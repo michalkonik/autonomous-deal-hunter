@@ -1,0 +1,25 @@
+currency: {internal: PLN, rounding: ROUND_HALF_UP, dp: 2, fx_source: NBP_mid}
+fx_spread: 0.01
+tax:
+  tax_mode: liniowy
+  pit_rate: 0.19
+  health_rate: 0.049
+  skala_pit_rate: 0.12
+  skala_health_rate: 0.09
+  ryczalt_rate: 0.03
+  ryczalt_health_pln_per_sale: 0
+  vat_rate: 0.23
+  vat_ue_registered: false
+  vat_margin_scheme_private: true
+returns_reserve: 0.05
+exit_channels: {enabled: [allegro, olx, ebay_pl, ebay_de]}
+import_costs:
+  duty_source: ISZTAR
+  consignment_fee_eur: 3
+  consignment_max_eur: 150
+  consignment_fee_from: "2026-07-01"
+  handling_fee_eur: 2
+  handling_fee_from: "2026-11-01"
+  clearance_fee_pln: 69
+  clearance_pct_of_duties_taxes: 0.025
+fiscal_cost_per_b2c_sale_pln: 0

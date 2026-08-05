@@ -1,0 +1,12 @@
+# Exit-channel fees used by dh/economics.py (spec §7). Read-only for the agent.
+# pct      : share of the exit price (gross, as the buyer pays it)
+# fixed    : fixed amount per item sold, in fixed_ccy
+# ccy      : payout currency; a non-PLN payout costs the FX spread on the exit price
+# b2c      : the owner sells to consumers there (returns reserve + fiscal cost apply)
+# by_category: optional {category: {pct, fixed}} override of pct/fixed for that category
+channels:
+  allegro:       {pct: 0.08, fixed: 1,    fixed_ccy: PLN, ccy: PLN, b2c: true}
+  olx:           {pct: 0,    fixed: 0,    fixed_ccy: PLN, ccy: PLN, b2c: true}
+  ebay_pl:       {pct: 0.09, fixed: 0,    fixed_ccy: PLN, ccy: PLN, b2c: true}
+  ebay_de:       {pct: 0.11, fixed: 0.35, fixed_ccy: EUR, ccy: EUR, b2c: true}
+  kleinanzeigen: {pct: 0,    fixed: 0,    fixed_ccy: EUR, ccy: EUR, b2c: true}

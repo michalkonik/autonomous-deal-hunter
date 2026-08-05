@@ -1,0 +1,14 @@
+floors: {easy: 50, moderate: 120, heavy: 250}
+tiers:
+  t1_min_cons_net_usd: 300
+  t4_floor_margin: 0.20
+confidence:
+  match_certainty_min: 0.9
+  p_scam_max: 0.05
+  comp_max_age_days: 30
+  verify_max_age_min: 10
+  min_comps: {base: 12, capital_over_5000: 20, capital_over_15000: 30}
+  capital_thresholds_usd: {mid: 5000, high: 15000}
+star_usd: 500
+capital_cap_usd: 30000
+repair: {enabled: false}

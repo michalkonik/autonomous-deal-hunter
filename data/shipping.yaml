@@ -1,0 +1,13 @@
+# Default shipping estimates (PLN) for building NetInputs when a listing does not state them.
+# Builder defaults, not measured: insured courier for a boxed GPU-sized parcel.
+# The economics engine itself takes inbound_ship_pln / outbound_ship_pln as inputs.
+outbound_pln:        # we ship to the buyer, by category
+  default: 25
+  gpu: 25
+  ram: 15
+  ssd: 15
+  pc: 80
+inbound_pln:         # seller ships to us, by origin (ISO2), "EU" = other EU states, "non_EU" = forwarder/courier
+  PL: 20
+  EU: 60
+  non_EU: 200

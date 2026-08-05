@@ -1,0 +1,3 @@
+ntfy: {server: https://ntfy.sh, topic: null, tier1_priority: urgent}
+email_fallback: {enabled: true}
+quiet_hours: null

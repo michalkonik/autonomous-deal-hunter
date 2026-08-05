@@ -1,0 +1,13 @@
+fetch:
+  min_interval_s: 4
+  jitter_s: 2
+  backoff_start_s: 60
+  backoff_cap_s: 3600
+  proxies: false
+  solve_captcha: false
+  logged_in: false
+adapters:
+  allegro: {enabled: true, via: mailbox}
+  vinted: {enabled: false}
+  ebay: {enabled: true, via: api}
+retention: {photos_days: 90, snapshots_days: 90}

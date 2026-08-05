@@ -1,0 +1,107 @@
+{
+ "nomenclature": {
+  "code": "8471709800",
+  "description": "Section XVI - Machinery and mechanical appliances; electrical equipment; parts thereof; sound recorders and reproducers, television image and sound recorders and reproducers, and parts and accessories of such articles: NUCLEAR REACTORS, BOILERS, MACHINERY AND MECHANICAL APPLIANCES; PARTS THEREOF: Automatic data-processing machines and units thereof; magnetic or optical readers, machines for transcribing data onto data media in coded form and machines for processing such data, not elsewhere specified or included: - Storage units: - - - Other",
+  "supplementaryUnit": "p/st"
+ },
+ "tariffMeasures": [
+  {
+   "country": {
+    "code": "ERGA OMNES",
+    "description": "ERGA OMNES",
+    "group": true
+   },
+   "description": "Third country duty",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "R2204/99",
+    "code": "R9922040",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31999R2204&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "ERGA OMNES",
+    "description": "ERGA OMNES",
+    "group": true
+   },
+   "description": "Low-value consignment customs duty",
+   "dutyAmount": "3 EUR",
+   "dutyAmountWithCodes": "3%",
+   "footnotes": [
+    {
+     "code": "TM01066",
+     "description": "From 1 July 2026 until 1 July 2028, a customs duty of EUR 3 per item in a consignment the intrinsic value of which does not exceed a total of EUR 150 shall apply instead of the relief eliminated pursuant to Article 1 of this Regulation, where:(a) the importation of the goods is exempt from VAT in accordance with Article 143(1), point (ca), of Directive 2006/112/EC; or(b) the goods are in a postal consignment as defined in Article 1, point (24), of Delegated Regulation (EU) 2015/2446."
+    }
+   ],
+   "regulation": {
+    "abbreviation": "R0382/26",
+    "code": "R2603820",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32026R0382&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "MA",
+    "description": "Morocco",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "D0204/00",
+    "code": "D0002040",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32000D0204&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "XC",
+    "description": "Ceuta",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "A0001/85",
+    "code": "A8500010",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31985A0001&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "XL",
+    "description": "Melilla",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "A0001/85",
+    "code": "A8500010",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31985A0001&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "AD",
+    "description": "Andorra",
+    "group": false
+   },
+   "description": "Customs Union Duty",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "D0680/90",
+    "code": "D9006801",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31990D0680&rid=1"
+   }
+  }
+ ],
+ "nonTariffMeasures": [],
+ "taxes": []
+}

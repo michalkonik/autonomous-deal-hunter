@@ -1,0 +1,7 @@
+base_url: http://localhost:8080/v1
+roles:
+  worker: gemma-4-26b-a4b-pool
+  senior: qwen3.8-flash-next-uncensored
+  advisor: qwen3.8-flash-next-uncensored
+paid_api: {enabled: false}
+min_free_ram_gb: 12

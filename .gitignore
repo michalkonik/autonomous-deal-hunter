@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+config/local/
+snapshots/
+var/
+*.db
+*.db-wal
+*.db-shm
+.superpowers/

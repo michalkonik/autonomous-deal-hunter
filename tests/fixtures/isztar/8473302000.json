@@ -1,0 +1,132 @@
+{
+ "nomenclature": {
+  "code": "8473302000",
+  "description": "Section XVI - Machinery and mechanical appliances; electrical equipment; parts thereof; sound recorders and reproducers, television image and sound recorders and reproducers, and parts and accessories of such articles: NUCLEAR REACTORS, BOILERS, MACHINERY AND MECHANICAL APPLIANCES; PARTS THEREOF: Parts and accessories (other than covers, carrying cases and the like) suitable for use solely or principally with machines of headings 8470 to 8472: - Parts and accessories of the machines of heading 8471: - - Electronic assemblies"
+ },
+ "tariffMeasures": [
+  {
+   "country": {
+    "code": "ERGA OMNES",
+    "description": "ERGA OMNES",
+    "group": true
+   },
+   "description": "Third country duty",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "R2204/99",
+    "code": "R9922040",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31999R2204&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "ERGA OMNES",
+    "description": "ERGA OMNES",
+    "group": true
+   },
+   "description": "Low-value consignment customs duty",
+   "dutyAmount": "3 EUR",
+   "dutyAmountWithCodes": "3%",
+   "footnotes": [
+    {
+     "code": "TM01066",
+     "description": "From 1 July 2026 until 1 July 2028, a customs duty of EUR 3 per item in a consignment the intrinsic value of which does not exceed a total of EUR 150 shall apply instead of the relief eliminated pursuant to Article 1 of this Regulation, where:(a) the importation of the goods is exempt from VAT in accordance with Article 143(1), point (ca), of Directive 2006/112/EC; or(b) the goods are in a postal consignment as defined in Article 1, point (24), of Delegated Regulation (EU) 2015/2446."
+    }
+   ],
+   "regulation": {
+    "abbreviation": "R0382/26",
+    "code": "R2603820",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32026R0382&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "KR",
+    "description": "Korea, Republic of (South Korea)",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "D0265/11",
+    "code": "D1102650",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32011D0265&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "US",
+    "description": "United States",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "footnotes": [
+    {
+     "code": "CD01100",
+     "description": "For the purposes of this Regulation, the origin of goods shall be determined in accordance with the rules on non-preferential origin as referred to in Title II, Chapter 2, Section 1 of Regulation (EU) No 952/2013, until rules on preferential origin as referred to in Article 64(2) or (3) of that Regulation have been adopted."
+    }
+   ],
+   "regulation": {
+    "abbreviation": "R1455/26",
+    "code": "R2614551",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32026R1455&rid=1"
+   },
+   "measureConditions": {
+    "conditions": [
+     {
+      "code": "B001",
+      "description": "Presentation of a certificate/licence/document: U190",
+      "action": "Apply the mentioned duty"
+     },
+     {
+      "code": "B009",
+      "description": "Presentation of a certificate/licence/document: the condition is not fulfilled",
+      "action": "Measure not applicable"
+     }
+    ],
+    "additionalInformations": [
+     {
+      "code": "U190",
+      "description": "Proof of origin established in accordance with Article 6 of Regulation (EU) 2026/1455"
+     }
+    ]
+   }
+  },
+  {
+   "country": {
+    "code": "VN",
+    "description": "Viet Nam",
+    "group": false
+   },
+   "description": "Tariff preference",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "D0753/20",
+    "code": "D2007530",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:32020D0753&rid=1"
+   }
+  },
+  {
+   "country": {
+    "code": "AD",
+    "description": "Andorra",
+    "group": false
+   },
+   "description": "Customs Union Duty",
+   "dutyAmount": "0%",
+   "dutyAmountWithCodes": "0%",
+   "regulation": {
+    "abbreviation": "D0680/90",
+    "code": "D9006801",
+    "link": "http://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX:31990D0680&rid=1"
+   }
+  }
+ ],
+ "nonTariffMeasures": [],
+ "taxes": []
+}
