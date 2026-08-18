@@ -5,3 +5,5 @@ roles:
   advisor: qwen3.8-flash-next-uncensored
 paid_api: {enabled: false}
 min_free_ram_gb: 12
+timeouts: {connect_s: 5, read_s: 60}
+breaker: {failures: 3, cooldown_s: 120}

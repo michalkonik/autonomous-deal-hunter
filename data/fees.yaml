@@ -1,12 +1,20 @@
-# Exit-channel fees used by dh/economics.py (spec §7). Read-only for the agent.
-# pct      : share of the exit price (gross, as the buyer pays it)
-# fixed    : fixed amount per item sold, in fixed_ccy
-# ccy      : payout currency; a non-PLN payout costs the FX spread on the exit price
-# b2c      : the owner sells to consumers there (returns reserve + fiscal cost apply)
-# by_category: optional {category: {pct, fixed}} override of pct/fixed for that category
+# Exit-channel fees used by dh/economics.py (spec §7). Frozen: read-only for the agent.
+#
+# CONVENTION: every amount is GROSS, as the platform charges it (Polish VAT included where it charges
+# Polish VAT). The engine deducts the VAT inside the fee (23/123 of it) when vat_deductible is true and
+# shows it in the line "input VAT on services". eBay fees are reverse-charged (foreign supplier): the
+# fee is net, there is no Polish VAT on the invoice to deduct, so vat_deductible is false.
+#
+# pct            : share of the exit price (gross, as the buyer pays it)
+# fixed          : fixed amount per item sold, in fixed_ccy
+# ccy            : payout currency; a non-PLN payout costs the FX spread on the exit price
+# dest           : buyer's country (ISO2): picks the outbound shipping lane in data/shipping.yaml
+# b2c            : the owner sells to consumers there (returns reserve + fiscal cost apply)
+# vat_deductible : the fee invoice carries Polish VAT we can deduct
+# by_category    : optional {category: {pct, fixed}} override of pct/fixed for that category
 channels:
-  allegro:       {pct: 0.08, fixed: 1,    fixed_ccy: PLN, ccy: PLN, b2c: true}
-  olx:           {pct: 0,    fixed: 0,    fixed_ccy: PLN, ccy: PLN, b2c: true}
-  ebay_pl:       {pct: 0.09, fixed: 0,    fixed_ccy: PLN, ccy: PLN, b2c: true}
-  ebay_de:       {pct: 0.11, fixed: 0.35, fixed_ccy: EUR, ccy: EUR, b2c: true}
-  kleinanzeigen: {pct: 0,    fixed: 0,    fixed_ccy: EUR, ccy: EUR, b2c: true}
+  allegro:       {pct: 0.08, fixed: 1,    fixed_ccy: PLN, ccy: PLN, dest: PL, b2c: true, vat_deductible: true}
+  olx:           {pct: 0,    fixed: 0,    fixed_ccy: PLN, ccy: PLN, dest: PL, b2c: true, vat_deductible: true}
+  ebay_pl:       {pct: 0.09, fixed: 0,    fixed_ccy: PLN, ccy: PLN, dest: PL, b2c: true, vat_deductible: false}
+  ebay_de:       {pct: 0.11, fixed: 0.35, fixed_ccy: EUR, ccy: EUR, dest: DE, b2c: true, vat_deductible: false}
+  kleinanzeigen: {pct: 0,    fixed: 0,    fixed_ccy: EUR, ccy: EUR, dest: DE, b2c: true, vat_deductible: false}

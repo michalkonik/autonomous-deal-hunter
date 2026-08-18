@@ -1,0 +1,5 @@
+# SSD key = ssd:<nvme|sata>:<capacity>, e.g. ssd:nvme:2tb. Capacity is normalised: 1000 GB / 1024 GB -> 1tb.
+interfaces: [nvme, sata]
+capacities_gb: [64, 120, 128, 240, 250, 256, 480, 500, 512, 960, 1000, 2000, 4000, 8000, 16000]
+# enterprise capacities, in TB
+capacities_tb_decimal: ["0.96", "1.92", "3.84", "7.68", "15.36"]

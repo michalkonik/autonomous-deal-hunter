@@ -1,8 +1,12 @@
 fetch:
+  user_agent: "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
   min_interval_s: 4
   jitter_s: 2
   backoff_start_s: 60
   backoff_cap_s: 3600
+  disable_after_blocks: 3
+  robots_ttl_s: 86400
+  timeout_s: 30
   proxies: false
   solve_captcha: false
   logged_in: false

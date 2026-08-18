@@ -1,4 +1,18 @@
-# Default shipping estimates (PLN) for building NetInputs when a listing does not state them.
+# Shipping data used with dh/economics.py. Frozen: read-only for the agent.
+#
+# CONVENTION: amounts are GROSS, as the courier or seller charges them.
+#
+# lanes: <from region>_<to region>, regions PL | EU (other EU states) | nonEU.
+#   vat_deductible: true when the courier's invoice carries Polish VAT we can deduct; the engine then
+#   deducts 23/123 of the shipping cost in the line "input VAT on services". Unknown lane = false.
+lanes:
+  PL_PL:    {vat_deductible: true}    # domestic courier, Polish VAT invoice
+  EU_PL:    {vat_deductible: false}   # paid to a seller in another EU state, no Polish VAT invoice
+  nonEU_PL: {vat_deductible: false}   # foreign forwarder / courier
+  PL_EU:    {vat_deductible: false}   # international transport from PL: 0% VAT, nothing to deduct
+  PL_nonEU: {vat_deductible: false}
+
+# Default estimates (PLN, gross) for building NetInputs when a listing does not state them.
 # Builder defaults, not measured: insured courier for a boxed GPU-sized parcel.
 # The economics engine itself takes inbound_ship_pln / outbound_ship_pln as inputs.
 outbound_pln:        # we ship to the buyer, by category

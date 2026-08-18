@@ -221,6 +221,9 @@ In order of trust:
 
 ### 6.4 Fetching etiquette (frozen) [design]
 
+**Amended 2026-10-29 during the build:** no bot-check circumvention of any kind: no TLS/browser fingerprint impersonation, no stealth browsers, no challenge solving, no proxy rotation. Requests are plain, identify the agent honestly, and respect robots.txt. Sites that block plain polite requests (OLX, Allegro.pl, Vinted, eBay web, Geizhals, Leboncoin, Wallapop) are used only through official APIs, RSS or the alert mailbox. OLX therefore moves from polling to the alert mailbox.
+
+
 - Logged out, except the mailbox.
 - From the rig's home IP. No datacenter proxies; residential proxies are configurable but off.
 - At most one request every few seconds per site, with jitter. Exponential backoff on 403/429.

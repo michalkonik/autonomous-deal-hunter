@@ -1,0 +1,9 @@
+# RAM key = ram:<type>:<total_gb>:<kit>, e.g. ram:ddr5:32:2x16. Speed is parsed but is NOT part of the key.
+# SO-DIMM (laptop) memory is its own category (ram-sodimm) with the same key shape; ECC/registered/server
+# memory is not keyed at all.
+types: [ddr4, ddr5]
+module_gb: [2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256]
+module_counts: [1, 2, 4, 8]
+speeds_mhz:
+  ddr4: [2133, 2400, 2666, 2933, 3000, 3200, 3333, 3466, 3600, 3733, 3800, 4000, 4133, 4266, 4400, 4600, 4800, 5000]
+  ddr5: [3200, 4000, 4400, 4800, 5200, 5600, 6000, 6200, 6400, 6600, 6800, 7000, 7200, 7600, 8000, 8200, 8400, 8800]

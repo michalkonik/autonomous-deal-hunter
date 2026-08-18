@@ -1,0 +1,134 @@
+# GPU taxonomy. Key = <category>:<id>:<vram_gb>. `vram` lists the real variants; `default_vram` is used (certainty 0.7)
+# when a listing names the chip but not the memory and the chip has more than one variant. The default is the
+# LOWER-priced variant, so a defaulted match can never inflate a comparable price (3060 is the one exception: the
+# 12 GB card is the original and the common one).
+# `bare_ok: true` = the name is distinctive enough to match without a brand prefix or GPU context word.
+# Short datacenter names that collide with phones/other products (A100, H100, H200, A10, A30, A40, L4, L40, V100) need a context
+# word (nvidia, tesla, gpu, ...) instead.
+# Ids are parsed by dh/taxonomy.py: first token rtx|rx|arc is the series (prefix), the rest is the model.
+gpu:
+  # ---- NVIDIA RTX 20
+  - {id: rtx-2060, vram: [6, 12], default_vram: 6}
+  - {id: rtx-2060-super, vram: [8], default_vram: 8}
+  - {id: rtx-2070, vram: [8], default_vram: 8}
+  - {id: rtx-2070-super, vram: [8], default_vram: 8}
+  - {id: rtx-2080, vram: [8], default_vram: 8}
+  - {id: rtx-2080-super, vram: [8], default_vram: 8}
+  - {id: rtx-2080-ti, vram: [11], default_vram: 11}
+  - {id: titan-rtx, vram: [24], default_vram: 24, bare_ok: true}
+  # ---- NVIDIA RTX 30
+  - {id: rtx-3050, vram: [6, 8], default_vram: 6}
+  - {id: rtx-3060, vram: [8, 12], default_vram: 12}
+  - {id: rtx-3060-ti, vram: [8], default_vram: 8}
+  - {id: rtx-3070, vram: [8], default_vram: 8}
+  - {id: rtx-3070-ti, vram: [8], default_vram: 8}
+  - {id: rtx-3080, vram: [10, 12], default_vram: 10}
+  - {id: rtx-3080-ti, vram: [12], default_vram: 12}
+  - {id: rtx-3090, vram: [24], default_vram: 24}
+  - {id: rtx-3090-ti, vram: [24], default_vram: 24}
+  # ---- NVIDIA RTX 40
+  - {id: rtx-4060, vram: [8], default_vram: 8}
+  - {id: rtx-4060-ti, vram: [8, 16], default_vram: 8}
+  - {id: rtx-4070, vram: [12], default_vram: 12}
+  - {id: rtx-4070-super, vram: [12], default_vram: 12}
+  - {id: rtx-4070-ti, vram: [12], default_vram: 12}
+  - {id: rtx-4070-ti-super, vram: [16], default_vram: 16}
+  - {id: rtx-4080, vram: [16], default_vram: 16}
+  - {id: rtx-4080-super, vram: [16], default_vram: 16}
+  - {id: rtx-4090, vram: [24], default_vram: 24}
+  - {id: rtx-4090d, vram: [24], default_vram: 24}
+  # ---- NVIDIA RTX 50
+  - {id: rtx-5050, vram: [8], default_vram: 8}
+  - {id: rtx-5060, vram: [8], default_vram: 8}
+  - {id: rtx-5060-ti, vram: [8, 16], default_vram: 8}
+  - {id: rtx-5070, vram: [12], default_vram: 12}
+  - {id: rtx-5070-ti, vram: [16], default_vram: 16}
+  - {id: rtx-5080, vram: [16], default_vram: 16}
+  - {id: rtx-5090, vram: [32], default_vram: 32}
+  - {id: rtx-5090d, vram: [32], default_vram: 32}
+  # ---- AMD RX 6000
+  - {id: rx-6400, vram: [4], default_vram: 4}
+  - {id: rx-6500-xt, vram: [4, 8], default_vram: 4}
+  - {id: rx-6600, vram: [8], default_vram: 8}
+  - {id: rx-6600-xt, vram: [8], default_vram: 8}
+  - {id: rx-6650-xt, vram: [8], default_vram: 8}
+  - {id: rx-6700, vram: [10], default_vram: 10}
+  - {id: rx-6700-xt, vram: [12], default_vram: 12}
+  - {id: rx-6750-xt, vram: [12], default_vram: 12}
+  - {id: rx-6800, vram: [16], default_vram: 16}
+  - {id: rx-6800-xt, vram: [16], default_vram: 16}
+  - {id: rx-6900-xt, vram: [16], default_vram: 16}
+  - {id: rx-6950-xt, vram: [16], default_vram: 16}
+  # ---- AMD RX 7000
+  - {id: rx-7600, vram: [8], default_vram: 8}
+  - {id: rx-7600-xt, vram: [16], default_vram: 16}
+  - {id: rx-7700-xt, vram: [12], default_vram: 12}
+  - {id: rx-7800-xt, vram: [16], default_vram: 16}
+  - {id: rx-7900-gre, vram: [16], default_vram: 16}
+  - {id: rx-7900-xt, vram: [20], default_vram: 20}
+  - {id: rx-7900-xtx, vram: [24], default_vram: 24}
+  # ---- AMD RX 9000
+  - {id: rx-9060-xt, vram: [8, 16], default_vram: 8}
+  - {id: rx-9070, vram: [16], default_vram: 16}
+  - {id: rx-9070-gre, vram: [16], default_vram: 16}
+  - {id: rx-9070-xt, vram: [16], default_vram: 16}
+  # ---- Intel Arc
+  - {id: arc-a310, vram: [4], default_vram: 4}
+  - {id: arc-a380, vram: [6], default_vram: 6}
+  - {id: arc-a580, vram: [8], default_vram: 8}
+  - {id: arc-a750, vram: [8], default_vram: 8}
+  - {id: arc-a770, vram: [8, 16], default_vram: 8}
+  - {id: arc-b570, vram: [10], default_vram: 10}
+  - {id: arc-b580, vram: [12], default_vram: 12}
+  # ---- Datacenter / workstation
+  - {id: a100, vram: [40, 80], default_vram: 40}
+  - {id: h100, vram: [80, 94], default_vram: 80}
+  - {id: h200, vram: [141], default_vram: 141}
+  - {id: l40s, vram: [48], default_vram: 48, bare_ok: true}
+  - {id: l40, vram: [48], default_vram: 48}
+  - {id: l4, vram: [24], default_vram: 24}
+  - {id: a40, vram: [48], default_vram: 48}
+  - {id: a30, vram: [24], default_vram: 24}
+  - {id: a10, vram: [24], default_vram: 24}
+  - {id: v100, vram: [16, 32], default_vram: 16}
+  - {id: rtx-a6000, vram: [48], default_vram: 48, bare_ok: true}
+  - {id: rtx-a5000, vram: [24], default_vram: 24, bare_ok: true}
+  - {id: rtx-a4500, vram: [20], default_vram: 20, bare_ok: true}
+  - {id: rtx-a4000, vram: [16], default_vram: 16, bare_ok: true}
+  - {id: rtx-6000-ada, vram: [48], default_vram: 48, bare_ok: true}
+  - {id: rtx-5000-ada, vram: [32], default_vram: 32, bare_ok: true}
+  - {id: rtx-4500-ada, vram: [24], default_vram: 24, bare_ok: true}
+  - {id: rtx-4000-ada, vram: [20], default_vram: 20, bare_ok: true}
+  - {id: rtx-pro-6000, vram: [96], default_vram: 96, bare_ok: true}
+  - {id: rtx-pro-5000, vram: [48, 72], default_vram: 48, bare_ok: true}
+  - {id: rtx-pro-4500, vram: [32], default_vram: 32, bare_ok: true}
+  - {id: rtx-pro-4000, vram: [24], default_vram: 24, bare_ok: true}
+
+# Laptop GPUs. Their own category so a "laptop RTX 4090" (16 GB) can never map to the desktop RTX 4090 (24 GB).
+gpu-mobile:
+  - {id: rtx-2060, vram: [6], default_vram: 6}
+  - {id: rtx-2070, vram: [8], default_vram: 8}
+  - {id: rtx-2080, vram: [8], default_vram: 8}
+  - {id: rtx-3050, vram: [4, 6], default_vram: 4}
+  - {id: rtx-3050-ti, vram: [4], default_vram: 4}
+  - {id: rtx-3060, vram: [6], default_vram: 6}
+  - {id: rtx-3070, vram: [8], default_vram: 8}
+  - {id: rtx-3070-ti, vram: [8], default_vram: 8}
+  - {id: rtx-3080, vram: [8, 16], default_vram: 8}
+  - {id: rtx-3080-ti, vram: [16], default_vram: 16}
+  - {id: rtx-4050, vram: [6], default_vram: 6}
+  - {id: rtx-4060, vram: [8], default_vram: 8}
+  - {id: rtx-4070, vram: [8], default_vram: 8}
+  - {id: rtx-4080, vram: [12], default_vram: 12}
+  - {id: rtx-4090, vram: [16], default_vram: 16}
+  - {id: rtx-5050, vram: [8], default_vram: 8}
+  - {id: rtx-5060, vram: [8], default_vram: 8}
+  - {id: rtx-5070, vram: [8], default_vram: 8}
+  - {id: rtx-5070-ti, vram: [12], default_vram: 12}
+  - {id: rtx-5080, vram: [16], default_vram: 16}
+  - {id: rtx-5090, vram: [24], default_vram: 24}
+  - {id: rx-6800m, vram: [12], default_vram: 12}
+  - {id: rx-7600m, vram: [8], default_vram: 8}
+  - {id: rx-7600m-xt, vram: [8], default_vram: 8}
+  - {id: rx-7700s, vram: [8], default_vram: 8}
+  - {id: rx-7900m, vram: [16], default_vram: 16}

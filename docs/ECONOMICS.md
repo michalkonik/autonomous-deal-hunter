@@ -2,8 +2,8 @@
 
 `dh/economics.py` computes the net profit of one resale deal, for one exit channel, for a Polish
 VAT-registered sole trader (JDG). It is part of the **frozen layer**: the agent never changes it, its
-config (`config/economics.yaml`) or its tests. A change is a human code change, re-checked against
-the 10 worked examples below.
+config (`config/economics.yaml`), its data (`data/fees.yaml`, `data/shipping.yaml`), `dh/customs.py` or
+its tests. A change is a human code change, re-checked against the 10 worked examples below.
 
 The defaults are conservative and are waiting for the owner's accountant (see spec §7 and
 `ACCOUNTANT-QUESTIONS.md`).
@@ -14,24 +14,30 @@ The defaults are conservative and are waiting for the owner's accountant (see sp
 
 - **NetInputs**: buy price and currency, origin country, whether the seller is a business, whether
   there is a VAT invoice, the exit channel, the conservative (P25) and expected (median) exit price in
-  PLN, inbound and outbound shipping in PLN, pickup distance in km (or none), number of items, date,
-  category (`gpu|ram|ssd|pc` or a 10-digit CN code), scam probability.
+  PLN, inbound and outbound shipping in PLN, pickup distance in km (or none), number of items,
+  evaluation date, category (`gpu|ram|ssd|pc` or a 10-digit CN code), scam probability.
+- **cfg** is the root config. `economics`, `pickup` and `rules` are required (the capital cap lives in
+  `rules`). **customs** is the duty lookup, needed for imports that are not low-value.
 - **NetResult**: one list of lines per scenario (conservative, expected), the two nets, the capital
   tied up, and flags.
 
 The two scenarios differ **only** in the exit price. Every other line is the same.
 
-## Rounding
+## Conventions
 
-All money is PLN `Decimal`. Every line is rounded to 0.01 PLN (ROUND_HALF_UP) by itself, then the lines
-are added. Cost lines are negative. The lines of a scenario always add up exactly to its net, so a
-deal card can be re-added by hand.
+- **Gross amounts.** Every PLN input is the amount actually paid or charged, VAT included where the
+  supplier charges Polish VAT: the buy price, channel fees, shipping, the clearance fee. The engine
+  itself takes the Polish VAT back out of service costs that carry it (see "Input VAT on services").
+- **Rounding.** All money is PLN `Decimal`. Every line is rounded to 0.01 PLN (ROUND_HALF_UP) by
+  itself, then the lines are added. Cost lines are negative. The lines of a scenario always add up
+  exactly to its net, so a deal card can be re-added by hand.
+- **Countries** are ISO 3166-1 alpha-2. `EL` (Greece's VAT prefix) is read as `GR`, `UK` as `GB`.
 
 ## Formula
 
-Notation: `r()` rounds to 0.01 PLN. `E` = exit price (P25 or median), gross, in PLN.
-`B` = buy price in PLN = r(buy price × NBP mid rate of the day). `items` = units bought; each is
-resold as a separate sale.
+Notation: `r()` rounds to 0.01 PLN. `iv(x) = r(x × 23/123)`, the VAT inside a gross amount. `E` = exit
+price (P25 or median), gross, in PLN. `B` = buy price in PLN = r(buy price × NBP mid rate of the day).
+`items` = units bought; each is resold as a separate sale.
 
 | Line | Formula | Applies when |
 |---|---|---|
@@ -40,11 +46,12 @@ resold as a separate sale.
 | buy price | `−B` | always |
 | inbound shipping | `−inbound_ship_pln` | always |
 | pickup | `−r(pln_per_km × 2 × km + pln_per_trip)` (config/pickup.yaml: 1.2 PLN/km, 40 PLN/trip) | pickup listing |
-| customs duty | `−r(duty_rate × CIF)`, `CIF = B + inbound`, rate from ISZTAR by CN code | origin outside the EU |
-| EU import fees | `−r(EUR fees × EUR rate)`: EUR 3/item if goods value ≤ EUR 150 (from 2026-07-01), plus EUR 2/item handling (from 2026-11-01) | origin outside the EU |
+| customs duty | `−r(duty_rate × CIF)`, `CIF = B + inbound`, rate from ISZTAR by CN code; **0 for a low-value consignment** (the flat EUR 3/item duty replaces it) | origin outside the EU |
+| EU import fees | `−r(EUR fees × EUR rate)`: EUR 3/item if goods value ≤ EUR 150 (from 2026-07-01), plus EUR 2/item handling (from 2026-11-01), both judged on the **arrival date = evaluation day + `transit_days`** (7) | origin outside the EU |
 | import VAT | `−r(23% × (CIF + duty + import fees))` | origin outside the EU |
-| clearance fee | `−max(69 PLN, r(2.5% × (duty + import fees + import VAT)))` | origin outside the EU |
+| clearance fee | `−max(69 PLN, r(2.5% × (duty + import fees + import VAT)))`, gross | origin outside the EU |
 | VAT due | see the VAT table below; a refund is positive | always |
+| input VAT on services | `+ iv(each deductible service cost)`, see below | always (may be 0.00) |
 | outbound shipping | `−outbound_ship_pln` | always |
 | returns reserve | `−r(5% × E)` | B2C channel |
 | fiscal cost | `−r(fiscal_cost_per_b2c_sale_pln × items)` (default 0) | B2C channel |
@@ -56,22 +63,40 @@ resold as a separate sale.
 | **net** | pre-tax profit − income tax | |
 
 **Capital** (cash out before the sale) = buy price + FX spread (buy) + inbound shipping + pickup + duty +
-import fees + clearance + import VAT. With a VAT invoice the buy price already includes the
-seller's VAT.
+import fees + clearance + import VAT, all gross. With a VAT invoice the buy price already includes the
+seller's VAT. VAT recovered later (input VAT, import VAT) does not reduce capital.
 
-### VAT
+### VAT on the goods
 
-`23/123` is the VAT inside a gross price at 23%. `output = r(E × 23/123)`.
+`output = r(E × 23/123)`. The rate comes from `tax.vat_rate`.
 
 | Purchase | Regime | VAT due |
 |---|---|---|
 | Private person, in Poland or another EU state, no invoice | margin scheme | `r(23/123 × max(0, E − B))`. The base is the buy price only: shipping and pickup are not in it |
-| Polish seller with a VAT invoice | standard | `output − r(B × 23/123)` |
+| Polish seller with a VAT invoice | standard | `output − iv(B)` |
 | Polish business, no VAT invoice | standard, nothing to deduct | `output` |
 | Business in another EU state | standard, nothing deductible in PL; flag `needs_vat_ue` while `vat_ue_registered: false` | `output` |
 | Any seller outside the EU (import) | standard | `output − import VAT` |
 
 VAT due can be negative (a refund). The sign is kept.
+
+### Input VAT on services
+
+Service costs invoiced with Polish VAT are deductible. The line is the sum of `iv(cost)` over:
+
+| Cost | Deductible? | Where it is set |
+|---|---|---|
+| Allegro, OLX fees | yes | `vat_deductible: true` in `data/fees.yaml` |
+| eBay (PL and DE), Kleinanzeigen fees | no: reverse-charged foreign service, the fee is net | `vat_deductible: false` |
+| Inbound shipping from a Polish seller (lane `PL_PL`) | yes | `lanes` in `data/shipping.yaml` |
+| Inbound shipping from another EU state or from outside the EU | no | `EU_PL`, `nonEU_PL` |
+| Outbound shipping to a buyer in Poland (`PL_PL`) | yes | channel `dest` in `fees.yaml` picks the lane |
+| Outbound shipping to a buyer abroad (`PL_EU`, eBay.de) | no: international transport is 0% VAT | `PL_EU` |
+| Clearance fee (imports) | yes | always for imports |
+| Pickup | no: no invoice | — |
+
+It applies in every VAT regime, including the margin scheme (the margin-scheme ban covers only the VAT
+on the goods themselves). That is on the accountant list.
 
 ### Income tax
 
@@ -112,42 +137,44 @@ VAT due can be negative (a refund). The sign is kept.
 - **eBay.de sales** are taxed at Polish VAT 23% (margin scheme: always taxed in the seller's state;
   standard VAT: below the EUR 10,000 EU distance-selling threshold). Above that threshold OSS and German
   VAT would apply.
-- **Import**: the customs value is the buy price plus inbound shipping at the NBP mid rate (customs
-  uses its own monthly rate). The EUR 150 low-value test uses the goods value without shipping. The EU
-  import fees are part of the import-VAT base (they are charges due on importation). The VAT inside
-  the carrier's clearance fee is not deducted.
+- **Import**: the customs value is the buy price plus inbound shipping at the NBP mid rate of the
+  evaluation day (customs uses its own monthly rate). The duty rate is looked up for the evaluation
+  day; only the EUR fees are dated on arrival. The EUR 150 low-value test uses the goods value without
+  shipping. The EU import fees are part of the import-VAT base (they are charges due on importation).
+  Before 2026-07-01 arrivals (no flat duty yet) the ad-valorem duty applies to every value.
 - **FX spread** is 1% of the buy price when it is paid in a foreign currency, and 1% of the gross exit
   price when the channel pays out in EUR (slightly more than the real payout after fees). Fixed fees in
   EUR, duty, import fees and import VAT are converted at the NBP mid rate with no spread.
 - **Returns reserve** is 5% of the exit price for every B2C channel. All enabled channels are B2C: the
   2-year warranty applies to used goods too, and it cannot be shortened.
-- **Pickup** is a buying cost only (driving to the seller). It is not part of the margin-scheme base.
+- **Pickup** is a buying cost only (driving to the seller). It is not part of the margin-scheme base
+  and has no deductible VAT.
 
 ## Worked examples
 
 Fixed FX rates used (PLN per unit): **EUR 4.3951, USD 3.6500, CZK 0.1750, JPY 0.0245**. Duty rates come
 from a fake lookup (0% for the CN codes used, which is what ISZTAR returns for 8473302000).
-Default config unless stated. Examples 1 to 4 and 7 to 10 are dated 2026-10-29; 5 and 6 are dated
-2026-11-02 (the EUR 2 handling fee applies).
+Default config unless stated. Examples 1 to 4 and 7 to 10 are dated 2026-10-29. Examples 5 and 6 are
+evaluated on 2026-11-02 and arrive on 2026-11-09, so the EUR 2 handling fee applies.
 
 ### Summary
 
 | # | Case | Buy | Exit (cons / exp) | Cons net | Exp net | Capital | Flags |
 |---|---|---|---|---|---|---|---|
-| 1 | PL private → Allegro (margin scheme) | 2000 PLN | 2600 / 2800 | **48.55** | **152.51** | 2020.00 | — |
-| 2 | PL business, VAT invoice → Allegro | 3075 PLN gross | 4200 / 4500 | **210.71** | **366.64** | 3105.00 | — |
-| 3 | CZ private → OLX (CZK) | 14000 CZK | 3000 / 3200 | **105.89** | **222.03** | 2519.50 | bdo_check |
+| 1 | PL private → Allegro (margin scheme) | 2000 PLN | 2600 / 2800 | **84.69** | **190.93** | 2020.00 | — |
+| 2 | PL business, VAT invoice → Allegro | 3075 PLN gross | 4200 / 4500 | **267.20** | **426.55** | 3105.00 | — |
+| 3 | CZ private → OLX (CZK) | 14000 CZK | 3000 / 3200 | **108.02** | **224.16** | 2519.50 | bdo_check |
 | 4 | DE private → eBay.de | 450 EUR | 2900 / 3100 | **42.52** | **140.39** | 2057.58 | bdo_check |
-| 5 | US business → Allegro (import, duty 0) | 1000 USD | 6400 / 6900 | **230.55** | **490.44** | 4851.81 | bdo_check |
-| 6 | JP private via forwarder → Allegro (low-value import) | 20000 JPY | 1100 / 1250 | **7.48** | **85.45** | 851.24 | bdo_check |
-| 7 | Loss: PL private → OLX, overpaid | 3000 PLN | 2900 / 3100 | **−415.00** | **−243.70** | 3020.00 | — |
-| 8 | Pickup 40 km → Allegro | 1800 PLN | 2600 / 2750 | **100.76** | **178.73** | 1936.00 | — |
-| 9 | Example 1 under ryczałt (+5 PLN health/sale) | 2000 PLN | 2600 / 2800 | **−19.20** | **111.41** | 2020.00 | — |
-| 10 | 30 GPUs, PL invoice, capital over the cap | 120000 PLN gross | 150000 / 160000 | **1986.39** | **7184.08** | 120300.00 | over_capital_cap |
+| 5 | US business → Allegro (import, duty 0) | 1000 USD | 6400 / 6900 | **317.64** | **583.22** | 4851.81 | bdo_check |
+| 6 | JP private via forwarder → Allegro (low-value import) | 20000 JPY | 1100 / 1250 | **32.09** | **111.77** | 851.24 | bdo_check |
+| 7 | Loss: PL private → OLX, overpaid | 3000 PLN | 2900 / 3100 | **−411.26** | **−239.96** | 3020.00 | — |
+| 8 | Pickup 40 km → Allegro | 1800 PLN | 2600 / 2750 | **134.06** | **213.73** | 1936.00 | — |
+| 9 | Example 1 under ryczałt (+5 PLN health/sale) | 2000 PLN | 2600 / 2800 | **28.29** | **161.89** | 2020.00 | — |
+| 10 | 30 GPUs, PL invoice, capital over the cap | 120000 PLN gross | 150000 / 160000 | **3847.68** | **9159.22** | 120300.00 | over_capital_cap |
 
 ### 1. PL private → Allegro (margin scheme)
 
-Buy 2000 PLN from a private person in Poland. Inbound 20, outbound 25, p_scam 0.02.
+Buy 2000 PLN from a private person in Poland. Inbound 20 and outbound 25, both domestic. p_scam 0.02.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -156,19 +183,21 @@ Buy 2000 PLN from a private person in Poland. Inbound 20, outbound 25, p_scam 0.
 | buy price | −2000.00 | −2000.00 | |
 | inbound shipping | −20.00 | −20.00 | |
 | VAT due | −112.20 | −149.59 | 23 × 600 / 123 = 112.195; 23 × 800 / 123 = 149.5935 |
+| input VAT on services | 47.49 | 50.48 | fees iv(209) = 39.08 (exp iv(225) = 42.07) + iv(20) = 3.74 + iv(25) = 4.67 |
 | outbound shipping | −25.00 | −25.00 | |
 | returns reserve | −130.00 | −140.00 | 5% × E |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −40.00 | −40.00 | 0.02 × 2000 |
-| *pre-tax* | *63.80* | *200.41* | |
-| income tax | −15.25 | −47.90 | 0.239 × 63.80 = 15.2482; 0.239 × 200.41 = 47.89799 |
-| **net** | **48.55** | **152.51** | |
+| *pre-tax* | *111.29* | *250.89* | |
+| income tax | −26.60 | −59.96 | 0.239 × 111.29 = 26.59831; 0.239 × 250.89 = 59.96271 |
+| **net** | **84.69** | **190.93** | |
 
 Capital 2000 + 20 = **2020.00**.
 
 ### 2. PL business with a VAT invoice → Allegro
 
-Buy 3075 PLN gross (input VAT 3075 × 23 / 123 = 575.00 exactly). Inbound 30, outbound 30, p_scam 0.01.
+Buy 3075 PLN gross (invoice VAT 3075 × 23 / 123 = 575.00 exactly). Inbound 30 and outbound 30, both
+domestic (iv(30) = 5.61 each). p_scam 0.01.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -177,19 +206,21 @@ Buy 3075 PLN gross (input VAT 3075 × 23 / 123 = 575.00 exactly). Inbound 30, ou
 | buy price | −3075.00 | −3075.00 | |
 | inbound shipping | −30.00 | −30.00 | |
 | VAT due | −210.37 | −266.46 | output 96600/123 = 785.37 (exp 103500/123 = 841.46) − 575.00 |
+| input VAT on services | 74.24 | 78.72 | iv(337) = 63.02 (exp iv(361) = 67.50) + 5.61 + 5.61 |
 | outbound shipping | −30.00 | −30.00 | |
 | returns reserve | −210.00 | −225.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −30.75 | −30.75 | 0.01 × 3075 |
-| *pre-tax* | *276.88* | *481.79* | |
-| income tax | −66.17 | −115.15 | 66.17432; 115.14781 |
-| **net** | **210.71** | **366.64** | |
+| *pre-tax* | *351.12* | *560.51* | |
+| income tax | −83.92 | −133.96 | 83.91768; 133.96189 |
+| **net** | **267.20** | **426.55** | |
 
 Capital 3075 + 30 = **3105.00**.
 
 ### 3. CZ private → OLX (FX in CZK)
 
-Buy 14000 CZK × 0.1750 = 2450.00 PLN. Inbound 45, outbound 15, p_scam 0.03. OLX: no fee, PLN payout.
+Buy 14000 CZK × 0.1750 = 2450.00 PLN. Inbound 45 from CZ (not deductible), outbound 15 to a Polish buyer,
+p_scam 0.03. OLX: no fee, PLN payout.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -198,21 +229,23 @@ Buy 14000 CZK × 0.1750 = 2450.00 PLN. Inbound 45, outbound 15, p_scam 0.03. OLX
 | buy price | −2450.00 | −2450.00 | |
 | inbound shipping | −45.00 | −45.00 | |
 | VAT due | −102.85 | −140.24 | margin: 23 × 550/123 = 102.8455; 23 × 750/123 = 140.2439 |
+| input VAT on services | 2.80 | 2.80 | fees iv(0) = 0 + outbound iv(15) = 2.8049 |
 | outbound shipping | −15.00 | −15.00 | |
 | returns reserve | −150.00 | −160.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | FX spread (buy) | −24.50 | −24.50 | 1% × 2450 |
 | risk haircut | −73.50 | −73.50 | 0.03 × 2450 |
-| *pre-tax* | *139.15* | *291.76* | |
-| income tax | −33.26 | −69.73 | 33.25685; 69.73064 |
-| **net** | **105.89** | **222.03** | |
+| *pre-tax* | *141.95* | *294.56* | |
+| income tax | −33.93 | −70.40 | 33.92605; 70.39984 |
+| **net** | **108.02** | **224.16** | |
 
 Capital 2450 + 24.50 + 45 = **2519.50**. Flags: `bdo_check`.
 
 ### 4. DE private → eBay.de
 
-Buy 450 EUR × 4.3951 = 1977.795 → 1977.80 PLN. Inbound 60, outbound 80, p_scam 0.02. eBay.de: 11% + 0.35 EUR
-(0.35 × 4.3951 = 1.538285 → 1.54), paid out in EUR, so the exit price also carries the 1% spread.
+Buy 450 EUR × 4.3951 = 1977.795 → 1977.80 PLN. Inbound 60 from DE, outbound 80 to a German buyer, p_scam
+0.02. eBay.de: 11% + 0.35 EUR (0.35 × 4.3951 = 1.538285 → 1.54), reverse-charged, paid out in EUR, so the
+exit price also carries the 1% spread. Nothing here carries deductible Polish VAT.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -221,6 +254,7 @@ Buy 450 EUR × 4.3951 = 1977.795 → 1977.80 PLN. Inbound 60, outbound 80, p_sca
 | buy price | −1977.80 | −1977.80 | |
 | inbound shipping | −60.00 | −60.00 | |
 | VAT due | −172.44 | −209.84 | margin: 23 × 922.20/123 = 172.4439; 23 × 1122.20/123 = 209.8423 |
+| input VAT on services | 0.00 | 0.00 | eBay fee, EU_PL and PL_EU lanes: none deductible |
 | outbound shipping | −80.00 | −80.00 | |
 | returns reserve | −145.00 | −155.00 | |
 | fiscal cost | 0.00 | 0.00 | |
@@ -235,8 +269,9 @@ Capital 1977.80 + 19.78 + 60 = **2057.58**. Flags: `bdo_check`.
 
 ### 5. US business → Allegro (import, duty 0, VAT 23%, clearance)
 
-Dated 2026-11-02. Buy 1000 USD × 3.65 = 3650.00 PLN. Inbound 200, outbound 30, p_scam 0.02, GPU (CN 8473302000, duty 0%).
-CIF = 3850.00. Goods value 3650 / 4.3951 = EUR 830 > 150, so only the EUR 2 handling fee: 2 × 4.3951 = 8.7902 → 8.79.
+Evaluated 2026-11-02, arrival 2026-11-09. Buy 1000 USD × 3.65 = 3650.00 PLN. Inbound 200 (not deductible),
+outbound 30 to a Polish buyer, p_scam 0.02, GPU (CN 8473302000, duty 0%). CIF = 3850.00. Goods value
+3650 / 4.3951 = EUR 830 > 150: ad-valorem duty, and only the EUR 2 handling fee: 2 × 4.3951 = 8.7902 → 8.79.
 Import VAT 23% × (3850 + 0 + 8.79) = 887.5217 → 887.52. Clearance max(69, 2.5% × (0 + 8.79 + 887.52) = 22.41) = 69.00.
 
 | Line | Cons | Exp | How |
@@ -250,22 +285,25 @@ Import VAT 23% × (3850 + 0 + 8.79) = 887.5217 → 887.52. Clearance max(69, 2.5
 | import VAT | −887.52 | −887.52 | |
 | clearance fee | −69.00 | −69.00 | |
 | VAT due | −309.23 | −402.72 | output 147200/123 = 1196.75 (exp 158700/123 = 1290.24) − 887.52 |
+| input VAT on services | 114.44 | 121.92 | iv(513) = 95.93 (exp iv(553) = 103.41) + outbound iv(30) = 5.61 + clearance iv(69) = 12.90 |
 | outbound shipping | −30.00 | −30.00 | |
 | returns reserve | −320.00 | −345.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | FX spread (buy) | −36.50 | −36.50 | 1% × 3650 |
 | risk haircut | −73.00 | −73.00 | 0.02 × 3650 |
-| *pre-tax* | *302.96* | *644.47* | |
-| income tax | −72.41 | −154.03 | 72.40744; 154.02833 |
-| **net** | **230.55** | **490.44** | |
+| *pre-tax* | *417.40* | *766.39* | |
+| income tax | −99.76 | −183.17 | 99.7586; 183.16721 |
+| **net** | **317.64** | **583.22** | |
 
 Capital 3650 + 36.50 + 200 + 0 + 8.79 + 69 + 887.52 = **4851.81**. Flags: `bdo_check`.
 
 ### 6. JP private via forwarder → Allegro (import, low-value fee)
 
-Dated 2026-11-02. Buy 20000 JPY × 0.0245 = 490.00 PLN (EUR 111.49 ≤ 150). Inbound (forwarder and shipping) 120,
-outbound 15, p_scam 0.04, RAM (CN 8473302000, duty 0%). Import fees EUR 3 + EUR 2 = EUR 5 × 4.3951 = 21.9755 → 21.98.
-CIF = 610.00. Import VAT 23% × 631.98 = 145.3554 → 145.36. Clearance max(69, 2.5% × 167.34 = 4.18) = 69.00.
+Evaluated 2026-11-02, arrival 2026-11-09. Buy 20000 JPY × 0.0245 = 490.00 PLN (EUR 111.49 ≤ 150, so the
+flat EUR 3 duty replaces the ad-valorem duty and no duty lookup is made). Inbound (forwarder and shipping)
+120, not deductible. Outbound 15 to a Polish buyer, p_scam 0.04, RAM. Import fees EUR 3 + EUR 2 = EUR 5 ×
+4.3951 = 21.9755 → 21.98. CIF = 610.00. Import VAT 23% × 631.98 = 145.3554 → 145.36. Clearance
+max(69, 2.5% × 167.34 = 4.18) = 69.00.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -273,25 +311,26 @@ CIF = 610.00. Import VAT 23% × 631.98 = 145.3554 → 145.36. Clearance max(69, 
 | channel fees | −89.00 | −101.00 | 8% × E + 1 |
 | buy price | −490.00 | −490.00 | |
 | inbound shipping | −120.00 | −120.00 | |
-| customs duty | 0.00 | 0.00 | |
+| customs duty | 0.00 | 0.00 | replaced by the low-value duty |
 | EU import fees | −21.98 | −21.98 | EUR 5 |
 | import VAT | −145.36 | −145.36 | |
 | clearance fee | −69.00 | −69.00 | |
 | VAT due | −60.33 | −88.38 | output 25300/123 = 205.69 (exp 28750/123 = 233.74) − 145.36 |
+| input VAT on services | 32.34 | 34.59 | iv(89) = 16.64 (exp iv(101) = 18.89) + iv(15) = 2.80 + iv(69) = 12.90 |
 | outbound shipping | −15.00 | −15.00 | |
 | returns reserve | −55.00 | −62.50 | |
 | fiscal cost | 0.00 | 0.00 | |
 | FX spread (buy) | −4.90 | −4.90 | |
 | risk haircut | −19.60 | −19.60 | 0.04 × 490 |
-| *pre-tax* | *9.83* | *112.28* | |
-| income tax | −2.35 | −26.83 | 2.34937; 26.83492 |
-| **net** | **7.48** | **85.45** | |
+| *pre-tax* | *42.17* | *146.87* | |
+| income tax | −10.08 | −35.10 | 10.07863; 35.10193 |
+| **net** | **32.09** | **111.77** | |
 
 Capital 490 + 4.90 + 120 + 0 + 21.98 + 69 + 145.36 = **851.24**. Flags: `bdo_check`.
 
 ### 7. A loss: PL private → OLX, overpaid
 
-Buy 3000 PLN, inbound 20, no outbound cost, p_scam 0.05.
+Buy 3000 PLN, inbound 20 (domestic), no outbound cost, p_scam 0.05.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -300,20 +339,21 @@ Buy 3000 PLN, inbound 20, no outbound cost, p_scam 0.05.
 | buy price | −3000.00 | −3000.00 | |
 | inbound shipping | −20.00 | −20.00 | |
 | VAT due | 0.00 | −18.70 | margin max(0, −100) = 0; 23 × 100/123 = 18.699 |
+| input VAT on services | 3.74 | 3.74 | inbound iv(20) |
 | outbound shipping | 0.00 | 0.00 | |
 | returns reserve | −145.00 | −155.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −150.00 | −150.00 | 0.05 × 3000 |
-| *pre-tax* | *−415.00* | *−243.70* | |
+| *pre-tax* | *−411.26* | *−239.96* | |
 | income tax | 0.00 | 0.00 | no tax on a loss |
-| **net** | **−415.00** | **−243.70** | |
+| **net** | **−411.26** | **−239.96** | |
 
 Capital **3020.00**.
 
 ### 8. Pickup 40 km → Allegro
 
-Buy 1800 PLN from a private person 40 km from Kraków. Pickup 1.2 × 2 × 40 + 40 = 136.00. No inbound shipping,
-outbound 25, p_scam 0.01.
+Buy 1800 PLN from a private person 40 km from Kraków. Pickup 1.2 × 2 × 40 + 40 = 136.00 (no deductible
+VAT). No inbound shipping, outbound 25 to a Polish buyer, p_scam 0.01.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -323,13 +363,14 @@ outbound 25, p_scam 0.01.
 | inbound shipping | 0.00 | 0.00 | |
 | pickup | −136.00 | −136.00 | |
 | VAT due | −149.59 | −177.64 | margin on 800 and 950 (pickup is not in the base) |
+| input VAT on services | 43.75 | 46.00 | iv(209) = 39.08 (exp iv(221) = 41.33) + iv(25) = 4.67 |
 | outbound shipping | −25.00 | −25.00 | |
 | returns reserve | −130.00 | −137.50 | |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −18.00 | −18.00 | |
-| *pre-tax* | *132.41* | *234.86* | |
-| income tax | −31.65 | −56.13 | 31.64599; 56.13154 |
-| **net** | **100.76** | **178.73** | |
+| *pre-tax* | *176.16* | *280.86* | |
+| income tax | −42.10 | −67.13 | 42.10224; 67.12554 |
+| **net** | **134.06** | **213.73** | |
 
 Capital 1800 + 0 + 136 = **1936.00**.
 
@@ -340,16 +381,16 @@ pre-tax are as in example 1.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
-| *pre-tax* | *63.80* | *200.41* | as example 1 |
+| *pre-tax* | *111.29* | *250.89* | as example 1 |
 | income tax | −83.00 | −89.00 | 3% × 2600 + 5 = 78 + 5; 3% × 2800 + 5 = 84 + 5 |
-| **net** | **−19.20** | **111.41** | |
+| **net** | **28.29** | **161.89** | |
 
-Ryczałt is charged on revenue, so a thin deal can turn into a loss.
+Ryczałt is charged on revenue, not profit: on this thin deal it costs more than liniowy (26.60 cons).
 
 ### 10. Capital over the cap
 
-30 GPUs from a Polish business with a VAT invoice: 120000 PLN gross (input VAT 2760000/123 = 22439.0244 →
-22439.02). Inbound 300, outbound 750, p_scam 0.01. The Allegro fixed fee is 1 PLN × 30 items.
+30 GPUs from a Polish business with a VAT invoice: 120000 PLN gross (invoice VAT 2760000/123 = 22439.0244 →
+22439.02). Inbound 300 and outbound 750, both domestic. p_scam 0.01. The Allegro fixed fee is 1 PLN × 30 items.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -358,13 +399,14 @@ Ryczałt is charged on revenue, so a thin deal can turn into a loss.
 | buy price | −120000.00 | −120000.00 | |
 | inbound shipping | −300.00 | −300.00 | |
 | VAT due | −5609.76 | −7479.68 | output 28048.78 (exp 29918.70) − 22439.02 |
+| input VAT on services | 2445.85 | 2595.45 | iv(12030) = 2249.51 (exp iv(12830) = 2399.11) + iv(300) = 56.10 + iv(750) = 140.24 |
 | outbound shipping | −750.00 | −750.00 | |
 | returns reserve | −7500.00 | −8000.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −1200.00 | −1200.00 | |
-| *pre-tax* | *2610.24* | *9440.32* | |
-| income tax | −623.85 | −2256.24 | 623.84736; 2256.23648 |
-| **net** | **1986.39** | **7184.08** | |
+| *pre-tax* | *5056.09* | *12035.77* | |
+| income tax | −1208.41 | −2876.55 | 1208.40551; 2876.54903 |
+| **net** | **3847.68** | **9159.22** | |
 
 Capital 120000 + 300 = **120300.00** PLN = 120300 / 3.65 = **32958.90 USD** > 30000. Flags: `over_capital_cap`
 (tiering then skips the deal).

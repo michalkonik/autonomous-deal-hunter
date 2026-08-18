@@ -61,7 +61,8 @@ create table if not exists health (
   id integer primary key, source text, kind text, detail text, at text default current_timestamp
 );
 create table if not exists fx (
-  date text not null, currency text not null, rate_pln text not null, primary key (date, currency)
+  date text not null, currency text not null, rate_pln text not null, effective_date text,
+  primary key (date, currency)
 );
 create table if not exists playbook_versions (
   id integer primary key, version text, content text, created_at text default current_timestamp

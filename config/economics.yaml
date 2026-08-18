@@ -22,4 +22,5 @@ import_costs:
   handling_fee_from: "2026-11-01"
   clearance_fee_pln: 69
   clearance_pct_of_duties_taxes: 0.025
+  transit_days: 7          # import fees are dated on arrival = evaluation day + transit_days
 fiscal_cost_per_b2c_sale_pln: 0

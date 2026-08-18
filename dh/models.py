@@ -47,6 +47,7 @@ class Extraction:
     wanted_ad: bool = False
     bundle_items: list[str] = field(default_factory=list)
     method: Literal["rules", "llm"] = "rules"
+    notes: list[str] = field(default_factory=list)  # e.g. "llm_unavailable"
 
 
 @dataclass
