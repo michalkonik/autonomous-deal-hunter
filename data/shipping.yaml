@@ -5,6 +5,7 @@
 # lanes: <from region>_<to region>, regions PL | EU (other EU states) | nonEU.
 #   vat_deductible: true when the courier's invoice carries Polish VAT we can deduct; the engine then
 #   deducts 23/123 of the shipping cost in the line "input VAT on services". Unknown lane = false.
+#   Inbound legs additionally need seller_is_business and has_vat_invoice (a private seller issues no invoice).
 lanes:
   PL_PL:    {vat_deductible: true}    # domestic courier, Polish VAT invoice
   EU_PL:    {vat_deductible: false}   # paid to a seller in another EU state, no Polish VAT invoice

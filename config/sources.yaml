@@ -6,6 +6,7 @@ fetch:
   backoff_cap_s: 3600
   disable_after_blocks: 3
   robots_ttl_s: 86400
+  max_crawl_delay_s: 60
   timeout_s: 30
   proxies: false
   solve_captcha: false

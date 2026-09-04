@@ -551,3 +551,35 @@ def test_included_extras_keep_key(title, key):
                                  "Kabel na {c}", "Backplate na {c}", "Waterblock {c}", "Kabel do {c}"])
 def test_accessory_before_chip_still_blocked(tpl, chip):
     assert ex(tpl.format(c=chip)).key is None
+
+
+# ------------------------------------------------------------------ fix round 3
+
+@pytest.mark.parametrize("title", [
+    "RTX 4090 Waterblock EK", "RTX 3080 waterblock Alphacool", "RX 7900 XTX backplate", "RTX 4090 Wasserkühler",
+    "Waterblock RTX 4090 EK", "Kabel 12VHPWR do RTX 4090",
+    "RTX 3060 Ti waterblock Bykski", "RTX 5080 Kabel", "RX 9070 XT radiator", "RTX 3070 uchwyt", "RTX 4090 adapter",
+    "Radiator do RAM DDR5", "DDR4 radiator", "Kabel NVMe SSD 1TB", "SSD NVMe 1TB adapter",
+])
+def test_accessory_sold_alone_is_none(title):
+    assert ex(title).key is None, title
+
+
+@pytest.mark.parametrize("title,key", [
+    ("Gigabyte RTX 3080 Gaming OC cooler", "gpu:rtx-3080:10"),
+    ("ASUS TUF RTX 3070 OC with original cooler", "gpu:rtx-3070:8"),
+    ("RTX 3080 z chłodzeniem wodnym EK", "gpu:rtx-3080:10"),
+    ("RTX 3080 + kabel zasilający", "gpu:rtx-3080:10"),
+    ("MSI RTX 3090 Suprim X + backplate", "gpu:rtx-3090:24"),
+    ("RTX 4090 + adapter 12VHPWR w zestawie", "gpu:rtx-4090:24"),
+    ("RTX 3070 manual box", "gpu:rtx-3070:8"),
+    ("Zotac RTX 4090 Cooler Master edition", "gpu:rtx-4090:24"),
+    ("RX 7900 XTX mit Kabel", "gpu:rx-7900-xtx:24"),
+    ("RTX 3060 Ti inkl. Netzteil", "gpu:rtx-3060-ti:8"),
+    ("RTX 5080 s kabelem", "gpu:rtx-5080:16"),
+    ("RTX 4090, kabel, faktura", "gpu:rtx-4090:24"),
+    ("Kingston 16GB DDR4 3200 + kabel", "ram:ddr4:16:1x16"),
+    ("Samsung 980 Pro 1TB NVMe + kabel", "ssd:nvme:1tb"),
+])
+def test_included_extras_after_chip_keep_key(title, key):
+    assert ex(title).key == key, title

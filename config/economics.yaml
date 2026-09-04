@@ -24,3 +24,20 @@ import_costs:
   clearance_pct_of_duties_taxes: 0.025
   transit_days: 7          # import fees are dated on arrival = evaluation day + transit_days
 fiscal_cost_per_b2c_sale_pln: 0
+# Scam score (dh/risk.py): p_scam = 1 / (1 + exp(-(bias + sum of weight * feature))), features 0/1.
+# Chosen so a normal listing sits near 1% (bias -4.5), a too-cheap listing from a new account is ~38%
+# (-4.5 + 2.5 + 1.5 = -0.5), and no single weak signal alone passes 12%.
+risk:
+  new_account_days: 30
+  z_threshold: -2.5
+  z_sigma_floor: 0.10      # log-price sigma is never below this, so tight comps do not make normal prices look extreme
+  scam_kw_max_hits: 2
+  weights:
+    bias: -4.5
+    too_cheap: 2.5         # robust z of the price against the median < z_threshold
+    new_account: 1.5       # seller account younger than new_account_days
+    no_ratings: 1.0        # seller has 0 ratings
+    stock_photo: 1.5       # stock-photo hint from the M2 photo checks
+    origin_cn_hk: 1.5      # ships from CN/HK, gpu key RTX >= 4080
+    no_photos_flagship: 2.0  # no photos at all, 4090/5090 key
+    scam_kw: 0.8           # per scam_kw playbook hit, capped at scam_kw_max_hits

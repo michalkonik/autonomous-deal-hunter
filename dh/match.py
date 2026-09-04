@@ -153,6 +153,28 @@ _ACCESSORY = re.compile(
     r"(?<![a-z])(?:waterblock|water[\s-]?block|wasserkuhl\w*|waku|wakue|backplate|kabel\w*|cable\w*|przewod\w*|"
     r"adapter\w*|cooler\w*|chlodzeni\w*|radiator\w*|uchwyt\w*|podstawk\w*|holder|bracket|stojak\w*|"
     r"zasilacz\w*|psu|netzteil\w*|manual|riser\w*)(?![a-z])")
+_INCLUSION = {"+", "&", "z", "ze", "with", "w", "mit", "inkl", "incl", "plus", "oraz", "i", "a", "und", "and", "s",
+              "es", "ses"}
+
+
+def _accessory_after(after: str) -> bool:
+    """An accessory noun in the first two tokens after the product, with no inclusion marker, is the item sold
+    ("RTX 4090 Waterblock EK"). Further away, or after + / z / with / mit ..., it is an included extra."""
+    if after.lstrip()[:1] in (",", ";", "(", "/", "+"):
+        return False
+    for tok in after.split()[:2]:
+        bare = tok.strip(",;:.()")
+        if tok.startswith("+") or bare in _INCLUSION:
+            return False
+        if bare != "manual" and _ACCESSORY.search(" " + bare + " "):
+            return not (bare.startswith("cooler") and after.split()[after.split().index(tok) + 1: after.split().index(tok) + 2] == ["master"])
+    return False
+
+
+def _accessory_blocks(t: str, start: int, end: int) -> bool:
+    return _ACCESSORY.search(t[:start]) is not None or _accessory_after(t[end:])
+
+
 # "for <chip>": an accessory made for the card, or a swap ("na RTX 4090")
 _FOR_CHIP = re.compile(r"(?<![a-z])(?:do|fur|for|pro|pod|k)\s+(?:(?:nvidia|geforce|amd|radeon|intel)\s+)?$")
 
@@ -261,7 +283,7 @@ def _gpu(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
     for e, s, en, _m in hits:
         if _PRE_CMP.search(t[:s]) or _POST_CMP.match(t[en:]):
             continue
-        if _FOR_CHIP.search(t[:s]) or _ACCESSORY.search(t[:s]):
+        if _FOR_CHIP.search(t[:s]) or _accessory_blocks(t, s, en):
             return ("", "", 0.0)  # accessory "for" the chip, or an accessory noun before it
         if _SECOND_CHIP.match(t[en:]) and _SECOND_CHIP.match(t[en:]).group(1) in _model_numbers():
             return ("", "", 0.0)  # "RTX 4090/4080", "4090 + 3090": two cards
@@ -466,7 +488,11 @@ def rules_extract(title: str, description: str, lang: str) -> Extraction:
     if not (wanted or box_only or _MERCH.search(t)):
         result = _gpu(t, gpu_bundle)
         if result is None:
-            result = (None if _ACCESSORY.search(t) else (_ram(t, other_bundle) or _ssd(t, other_bundle)))
+            result = _ram(t, other_bundle) or _ssd(t, other_bundle)
+            if result and result[0]:
+                anchor = _DDR.search(t) if result[1].startswith("ram") else _SSD_SIGNAL.search(t)
+                if anchor and _accessory_blocks(t, anchor.start(), anchor.end()):
+                    result = None
     key, cat, cert = result if result and result[0] else (None, None, 0.0)
     items = gpu_bundle if (key and cat in taxonomy.GPU_CATEGORIES) else other_bundle
     return Extraction(

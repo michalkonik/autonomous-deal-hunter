@@ -9,6 +9,7 @@ Conservative and expected results differ only by the exit price (P25 vs median).
 """
 from __future__ import annotations
 
+import copy
 import re
 from dataclasses import dataclass
 from datetime import date, timedelta
@@ -18,11 +19,11 @@ from typing import Any, Callable, Iterable, Protocol
 
 import yaml
 
-from .customs import DEFAULT_CN, import_fees_eur
+from .customs import DEFAULT_CN, import_fees_eur, is_low_value
 from .money import q2
 
 DATA = Path(__file__).resolve().parent.parent / "data"
-ZERO = Decimal("0")
+ZERO = Decimal("0.00")  # zero lines carry 2 dp like every other line
 
 # The 27 EU member states (ISO 3166-1 alpha-2; Greece is GR, not the VAT prefix EL).
 EU = frozenset({"AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE",
@@ -104,10 +105,6 @@ def _num(x: Decimal) -> str:
     return format(x.normalize(), "f")
 
 
-def _as_date(v: Any) -> date:
-    return v if isinstance(v, date) else date.fromisoformat(str(v))
-
-
 def norm_country(code: str) -> str:
     c = (code or "").strip().upper()
     return COUNTRY_ALIASES.get(c, c)
@@ -124,10 +121,10 @@ def _cached(kind: str, path: Path, parse: Callable[[Any], Any]) -> Any:
     key = (kind, str(path.resolve()))
     hit = _CACHE.get(key)
     if hit is not None and hit[0] == mtime:
-        return hit[1]
+        return copy.deepcopy(hit[1])
     val = parse(yaml.safe_load(path.read_text()))
     _CACHE[key] = (mtime, val)
-    return val
+    return copy.deepcopy(val)
 
 
 def _parse_fees(raw: dict) -> dict[str, dict[str, Any]]:
@@ -148,12 +145,12 @@ def _parse_fees(raw: dict) -> dict[str, dict[str, Any]]:
 
 
 def load_fees(path: Path | None = None) -> dict[str, dict[str, Any]]:
-    """Channel fees from data/fees.yaml (cached; re-read when the file's mtime changes). Do not mutate."""
+    """Channel fees from data/fees.yaml (cached; re-read when the file's mtime changes). Callers get a deep copy."""
     return _cached("fees", path or DATA / "fees.yaml", _parse_fees)
 
 
 def load_shipping(path: Path | None = None) -> dict[str, Any]:
-    """Shipping defaults and lanes from data/shipping.yaml (cached like load_fees). Do not mutate."""
+    """Shipping defaults and lanes from data/shipping.yaml (cached like load_fees). Callers get a deep copy."""
     return _cached("shipping", path or DATA / "shipping.yaml", lambda raw: raw)
 
 
@@ -228,7 +225,9 @@ async def net(inp: NetInputs, cfg, fx, customs: DutyLookup | None = None) -> Net
     capital = buy + inbound
     # Polish-invoiced service costs whose VAT we deduct (gross amounts); fees are added per scenario.
     deductible: list[tuple[str, Decimal]] = []
-    if lane_vat_deductible(origin, "PL", shipping):
+    # Inbound shipping VAT is deductible only if a Polish VAT invoice exists: the seller is a business and
+    # issued one. A private seller (no invoice) reimbursed for shipping gives us nothing to deduct.
+    if lane_vat_deductible(origin, "PL", shipping) and inp.seller_is_business and inp.has_vat_invoice:
         deductible.append(("inbound shipping", inbound))
     if lane_vat_deductible("PL", fee["dest"], shipping):
         deductible.append(("outbound shipping", outbound))
@@ -250,7 +249,7 @@ async def net(inp: NetInputs, cfg, fx, customs: DutyLookup | None = None) -> Net
         arrival = day + timedelta(days=int(ic.transit_days))
         value_eur = buy / await fx.rate("EUR", day)
         # Low-value consignment: the flat EUR/item duty (inside the import fees) REPLACES ad-valorem duty.
-        low_value = value_eur <= dec(ic.consignment_max_eur) and arrival >= _as_date(ic.consignment_fee_from)
+        low_value = is_low_value(value_eur, arrival, cfg)
         cif = buy + inbound
         if low_value:
             duty = ZERO

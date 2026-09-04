@@ -29,13 +29,21 @@ def _as_date(v) -> date:
     return v if isinstance(v, date) else date.fromisoformat(str(v))
 
 
+def is_low_value(value_eur: Decimal, day: date, cfg) -> bool:
+    """True if a consignment of this goods value, arriving on `day`, is a low-value consignment: value
+    <= `consignment_max_eur` and `day` on or after `consignment_fee_from`. The flat EUR/item duty then
+    replaces ad-valorem duty. `cfg` is the root Config."""
+    ic = cfg.economics.import_costs
+    return value_eur <= Decimal(str(ic.consignment_max_eur)) and day >= _as_date(ic.consignment_fee_from)
+
+
 def import_fees_eur(value_eur: Decimal, items: int, day: date, cfg) -> Decimal:
     """Low-value consignment fee per item (value <= threshold, from a date) plus a per-item handling fee
     (from a date). Every constant comes from `cfg.economics.import_costs` (config/economics.yaml); `cfg` is
     the root Config."""
     ic = cfg.economics.import_costs
     fee = Decimal(0)
-    if value_eur <= Decimal(str(ic.consignment_max_eur)) and day >= _as_date(ic.consignment_fee_from):
+    if is_low_value(value_eur, day, cfg):
         fee += Decimal(str(ic.consignment_fee_eur)) * items
     if day >= _as_date(ic.handling_fee_from):
         fee += Decimal(str(ic.handling_fee_eur)) * items

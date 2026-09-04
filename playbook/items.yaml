@@ -75,3 +75,111 @@
     - key: the correct canonical key if you can tell it (same format as the candidate), else null.
     - certainty: number 0..1, how sure you are of your answer.
     When in doubt answer same false.
+
+- id: scam_kw.prepayment_only
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "tylko przedplata"   # PL: prepayment demanded before any inspection; matched on lowercase text without diacritics
+
+- id: scam_kw.sicher_bezahlen
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "sicher bezahlen"   # DE: fake 'Sicher bezahlen' payment-protection phishing; matched on lowercase text without diacritics
+
+- id: scam_kw.qr_code
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "qr code"   # payment by QR code outside the platform; matched on lowercase text without diacritics
+
+- id: scam_kw.kontakt_mail
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "kontakt tylko mail"   # PL: contact by e-mail only; matched on lowercase text without diacritics
+
+- id: scam_kw.no_phone
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "nie odbieram telefonu"   # PL: refuses calls; matched on lowercase text without diacritics
+
+- id: scam_kw.abroad
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "jestem za granica"   # PL: seller abroad, ships after payment; matched on lowercase text without diacritics
+
+- id: scam_kw.courier_pays
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "kurier odbierze"   # PL: 'my courier will collect', typical triangle scam; matched on lowercase text without diacritics
+
+- id: scam_kw.send_after_payment
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "wysylam po wplacie"   # PL: ships only after payment; matched on lowercase text without diacritics
+
+- id: scam_kw.no_returns_no_inspection
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "bez mozliwosci sprawdzenia"   # PL: no chance to inspect before paying; matched on lowercase text without diacritics
+
+- id: scam_kw.buyer_protection
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "ochrona kupujacego poza"   # buyer-protection claim redirected off the platform; matched on lowercase text without diacritics
+
+- id: scam_kw.only_pay_first
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "nur vorkasse"   # DE: prepayment only; matched on lowercase text without diacritics
+
+- id: scam_kw.western_union
+  kind: scam_kw
+  target: risk
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: "western union"   # untraceable payment method; matched on lowercase text without diacritics

@@ -88,7 +88,8 @@ Service costs invoiced with Polish VAT are deductible. The line is the sum of `i
 |---|---|---|
 | Allegro, OLX fees | yes | `vat_deductible: true` in `data/fees.yaml` |
 | eBay (PL and DE), Kleinanzeigen fees | no: reverse-charged foreign service, the fee is net | `vat_deductible: false` |
-| Inbound shipping from a Polish seller (lane `PL_PL`) | yes | `lanes` in `data/shipping.yaml` |
+| Inbound shipping from a Polish **business that issued a VAT invoice** (lane `PL_PL`) | yes | `lanes` in `data/shipping.yaml`, plus `seller_is_business` and `has_vat_invoice` |
+| Inbound shipping from a Polish private seller, or a business without an invoice | no: no VAT invoice, nothing to deduct | none |
 | Inbound shipping from another EU state or from outside the EU | no | `EU_PL`, `nonEU_PL` |
 | Outbound shipping to a buyer in Poland (`PL_PL`) | yes | channel `dest` in `fees.yaml` picks the lane |
 | Outbound shipping to a buyer abroad (`PL_EU`, eBay.de) | no: international transport is 0% VAT | `PL_EU` |
@@ -161,20 +162,22 @@ evaluated on 2026-11-02 and arrive on 2026-11-09, so the EUR 2 handling fee appl
 
 | # | Case | Buy | Exit (cons / exp) | Cons net | Exp net | Capital | Flags |
 |---|---|---|---|---|---|---|---|
-| 1 | PL private → Allegro (margin scheme) | 2000 PLN | 2600 / 2800 | **84.69** | **190.93** | 2020.00 | — |
+| 1 | PL private → Allegro (margin scheme) | 2000 PLN | 2600 / 2800 | **81.85** | **188.08** | 2020.00 | — |
 | 2 | PL business, VAT invoice → Allegro | 3075 PLN gross | 4200 / 4500 | **267.20** | **426.55** | 3105.00 | — |
 | 3 | CZ private → OLX (CZK) | 14000 CZK | 3000 / 3200 | **108.02** | **224.16** | 2519.50 | bdo_check |
 | 4 | DE private → eBay.de | 450 EUR | 2900 / 3100 | **42.52** | **140.39** | 2057.58 | bdo_check |
 | 5 | US business → Allegro (import, duty 0) | 1000 USD | 6400 / 6900 | **317.64** | **583.22** | 4851.81 | bdo_check |
 | 6 | JP private via forwarder → Allegro (low-value import) | 20000 JPY | 1100 / 1250 | **32.09** | **111.77** | 851.24 | bdo_check |
-| 7 | Loss: PL private → OLX, overpaid | 3000 PLN | 2900 / 3100 | **−411.26** | **−239.96** | 3020.00 | — |
+| 7 | Loss: PL private → OLX, overpaid | 3000 PLN | 2900 / 3100 | **−415.00** | **−243.70** | 3020.00 | — |
 | 8 | Pickup 40 km → Allegro | 1800 PLN | 2600 / 2750 | **134.06** | **213.73** | 1936.00 | — |
-| 9 | Example 1 under ryczałt (+5 PLN health/sale) | 2000 PLN | 2600 / 2800 | **28.29** | **161.89** | 2020.00 | — |
+| 9 | Example 1 under ryczałt (+5 PLN health/sale) | 2000 PLN | 2600 / 2800 | **24.55** | **158.15** | 2020.00 | — |
 | 10 | 30 GPUs, PL invoice, capital over the cap | 120000 PLN gross | 150000 / 160000 | **3847.68** | **9159.22** | 120300.00 | over_capital_cap |
 
 ### 1. PL private → Allegro (margin scheme)
 
 Buy 2000 PLN from a private person in Poland. Inbound 20 and outbound 25, both domestic. p_scam 0.02.
+The private seller issues no VAT invoice, so the inbound shipping carries no deductible VAT (only the
+outbound courier invoice and the Allegro fee do).
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
@@ -183,14 +186,14 @@ Buy 2000 PLN from a private person in Poland. Inbound 20 and outbound 25, both d
 | buy price | −2000.00 | −2000.00 | |
 | inbound shipping | −20.00 | −20.00 | |
 | VAT due | −112.20 | −149.59 | 23 × 600 / 123 = 112.195; 23 × 800 / 123 = 149.5935 |
-| input VAT on services | 47.49 | 50.48 | fees iv(209) = 39.08 (exp iv(225) = 42.07) + iv(20) = 3.74 + iv(25) = 4.67 |
+| input VAT on services | 43.75 | 46.74 | fees iv(209) = 39.08 (exp iv(225) = 42.07) + iv(25) = 4.67; inbound not deductible (private seller, no invoice) |
 | outbound shipping | −25.00 | −25.00 | |
 | returns reserve | −130.00 | −140.00 | 5% × E |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −40.00 | −40.00 | 0.02 × 2000 |
-| *pre-tax* | *111.29* | *250.89* | |
-| income tax | −26.60 | −59.96 | 0.239 × 111.29 = 26.59831; 0.239 × 250.89 = 59.96271 |
-| **net** | **84.69** | **190.93** | |
+| *pre-tax* | *107.55* | *247.15* | |
+| income tax | −25.70 | −59.07 | 0.239 × 107.55 = 25.70445; 0.239 × 247.15 = 59.06885 |
+| **net** | **81.85** | **188.08** | |
 
 Capital 2000 + 20 = **2020.00**.
 
@@ -339,14 +342,14 @@ Buy 3000 PLN, inbound 20 (domestic), no outbound cost, p_scam 0.05.
 | buy price | −3000.00 | −3000.00 | |
 | inbound shipping | −20.00 | −20.00 | |
 | VAT due | 0.00 | −18.70 | margin max(0, −100) = 0; 23 × 100/123 = 18.699 |
-| input VAT on services | 3.74 | 3.74 | inbound iv(20) |
+| input VAT on services | 0.00 | 0.00 | fees 0, outbound 0; inbound iv(20) is not deductible (private seller) |
 | outbound shipping | 0.00 | 0.00 | |
 | returns reserve | −145.00 | −155.00 | |
 | fiscal cost | 0.00 | 0.00 | |
 | risk haircut | −150.00 | −150.00 | 0.05 × 3000 |
-| *pre-tax* | *−411.26* | *−239.96* | |
+| *pre-tax* | *−415.00* | *−243.70* | |
 | income tax | 0.00 | 0.00 | no tax on a loss |
-| **net** | **−411.26** | **−239.96** | |
+| **net** | **−415.00** | **−243.70** | |
 
 Capital **3020.00**.
 
@@ -381,11 +384,11 @@ pre-tax are as in example 1.
 
 | Line | Cons | Exp | How |
 |---|---|---|---|
-| *pre-tax* | *111.29* | *250.89* | as example 1 |
+| *pre-tax* | *107.55* | *247.15* | as example 1 |
 | income tax | −83.00 | −89.00 | 3% × 2600 + 5 = 78 + 5; 3% × 2800 + 5 = 84 + 5 |
-| **net** | **28.29** | **161.89** | |
+| **net** | **24.55** | **158.15** | |
 
-Ryczałt is charged on revenue, not profit: on this thin deal it costs more than liniowy (26.60 cons).
+Ryczałt is charged on revenue, not profit: on this thin deal it costs more than liniowy (25.70 cons).
 
 ### 10. Capital over the cap
 

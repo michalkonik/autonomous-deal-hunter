@@ -1,0 +1,5 @@
+interval_min: 30
+remote: null            # clone URL of deal-hunter-log; only used when log_dir does not exist yet
+branch: log
+log_dir: ~/.local/share/deal-hunter/log
+cards_dir: var/cards/deals

@@ -9,9 +9,10 @@ Defaults (config/economics.yaml, data/fees.yaml, data/shipping.yaml): liniowy 19
 of max(0, pre-tax); VAT 23%; returns reserve 5% of exit; FX spread 1% of foreign-currency amounts; fiscal
 cost per B2C sale 0; clearance max(69 PLN, 2.5% of duties+taxes); import fees dated day + 7 transit days;
 allegro 8% + 1 PLN/item; olx 0%; ebay_de 11% + 0.35 EUR/item, paid out in EUR, buyer in DE.
-All service costs are GROSS. Input VAT on services (deducted): allegro/olx fees, PL->PL shipping
-(inbound from PL, outbound to a PL buyer), clearance. Not deducted: eBay fees, EU/non-EU inbound,
-outbound to DE, pickup.
+All service costs are GROSS. Input VAT on services (deducted): allegro/olx fees, outbound PL->PL
+shipping (to a PL buyer), clearance, and inbound PL->PL shipping ONLY when the seller is a business with
+a VAT invoice (carry B: a private seller reimbursed for shipping issues no invoice). Not deducted: eBay
+fees, EU/non-EU inbound, outbound to DE, pickup.
 """
 import os
 from dataclasses import replace
@@ -93,19 +94,22 @@ EXAMPLES = {
     #    p_scam 0.02.
     #   cons E=2600: fees r(.08*2600)+1 = 208.00+1 = 209.00
     #     VAT margin r(23/123*(2600-2000)) = 13800/123 = 112.195 -> 112.20
-    #     input VAT on services: fees iv(209) = 4807/123 = 39.0813 -> 39.08; inbound iv(20) = 460/123 = 3.7398
-    #       -> 3.74; outbound iv(25) = 575/123 = 4.6748 -> 4.67; total 47.49
+    #     input VAT on services: fees iv(209) = 4807/123 = 39.0813 -> 39.08; outbound iv(25) = 575/123 =
+    #       4.6748 -> 4.67; total 43.75. Inbound NOT deductible: a private seller issues no VAT invoice
+    #       (carry B; was iv(20) = 3.74 before, total 47.49)
     #     returns r(.05*2600) = 130.00; risk r(.02*2000) = 40.00; fiscal 0.00
-    #     pre-tax = 2600-209-2000-20-112.20+47.49-25-130-0-40 = 111.29
-    #     tax r(.239*111.29) = 26.59831 -> 26.60; net = 84.69
+    #     pre-tax = 2600-209-2000-20-112.20+43.75-25-130-0-40 = 107.55
+    #       (running: 2391 -> 391 -> 371 -> 258.80 -> 302.55 -> 277.55 -> 147.55 -> 107.55)
+    #     tax r(.239*107.55) = 25.70445 -> 25.70; net = 81.85
     #   exp E=2800: fees 224+1 = 225.00; VAT 18400/123 = 149.5935 -> 149.59
-    #     input VAT: iv(225) = 5175/123 = 42.0732 -> 42.07; + 3.74 + 4.67 = 50.48; returns 140.00
-    #     pre-tax = 2800-225-2000-20-149.59+50.48-25-140-40 = 250.89
-    #     tax r(.239*250.89) = 59.96271 -> 59.96; net = 190.93
+    #     input VAT: iv(225) = 5175/123 = 42.0732 -> 42.07; + 4.67 = 46.74; returns 140.00
+    #     pre-tax = 2800-225-2000-20-149.59+46.74-25-140-40 = 247.15
+    #       (running: 2575 -> 575 -> 555 -> 405.41 -> 452.15 -> 427.15 -> 287.15 -> 247.15)
+    #     tax r(.239*247.15) = 59.06885 -> 59.07; net = 188.08
     #   capital = 2000 + 20 = 2020.00; flags none
     1: (inp(buy_price=P("2000"), exit_price_cons_pln=P("2600"), exit_price_exp_pln=P("2800"),
             inbound_ship_pln=P("20"), outbound_ship_pln=P("25"), p_scam=0.02),
-        {}, P("84.69"), P("190.93"), P("2020.00"), set()),
+        {}, P("81.85"), P("188.08"), P("2020.00"), set()),
 
     # 2. PL business with VAT invoice -> Allegro. buy 3075 PLN gross, inbound 30, outbound 30 (both PL->PL),
     #    p_scam 0.01. Invoice VAT r(3075*23/123) = 70725/123 = 575.00 exactly. iv(30) = 690/123 = 5.6098 -> 5.61.
@@ -203,15 +207,17 @@ EXAMPLES = {
         {}, P("32.09"), P("111.77"), P("851.24"), {"bdo_check"}),
 
     # 7. Loss: PL private -> OLX, overpaid. buy 3000, inbound 20 (PL->PL), outbound 0, p_scam 0.05.
-    #   input VAT: fees iv(0) 0.00 + inbound iv(20) 3.74 + outbound iv(0) 0.00 = 3.74
+    #   input VAT: fees iv(0) 0.00 + outbound iv(0) 0.00 = 0.00 (private seller: inbound iv(20) = 3.74 no
+    #     longer deductible, carry B)
     #   cons E=2900: fees 0.00; VAT margin max(0, 2900-3000) = 0.00; returns 145.00; risk 150.00
-    #     pre-tax = 2900-0-3000-20-0+3.74-0-145-0-150 = -411.26; tax max(0, ...) = 0.00; net = -411.26
+    #     pre-tax = 2900-0-3000-20-0+0-0-145-0-150 = -415.00; tax max(0, ...) = 0.00; net = -415.00
     #   exp E=3100: VAT r(23*100/123) = 18.699 -> 18.70; returns 155.00
-    #     pre-tax = 3100-3000-20-18.70+3.74-0-155-150 = -239.96; tax 0.00; net = -239.96
+    #     pre-tax = 3100-3000-20-18.70+0-0-155-150 = -243.70 (100 -> 80 -> 61.30 -> -93.70 -> -243.70);
+    #     tax 0.00; net = -243.70
     #   capital = 3020.00; flags none
     7: (inp(buy_price=P("3000"), exit_channel="olx", exit_price_cons_pln=P("2900"),
             exit_price_exp_pln=P("3100"), inbound_ship_pln=P("20"), p_scam=0.05),
-        {}, P("-411.26"), P("-239.96"), P("3020.00"), set()),
+        {}, P("-415.00"), P("-243.70"), P("3020.00"), set()),
 
     # 8. Pickup 40 km: PL private -> Allegro. buy 1800, pickup r(1.2*2*40 + 40) = 136.00 (no invoice, not
     #    deductible), inbound 0, outbound 25 (PL->PL), p_scam 0.01. Margin base = buy price only.
@@ -229,14 +235,14 @@ EXAMPLES = {
         {}, P("134.06"), P("213.73"), P("1936.00"), set()),
 
     # 9. Ryczalt: the deal of example 1 with tax_mode ryczalt and ryczalt_health_pln_per_sale 5.
-    #   pre-tax as in example 1: cons 111.29, exp 250.89
-    #   cons tax = r(.03*2600) + 5 = 78.00+5 = 83.00; net = 111.29-83.00 = 28.29
-    #   exp tax = r(.03*2800) + 5 = 84.00+5 = 89.00; net = 250.89-89.00 = 161.89
+    #   pre-tax as in example 1 (carry B): cons 107.55, exp 247.15
+    #   cons tax = r(.03*2600) + 5 = 78.00+5 = 83.00; net = 107.55-83.00 = 24.55
+    #   exp tax = r(.03*2800) + 5 = 84.00+5 = 89.00; net = 247.15-89.00 = 158.15
     #   capital 2020.00; flags none
     9: (inp(buy_price=P("2000"), exit_price_cons_pln=P("2600"), exit_price_exp_pln=P("2800"),
             inbound_ship_pln=P("20"), outbound_ship_pln=P("25"), p_scam=0.02),
         {"tax": {"tax_mode": "ryczalt", "ryczalt_health_pln_per_sale": 5}},
-        P("28.29"), P("161.89"), P("2020.00"), set()),
+        P("24.55"), P("158.15"), P("2020.00"), set()),
 
     # 10. Capital over the 30000 USD cap: 30 GPUs from a PL business with invoice -> Allegro.
     #    buy 120000 PLN gross, items 30, inbound 300, outbound 750 (both PL->PL), p_scam 0.01.
@@ -293,13 +299,19 @@ async def test_example_5_line_breakdown_and_duty_lookup():
 
 async def test_input_vat_on_services_by_channel_and_lane():
     cfg, fx, cu = make_cfg(), FakeFx(), FakeCustoms()
-    # example 1: iv(209) 39.08 + iv(20) 3.74 + iv(25) 4.67 = 47.49
-    assert lines_of(await economics.net(EXAMPLES[1][0], cfg, fx, cu))["input VAT on services"] == P("47.49")
+    # example 1: private seller, inbound not deductible: iv(209) 39.08 + iv(25) 4.67 = 43.75
+    assert lines_of(await economics.net(EXAMPLES[1][0], cfg, fx, cu))["input VAT on services"] == P("43.75")
     # example 4: eBay.de fee (reverse charge), EU inbound, outbound to DE: nothing deductible
     assert lines_of(await economics.net(EXAMPLES[4][0], cfg, fx, cu))["input VAT on services"] == P("0.00")
-    # ebay_pl from PL: fee not deductible, PL->PL shipping is: iv(20) 3.74 + iv(25) 4.67 = 8.41
+    # ebay_pl from PL: fee not deductible; outbound PL->PL iv(25) = 4.67 (private seller: no inbound VAT)
     res = await economics.net(replace(EXAMPLES[1][0], exit_channel="ebay_pl"), cfg, fx, cu)
-    assert lines_of(res)["input VAT on services"] == P("8.41")
+    assert lines_of(res)["input VAT on services"] == P("4.67")
+    # PL business WITH invoice: inbound iv(20) = 3.74 counts: 4.67 + 3.74 = 8.41
+    biz = replace(EXAMPLES[1][0], exit_channel="ebay_pl", seller_is_business=True, has_vat_invoice=True)
+    assert lines_of(await economics.net(biz, cfg, fx, cu))["input VAT on services"] == P("8.41")
+    # PL business WITHOUT invoice: nothing to deduct on inbound either
+    noinv = replace(biz, has_vat_invoice=False)
+    assert lines_of(await economics.net(noinv, cfg, fx, cu))["input VAT on services"] == P("4.67")
 
 
 async def test_cons_and_exp_differ_only_by_exit_price():
@@ -408,16 +420,17 @@ async def test_vat_note_uses_configured_rate():
 
 async def test_skala_mode():
     # Example 1 under skala: 12% + 9% = 21% of pre-tax.
-    #   cons r(.21*111.29) = 23.3709 -> 23.37; net 87.92.  exp r(.21*250.89) = 52.6869 -> 52.69; net 198.20
+    #   (pre-tax after carry B: 107.55 / 247.15)
+    #   cons r(.21*107.55) = 22.5855 -> 22.59; net 84.96.  exp r(.21*247.15) = 51.9015 -> 51.90; net 195.25
     res = await economics.net(EXAMPLES[1][0], make_cfg(tax={"tax_mode": "skala"}), FakeFx(), FakeCustoms())
-    assert (res.cons_net_pln, res.exp_net_pln) == (P("87.92"), P("198.20"))
+    assert (res.cons_net_pln, res.exp_net_pln) == (P("84.96"), P("195.25"))
 
 
 async def test_fiscal_cost_per_b2c_sale():
-    # Example 1 with a 2.50 PLN fiscal cost: pre-tax 111.29-2.50 = 108.79; tax r(.239*108.79) = 26.00081
-    # -> 26.00; net = 82.79
+    # Example 1 with a 2.50 PLN fiscal cost: pre-tax 107.55-2.50 = 105.05; tax r(.239*105.05) = 25.10695
+    # -> 25.11; net = 79.94
     res = await economics.net(EXAMPLES[1][0], make_cfg(fiscal_cost_per_b2c_sale_pln=2.5), FakeFx(), FakeCustoms())
-    assert res.cons_net_pln == P("82.79")
+    assert res.cons_net_pln == P("79.94")
 
 
 async def test_pickup_out_of_range_flag():
@@ -488,7 +501,13 @@ def test_fees_cached_by_path_and_mtime(tmp_path):
     p = tmp_path / "fees.yaml"
     p.write_text("channels:\n  allegro: {pct: 0.08}\n")
     a = economics.load_fees(p)
-    assert economics.load_fees(p) is a  # cached: same object, no re-read
+    assert economics.load_fees(p) == a and economics.load_fees(p) is not a  # cached, but a fresh copy
+    st0 = p.stat()
+    p.write_text("channels:\n  allegro: {pct: 0.50}\n")        # same-mtime rewrite: the cache must still serve
+    os.utime(p, ns=(st0.st_atime_ns, st0.st_mtime_ns))
+    assert economics.load_fees(p)["allegro"]["pct"] == P("0.08")
+    p.write_text("channels:\n  allegro: {pct: 0.08}\n")
+    os.utime(p, ns=(st0.st_atime_ns, st0.st_mtime_ns))
     st = p.stat()
     p.write_text("channels:\n  allegro: {pct: 0.10}\n")
     os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
@@ -510,3 +529,34 @@ async def test_best_exit_ignores_disabled_channels():
     assert economics.best_exit(results, enabled=["ebay_pl"])[0] == "ebay_pl"
     with pytest.raises(ValueError):
         economics.best_exit({"kleinanzeigen": results["kleinanzeigen"]})
+
+
+async def test_zero_lines_are_two_decimals():
+    # carry B: every line, zero or not, is a 2 dp Decimal ("0.00", never "0")
+    for ex in (1, 5, 6, 7):
+        res = await economics.net(EXAMPLES[ex][0], make_cfg(), FakeFx(), FakeCustoms())
+        for line in res.lines_cons + res.lines_exp:
+            assert line.pln.as_tuple().exponent == -2, (ex, line)
+    res = await economics.net(EXAMPLES[6][0], make_cfg(), FakeFx(), FakeCustoms())
+    assert str(lines_of(res)["customs duty"]) == "0.00"
+    assert str(lines_of(res)["fiscal cost"]) == "0.00"
+
+
+def test_is_low_value():
+    cfg = make_cfg()
+    f = customs.is_low_value
+    assert f(P("150"), date(2026, 7, 1), cfg) is True          # both boundaries inclusive
+    assert f(P("150.01"), date(2026, 7, 1), cfg) is False
+    assert f(P("100"), date(2026, 6, 30), cfg) is False         # before the flat duty exists
+    assert f(P("0"), date(2026, 11, 9), cfg) is True
+
+
+def test_loaders_return_copies(tmp_path):
+    fees = economics.load_fees()
+    fees["allegro"]["pct"] = P("99")
+    fees["allegro"]["by_category"]["x"] = {}
+    assert economics.load_fees()["allegro"]["pct"] != P("99")
+    assert "x" not in economics.load_fees()["allegro"]["by_category"]
+    ship = economics.load_shipping()
+    ship["lanes"]["PL_PL"]["vat_deductible"] = False
+    assert economics.load_shipping()["lanes"]["PL_PL"]["vat_deductible"] is True

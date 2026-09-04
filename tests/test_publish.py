@@ -1,0 +1,146 @@
+import asyncio
+import json
+import subprocess
+from datetime import datetime, timezone
+from decimal import Decimal
+
+import pytest
+
+from dh import config, publish
+from dh.models import Deal
+from dh.store import Store
+
+NOW = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+
+
+def git(cwd, *a):
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *a], cwd=cwd, check=True,
+                          capture_output=True, text=True).stdout
+
+
+def make_remote(tmp_path):
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "log", str(bare)], check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(seed)], check=True, capture_output=True)
+    git(seed, "checkout", "-q", "-b", "log")
+    (seed / "README.md").write_text("log\n")
+    git(seed, "add", "-A"); git(seed, "commit", "-qm", "init"); git(seed, "push", "-q", "origin", "log")
+    return bare
+
+
+def make_env(tmp_path):
+    bare = make_remote(tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "publish.yaml").write_text(
+        f"interval_min: 30\nremote: {bare}\nbranch: log\nlog_dir: {tmp_path / 'clone'}\ncards_dir: var/cards/deals\n")
+    cfg = config.load(tmp_path)
+    st = Store(tmp_path / "t.db")
+    return bare, cfg, st
+
+
+def add_deal(st, tmp_path, tier=2, star=False, net="100", key="RTX 4090"):
+    d = Deal(id=None, listing_ref=1, key=key, tier=tier, star=star, effort="easy", confidence="high",
+             cons_net_pln=Decimal("1"), exp_net_pln=Decimal("1"), cons_net_usd=Decimal(net),
+             exp_net_usd=Decimal(net), capital_usd=Decimal("1"), breakdown_json="{}", evidence_json="{}",
+             reasons=[], created_at=NOW)
+    did = st.save_deal(d)
+    cdir = tmp_path / "var/cards/deals/2026-10-29"
+    cdir.mkdir(parents=True, exist_ok=True)
+    (cdir / f"deal-{did}.md").write_text(
+        f"---\ndeal_id: {did}\noutcome: {{status: open, price_pln: null, date: null, note: ''}}\n---\n"
+        f"# {key}\n[listing](https://olx.pl/x{did})\n")
+    (cdir / f"deal-{did}.json").write_text(json.dumps({"deal_id": did}))
+    return did
+
+
+def clone2(tmp_path, bare):
+    c = tmp_path / "phone"
+    subprocess.run(["git", "clone", "-q", "-b", "log", str(bare), str(c)], check=True, capture_output=True)
+    return c
+
+
+def test_outcome_edit_becomes_mark(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["pushed"] and r["cards"] == 1
+    # edit in the "GitHub app"
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("{status: open, price_pln: null, date: null, note: ''}",
+                                         "{status: bought, price_pln: 3100, date: 2026-10-30, note: picked up}"))
+    git(phone, "commit", "-qam", "mark bought"); git(phone, "push", "-q", "origin", "log")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["marks"] == 1
+    m = st.conn.execute("select * from marks").fetchall()
+    assert len(m) == 1 and m[0]["status"] == "bought" and m[0]["source"] == "github"
+    assert Decimal(m[0]["price_pln"]) == 3100 and "picked up" in m[0]["note"]
+    # unchanged -> no duplicate, and card sync did not clobber the edit
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
+    assert "bought" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()
+
+
+def test_index_order():
+    def c(i, tier, star, net):
+        return publish.CardFile(None, None, i, tier, star, Decimal(net), NOW)
+    cards = [c(1, 2, False, "500"), c(2, 1, False, "300"), c(3, 3, False, "900"), c(4, 2, True, "100"),
+             c(5, 1, False, "800"), c(6, 2, False, "600")]
+    assert [x.deal_id for x in publish.index_order(cards)] == [5, 2, 4, 6, 1, 3]
+
+
+def test_index_file_written(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    a = add_deal(st, tmp_path, tier=3, net="900")
+    b = add_deal(st, tmp_path, tier=1, net="300")
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    idx = (tmp_path / "clone/INDEX.md").read_text()
+    assert idx.index(f"deal-{b}") < idx.index(f"deal-{a}")
+    assert (tmp_path / "clone/daily/2026-10-29.md").is_file()
+    assert (tmp_path / "clone/weekly/2026-W44.md").is_file()
+
+
+def test_push_failure_keeps_state(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("status: open", "status: skipped"))
+    git(phone, "commit", "-qam", "skip"); git(phone, "push", "-q", "origin", "log")
+    add_deal(st, tmp_path, tier=1, net="400")
+    # remote becomes unreachable
+    moved = tmp_path / "remote.gone"
+    bare.rename(moved)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))  # must not raise
+    assert not r["pushed"]
+    assert st.conn.execute("select count(*) from health where kind='push_failed'").fetchone()[0] == 1
+    # state kept: new card committed locally, marks table untouched
+    assert "deal-2" in git(tmp_path / "clone", "show", "--stat", "HEAD")
+    # remote back: the mark (made while it was up) is imported, backlog pushed
+    moved.rename(bare)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["pushed"] and r["marks"] == 1
+    assert st.conn.execute("select status from marks").fetchone()["status"] == "skipped"
+    assert git(tmp_path / "clone", "rev-list", "--count", "origin/log..HEAD").strip() == "0"
+
+
+def test_mark_imported_even_when_push_fails(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("status: open", "status: sold"))
+    git(phone, "commit", "-qam", "sold"); git(phone, "push", "-q", "origin", "log")
+    # pull works, then push is rejected by a failing hook
+    hook = bare / "hooks/pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["marks"] == 1 and not r["pushed"]
+    assert st.conn.execute("select count(*) from marks where status='sold'").fetchone()[0] == 1
+    # card in clone still carries the sold outcome after later syncs
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert "sold" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
