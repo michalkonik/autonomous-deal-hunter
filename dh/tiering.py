@@ -13,6 +13,7 @@ from typing import Any, Literal
 from .economics import EU, load_fees, norm_country
 
 Effort = Literal["easy", "moderate", "heavy"]
+PL_SOURCES = frozenset({"olx", "allegro", "allegro_lokalnie", "sprzedajemy"})  # a missing country means PL here
 
 
 @dataclass
@@ -43,17 +44,18 @@ def _fmt(x: Decimal) -> str:
 def effort_class(listing, exit_channel: str, flags: list[str], estimate, *, extraction=None) -> Effort:
     """heavy: origin outside the EU, `needs_vat_ue`, `bdo_check` with a non-EU origin, or a bundle of >= 3
     items; moderate: any non-PL leg (origin, or the exit channel's buyer country) or days_to_sell > 14;
-    else easy. An unknown listing country counts as Poland (the sources are Polish; the flag `bdo_check`
-    from the economics engine still catches a non-PL origin that the caller passed it).
+    else easy. An unknown listing country is moderate unless the source is a Polish marketplace (PL_SOURCES).
     `extraction` supplies bundle_items (kept keyword-only: the brief's signature has no extraction)."""
-    origin = norm_country(getattr(listing, "country", None) or "PL")
+    country = getattr(listing, "country", None)
+    unknown_origin = not country and getattr(listing, "source", None) not in PL_SOURCES
+    origin = norm_country(country or "PL")
     non_eu = origin not in EU
     bundle = len(getattr(extraction, "bundle_items", None) or [])
     if non_eu or "needs_vat_ue" in flags or ("bdo_check" in flags and non_eu) or bundle >= 3:
         return "heavy"
     dest = norm_country(str(load_fees().get(exit_channel, {}).get("dest", "PL")))
     dts = getattr(estimate, "days_to_sell", None)
-    if origin != "PL" or dest != "PL" or (dts is not None and dts > 14):
+    if unknown_origin or origin != "PL" or dest != "PL" or (dts is not None and dts > 14):
         return "moderate"
     return "easy"
 
@@ -72,18 +74,21 @@ def min_comps(capital_usd: Any, rules: Any) -> int:
 
 
 def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -> tuple[str, list[str]]:
-    """('high'|'medium'|'low', reasons). The reasons list every unmet condition for high, so a card can say
+    """('high'|'medium'|'low'|'excluded', reasons). The reasons list every unmet condition for high, so a card can say
     why a deal is not tier 1.
 
     high: match certainty >= 0.9, >= min_comps comparables <= 30 days old (estimate.n_sold: owner sales,
     eBay sold, probably-sold; asks do not count), p_scam < 0.05, verified live at the same price <= 10 min ago
     (`verified_age_s` is None when never verified or when the price changed), no defect flags, condition known, no hard exclude.
     medium: certainty >= 0.75, p_scam < 0.15, known condition, comparables >= half of min_comps, no hard exclude.
-    Otherwise low."""
+    Otherwise low. A hard-excluded listing is 'excluded' and assign() never tiers it."""
     c = _rules(rules).confidence
     need = min_comps(capital_usd, rules)
     n_sold = getattr(estimate, "n_sold", 0) if estimate is not None else 0
     cert = extraction.certainty if extraction.key else 0.0
+    if risk.hard_exclude:
+        flags = ", ".join(getattr(risk, "flags", []) or [])
+        return "excluded", ["hard exclude" + (f": {flags}" if flags else "")]
     why: list[str] = []
     if cert < float(c.match_certainty_min):
         why.append(f"match certainty {cert:.2f} < {c.match_certainty_min}")
@@ -97,14 +102,10 @@ def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -
         why.append("unresolved defects: " + ", ".join(extraction.defects))
     if extraction.condition == "unknown":
         why.append("condition unknown")
-    if risk.hard_exclude:
-        why.append("hard exclude")
     if not why:
         return "high", []
     m = c.medium
     hard: list[str] = []
-    if risk.hard_exclude:
-        hard.append("hard exclude")
     if cert < float(m.match_certainty_min):
         hard.append("weak match")
     if risk.p_scam >= float(m.p_scam_max):
@@ -121,11 +122,13 @@ def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -
 # ------------------------------------------------------------------------------------------ tiering
 
 def assign(cons_usd: Any, exp_usd: Any, effort: str, conf: str, capital_usd: Any, rules: Any) -> TierResult:
-    """Tier 1: cons >= t1_min (300) and high confidence. Tier 2: clears the effort floor, confidence >= medium.
+    """`conf` 'excluded' -> tier None. Tier 1: cons >= t1_min (300) and high confidence. Tier 2: clears the effort floor, confidence >= medium.
     Tier 3: clears the floor, low confidence. Tier 4: floor*(1-0.2) <= cons < floor. Else None (not logged).
     Capital above the cap: None. star = exp >= star_usd (only for logged deals). The trend-signal tier 4 is
     produced elsewhere."""
     r = _rules(rules)
+    if conf == "excluded":  # a hard-excluded listing is never tiered, at any net
+        return TierResult(None, False, _d(r.floors[effort]), ["hard exclude: not logged"])
     cons, exp, cap = _d(cons_usd), _d(exp_usd), _d(capital_usd)
     floor = _d(r.floors[effort])
     if cap > _d(r.capital_cap_usd):
@@ -146,7 +149,7 @@ def assign(cons_usd: Any, exp_usd: Any, effort: str, conf: str, capital_usd: Any
             reasons.append("low confidence")
     elif cons >= near:
         tier = 4
-        reasons.append(f"conservative net {_fmt(cons)} is within 20% under the {effort} floor {_fmt(floor)}")
+        reasons.append(f"conservative net {_fmt(cons)} is within {_fmt(_d(r.tiers.t4_floor_margin) * 100)}% under the {effort} floor {_fmt(floor)}")
     else:
         return TierResult(None, False, floor,
                           [f"conservative net {_fmt(cons)} below the {effort} floor {_fmt(floor)} (and not within 20%)"])

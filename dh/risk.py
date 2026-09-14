@@ -21,18 +21,23 @@ from .playbook_io import load_items
 _ROOT = Path(__file__).resolve().parent.parent
 
 # Off-platform contact cues (hard exclude). Matched on the title and description.
+# A phone number needs phone-like formatting: a +CC / 00CC prefix, spaced or dashed 3-3-3 groups, or a bare
+# 9-digit run right after a "tel"/"telefon"/"zadzwon"/"kontakt"/"call" cue. A bare digit run (serial, part
+# number) does not match.
 _PHONE = re.compile(
-    r"(?<![\d.,])(?:(?:\+|00)\d{1,3}[\s.-]?)?\d{3}[\s.-]\d{3}[\s.-]\d{3}(?![\d])"   # 123 456 789, +48 123-456-789
-    r"|(?<![\d.,])\+\d{1,3}[\s.-]?\d(?:[\s.-]?\d){7,11}(?!\d)"                         # +491701234567
-    r"|(?<![\d.,])\d{9}(?!\d)")                                                          # 123456789
+    r"(?<![\w.,])(?:\+|00)\d{1,3}[\s.-]?\d(?:[\s.-]?\d){7,11}(?!\d)"                 # +48 600123456, +49 170 1234567
+    r"|(?<![\w.,])\d{3}[\s.-]\d{3}[\s.-]\d{3}(?![\d])"                              # 600 123 456, 600-123-456
+    r"|\b(?:tel|telefon|tel\.|zadzwon|dzwon|kom|komorka|kontakt|call|anruf\w*|handy)\W{0,12}\d{9}(?!\d)", re.I)
 _WHATSAPP = re.compile(r"\bwh?ats?\s?-?app\b|\bwhatsap\b|\bwa\.me\b", re.I)
 _TELEGRAM = re.compile(r"\btelegram\b|\bt\.me/", re.I)
 _URL = re.compile(r"https?://|\bwww\.", re.I)
 _PAYPAL_FF = re.compile(r"paypal.{0,30}(friends|family|freunde|znajomi|rodzin)|(friends|family|freunde|znajomi|rodzin).{0,30}paypal", re.I)
 _TRANSFER = re.compile(r"przelew\w*\s+na\s+konto")
 
-_FLAGSHIP_GPU = re.compile(r"^gpu:rtx-(\d{4})")
-_STOCK_PHOTO_FLAGSHIP = {"4090", "5090"}
+_GPU_ID = re.compile(r"^gpu:([a-z0-9-]+):")
+# Desktop GPU ids the CN/HK-origin rule and the missing-photo rule apply to (taxonomy ids, explicit on purpose).
+_CN_HK_MODELS = frozenset({"rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090"})
+_NO_PHOTO_MODELS = frozenset({"rtx-4090", "rtx-4090d", "rtx-5090", "rtx-5090d"})
 
 
 @dataclass
@@ -48,9 +53,26 @@ def _norm(text: str) -> str:
     return "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
 
 
-def _gpu_model(key: str | None) -> int | None:
-    m = _FLAGSHIP_GPU.match(key or "")
-    return int(m.group(1)) if m else None
+_KW_CACHE: dict[Path, tuple[int, list[tuple[str, str]]]] = {}
+
+
+def _scam_keywords(root: Path) -> list[tuple[str, str]]:
+    """(id, normalised phrase) of the playbook's scam_kw/risk items, cached per items.yaml mtime."""
+    p = Path(root) / "playbook" / "items.yaml"
+    mtime = p.stat().st_mtime_ns if p.is_file() else -1
+    hit = _KW_CACHE.get(p)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    kws = [(it["id"], _norm(str(it["value"]))) for it in load_items(root)
+           if it["kind"] == "scam_kw" and it["target"] == "risk"]
+    _KW_CACHE[p] = (mtime, kws)
+    return kws
+
+
+def _gpu_model(key: str | None) -> str | None:
+    """Desktop GPU taxonomy id of a key (gpu-mobile keys never match)."""
+    m = _GPU_ID.match(key or "")
+    return m.group(1) if m else None
 
 
 def _price_z(listing: Listing, estimate: Any, price_pln: Decimal | None, sigma_floor: float) -> float | None:
@@ -77,7 +99,7 @@ def _offplatform(text: str) -> list[str]:
 
 
 def _checklist(extraction: Extraction, listing: Listing, flags: list[str]) -> list[str]:
-    items = ["Pay only through the platform's own payment or buyer protection; never transfer outside it.",
+    items = ["Pay only through the platform's protected checkout, also for an in-person pickup; never transfer outside it.",
              "Never move the chat to WhatsApp, Telegram or e-mail, and never open links the seller sends."]
     cat = extraction.category or ""
     if cat.startswith("gpu"):
@@ -96,7 +118,7 @@ def _checklist(extraction: Extraction, listing: Listing, flags: list[str]) -> li
     if "too_cheap" in flags:
         items.append("The price is far below the market: assume a scam until a live video call proves the item.")
     if "new_account" in flags or "no_ratings" in flags:
-        items.append("Seller account is new or unrated: insist on pickup with cash only after testing.")
+        items.append("Seller account is new or unrated: test the item before paying, and pay only through the platform's protected checkout.")
     return items
 
 
@@ -126,9 +148,9 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
         hard.append("box_only")
     if extraction.wanted_ad:
         hard.append("wanted_ad")
-    if extraction.for_parts and not cfg.rules.repair.enabled:
+    if (extraction.for_parts or extraction.condition == "for_parts") and not cfg.rules.repair.enabled:
         hard.append("for_parts")
-    hard += _offplatform(text)
+    hard += _offplatform(ntext)  # normalised: lowercase, no diacritics
     if _TRANSFER.search(ntext) and new_account:
         hard.append("transfer_new_account")
     flags += hard
@@ -139,6 +161,10 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
     if z is not None and z < float(rk.z_threshold):
         feats["too_cheap"] = 1.0
         flags.append("too_cheap")
+        price = price_pln if price_pln is not None else listing.price
+        if price < Decimal(str(rk.extreme_price_frac)) * Decimal(str(estimate.median_pln)):
+            feats["extreme_price"] = 1.0
+            flags.append("extreme_price")
     if new_account:
         feats["new_account"] = 1.0
         flags.append("new_account")
@@ -149,16 +175,13 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
         feats["stock_photo"] = 1.0
         flags.append("stock_photo")
     model = _gpu_model(extraction.key)
-    if model is not None and model >= 4080 and (listing.country or "").upper() in {"CN", "HK"}:
+    if model in _CN_HK_MODELS and (listing.country or "").upper() in {"CN", "HK"}:
         feats["origin_cn_hk"] = 1.0
         flags.append("origin_cn_hk")
-    if model is not None and str(model) in _STOCK_PHOTO_FLAGSHIP and not listing.photos:
+    if model in _NO_PHOTO_MODELS and not listing.photos:
         feats["no_photos_flagship"] = 1.0
         flags.append("no_photos_flagship")
-    hits = []
-    for it in load_items(root):
-        if it["kind"] == "scam_kw" and it["target"] == "risk" and _norm(str(it["value"])) in ntext:
-            hits.append(it["id"])
+    hits = [iid for iid, needle in _scam_keywords(root) if needle in ntext]
     if hits:
         feats["scam_kw"] = float(min(len(hits), int(rk.scam_kw_max_hits)))
         flags += hits

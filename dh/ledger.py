@@ -1,0 +1,361 @@
+"""Clears-at ledger: infer which classified listings probably sold by watching them disappear (spec §6.2, §15a.1).
+
+Only watched time counts. The agent runs when the owner starts it, so every inference is confined to an
+observation window: the span between `dh start` and `dh stop` (or the last observation before a crash).
+
+Vocabulary
+- arm: one search the agent repeats, `arm_id(source, query_text)`. One `observe(..., arm=...)` call is one sweep.
+- sweep: recorded in `sweeps`. It counts as evidence of absence only when it succeeded (ok) AND returned at least
+  one listing; a zero-result sweep is more likely a broken parser than an empty market.
+- sighting without an arm (mailbox alert, detail/verify fetch): updates the listing, records no sweep, and can never
+  make other listings disappear.
+
+Disappearance (`sweep_disappeared`, also run by `close_all_windows` before a window closes). A listing gets
+`disappeared_at` when, after its last sighting t0:
+1. some arm that has returned it made 2 successful non-empty sweeps after t0 without it;
+2. t0 and both sweeps lie in the SAME observation window (the window of the last sighting), so a stop or a crash
+   in between makes the disappearance unknown and nothing is inferred;
+3. inside that window, from t0 to the second sweep, no two consecutive successful sweeps of the source are more
+   than `max_gap` apart. This catches a crashed run whose window was never closed (startup recovery skipped).
+`disappeared_at` = the first sweep that missed it (the latest possible disappearance time). A listing seen again
+later has `disappeared_at` cleared (it was only pushed off the results page, or relisted).
+
+Appearance. A listing first returned by an arm whose previous successful non-empty sweep lies in the same window
+and within `max_gap` appeared under watch: `appeared_at` = that previous sweep (the earliest possible time).
+Listings already present when watching started have an unknown age unless the site gives `posted_at`.
+
+Probably sold (`clears_at`): disappeared, age at disappearance ≤ 72 h (age from min(posted_at, appeared_at); unknown
+age → not counted), and last price ≤ median ask of the same key in the same currency over the 30 days before the
+disappearance (one ask per listing; at least `min_asks` asks). Kind `probably_sold`, weight 0.5.
+Condition: the matcher leaves most classified titles at `unknown`; `unknown` is valued as `used`
+(`condition_filter`). Box-only, for-parts and wanted ads are never comparables.
+
+Observations: one row on first sighting and one on every price change (first price + every cut), not one per sweep.
+"""
+from __future__ import annotations
+
+import dataclasses
+import sqlite3
+from datetime import datetime, timedelta
+from decimal import Decimal
+from statistics import median
+from typing import Callable
+
+from .models import CompRow, Listing
+from .money import q2
+from .store import Store, _iso
+
+MAX_GAP = timedelta(hours=6)
+PROBABLY_SOLD_MAX_AGE = timedelta(hours=72)
+ASK_WINDOW = timedelta(days=30)
+MIN_ASKS = 3
+ACTIVE_ASK_MAX_AGE = timedelta(days=3)
+PROBABLY_SOLD_WEIGHT = 0.5
+ACTIVE_ASK_WEIGHT = 0.3
+
+_TABLES = (
+    """create table if not exists sweeps (
+         id integer primary key, source text not null, arm text not null, window_id integer,
+         ts text not null, ok integer not null, n_results integer not null default 0, note text)""",
+    "create index if not exists idx_sweeps_window on sweeps(window_id, arm, ts)",
+    """create table if not exists listing_arms (
+         listing_id integer not null, arm text not null, primary key (listing_id, arm))""",
+)
+_COLUMNS = {
+    "listings": ("disappeared_at text", "appeared_at text", "last_window_id integer"),
+    "windows": ("last_obs_at text",),
+}
+
+
+def _t(s: str | None) -> datetime | None:
+    return None if s is None else datetime.fromisoformat(s)
+
+
+def migrate(store: Store) -> None:
+    """Idempotent: ledger tables and columns, added without touching dh/store.py."""
+    if getattr(store, "_ledger_migrated", False):
+        return
+    for sql in _TABLES:
+        store.ensure_table(sql)
+    for table, cols in _COLUMNS.items():
+        have = {r["name"] for r in store.conn.execute(f"pragma table_info({table})")}
+        for col in cols:
+            if col.split()[0] not in have:
+                store.ensure_table(f"alter table {table} add column {col}")
+    store.ensure_table("create index if not exists idx_listings_window on listings(source, last_window_id)")
+    store._ledger_migrated = True
+
+
+def arm_id(source: str, query_text: str) -> str:
+    return f"{source}:{' '.join(query_text.lower().split())}"
+
+
+# ------------------------------------------------------------------ windows
+
+
+def current_window(store: Store, source: str) -> sqlite3.Row | None:
+    migrate(store)
+    return store.conn.execute("select * from windows where source=? and closed_at is null order by id desc limit 1",
+                              (source,)).fetchone()
+
+
+def open_window(store: Store, source: str, ts: datetime) -> int:
+    """Open a new window for `source`; any window of the source still open is stale and is closed first."""
+    migrate(store)
+    _iso(ts)
+    for w in store.conn.execute("select * from windows where source=? and closed_at is null order by id",
+                                (source,)).fetchall():
+        _close(store, w, ts)
+    wid = store.open_window(source, ts)
+    store.conn.execute("update windows set last_obs_at=? where id=?", (_iso(ts), wid))
+    store.conn.commit()
+    return wid
+
+
+def close_all_windows(store: Store, ts: datetime) -> int:
+    """`dh stop` and startup recovery: close every open window at its last observation time (never later than ts).
+
+    Evidence gathered inside a window (sweeps already made) is evaluated first; nothing after the close counts.
+    Returns the number of windows closed.
+    """
+    migrate(store)
+    _iso(ts)
+    rows = store.conn.execute("select * from windows where closed_at is null order by id").fetchall()
+    for w in rows:
+        _close(store, w, ts)
+    return len(rows)
+
+
+def _close(store: Store, w: sqlite3.Row, ts: datetime) -> None:
+    opened = _t(w["opened_at"])
+    last = _t(w["last_obs_at"]) or opened
+    at = max(opened, min(last, ts))
+    _infer_window(store, w, at)
+    store.close_window(w["id"], at)
+
+
+# ------------------------------------------------------------------ observing
+
+
+def observe(store: Store, source: str, listings: list[Listing], ts: datetime, *, arm: str | None = None,
+            max_gap: timedelta = MAX_GAP) -> list[int]:
+    """Upsert listings seen at `ts` and record observations. With `arm`, this call is one successful sweep of it.
+
+    Opens a window for the source if none is open. Listings with a price ≤ 0 are ignored. Returns listing ids.
+    """
+    migrate(store)
+    ts_iso = _iso(ts)
+    w = current_window(store, source)
+    wid = w["id"] if w is not None else open_window(store, source, ts)
+    if w is not None and ts < _t(w["opened_at"]):
+        raise ValueError(f"observation at {ts_iso} precedes its window ({w['opened_at']})")
+    for l in listings:
+        if l.source != source:
+            raise ValueError(f"listing from {l.source!r} observed as {source!r}")
+    listings = [l for l in listings if l.price is not None and l.price > 0]
+
+    prev_sweep = None
+    if arm is not None:
+        prev_sweep = store.conn.execute(
+            "select ts from sweeps where window_id=? and arm=? and ok=1 and n_results>0 and ts<? "
+            "order by ts desc limit 1", (wid, arm, ts_iso)).fetchone()
+    appeared = None
+    if prev_sweep is not None and ts - _t(prev_sweep["ts"]) <= max_gap:
+        appeared = prev_sweep["ts"]
+
+    ids = []
+    for l in listings:
+        old = store.conn.execute("select id, price from listings where source=? and source_id=?",
+                                 (source, l.source_id)).fetchone()
+        lid = store.upsert_listing(dataclasses.replace(l, seen_at=ts))
+        if old is None or Decimal(old["price"]) != l.price:
+            store.record_observation(lid, l.price, ts)
+        store.conn.execute("update listings set last_window_id=?, disappeared_at=null where id=?", (wid, lid))
+        if old is None and appeared is not None:
+            store.conn.execute("update listings set appeared_at=? where id=?", (appeared, lid))
+        if arm is not None:
+            store.conn.execute("insert or ignore into listing_arms (listing_id, arm) values (?,?)", (lid, arm))
+        ids.append(lid)
+    if arm is not None:
+        store.conn.execute("insert into sweeps (source, arm, window_id, ts, ok, n_results) values (?,?,?,?,1,?)",
+                           (source, arm, wid, ts_iso, len(listings)))
+    if listings:
+        store.conn.execute("update windows set last_obs_at=? where id=? and (last_obs_at is null or last_obs_at<?)",
+                           (ts_iso, wid, ts_iso))
+    store.conn.commit()
+    return ids
+
+
+def record_sweep(store: Store, source: str, arm: str, ts: datetime, ok: bool, n_results: int = 0,
+                 note: str = "") -> None:
+    """Record a sweep that did not go through `observe` (a block, an error, a timeout). Failed sweeps never count."""
+    migrate(store)
+    w = current_window(store, source)
+    store.conn.execute("insert into sweeps (source, arm, window_id, ts, ok, n_results, note) values (?,?,?,?,?,?,?)",
+                       (source, arm, None if w is None else w["id"], _iso(ts), int(ok), n_results, note))
+    store.conn.commit()
+
+
+# ------------------------------------------------------------------ disappearance
+
+
+def sweep_disappeared(store: Store, source: str, ts: datetime, *, max_gap: timedelta = MAX_GAP) -> list[int]:
+    """Mark listings of `source` that vanished under watch (see module doc). Returns the ids marked now."""
+    migrate(store)
+    _iso(ts)
+    out: list[int] = []
+    for w in store.conn.execute("select * from windows where source=? and closed_at is null order by id",
+                                (source,)).fetchall():
+        out += _infer_window(store, w, ts, max_gap)
+    return out
+
+
+def _infer_window(store: Store, w: sqlite3.Row, until: datetime, max_gap: timedelta = MAX_GAP) -> list[int]:
+    if w["closed_at"] is not None:
+        until = min(until, _t(w["closed_at"]))
+    sweeps = [(r["arm"], _t(r["ts"])) for r in store.conn.execute(
+        "select arm, ts from sweeps where window_id=? and ok=1 and n_results>0 order by ts", (w["id"],))]
+    sweeps = [(a, t) for a, t in sweeps if t <= until]
+    if not sweeps:
+        return []
+    by_arm: dict[str, list[datetime]] = {}
+    for a, t in sweeps:
+        by_arm.setdefault(a, []).append(t)
+    beats = [t for _, t in sweeps]
+
+    arms_of: dict[int, list[str]] = {}
+    for r in store.conn.execute(
+            """select la.listing_id, la.arm from listing_arms la join listings l on l.id=la.listing_id
+               where l.source=? and l.last_window_id=? and l.disappeared_at is null""", (w["source"], w["id"])):
+        arms_of.setdefault(r["listing_id"], []).append(r["arm"])
+    marked = []
+    for c in store.conn.execute(
+            "select id, last_seen_at from listings where source=? and last_window_id=? and disappeared_at is null",
+            (w["source"], w["id"])).fetchall():
+        t0 = _t(c["last_seen_at"])
+        arms = arms_of.get(c["id"], [])
+        first_miss = None
+        for a in arms:
+            after = [t for t in by_arm.get(a, ()) if t > t0]
+            if len(after) < 2:
+                continue
+            s1, s2 = after[0], after[1]
+            if not _continuous(t0, s2, beats, max_gap):
+                continue
+            if first_miss is None or s1 < first_miss:
+                first_miss = s1
+        if first_miss is not None:
+            store.conn.execute("update listings set disappeared_at=? where id=?", (_iso(first_miss), c["id"]))
+            marked.append(c["id"])
+    store.conn.commit()
+    return marked
+
+
+def _continuous(t0: datetime, end: datetime, beats: list[datetime], max_gap: timedelta) -> bool:
+    points = [t0] + [t for t in beats if t0 < t <= end]
+    return all(b - a <= max_gap for a, b in zip(points, points[1:]))
+
+
+# ------------------------------------------------------------------ comps
+
+
+_SALEABLE = ("coalesce(e.box_only,0)=0 and coalesce(e.for_parts,0)=0 and coalesce(e.wanted_ad,0)=0 "
+             "and coalesce(e.condition,'') != 'for_parts'")
+USED_LIKE = ("used", "unknown")  # a classified ad with no stated condition is valued as used
+
+
+def condition_filter(condition: str | None) -> tuple[str, list]:
+    """SQL fragment on extractions `e`: None = any; 'used'/'unknown' = used, unknown or missing; else exact."""
+    if condition is None:
+        return "", []
+    if condition in USED_LIKE:
+        return " and (e.condition is null or e.condition in ('used','unknown'))", []
+    return " and e.condition=?", [condition]
+
+
+def _pln(price: Decimal, currency: str) -> Decimal | None:
+    return q2(price) if currency.upper() == "PLN" else None
+
+
+def _price_at(store: Store, listing_id: int, t: datetime, fallback: str) -> Decimal:
+    r = store.conn.execute("select price from observations where listing_id=? and seen_at<=? "
+                           "order by seen_at desc, id desc limit 1", (listing_id, _iso(t))).fetchone()
+    return Decimal(r["price"] if r else fallback)
+
+
+def _median_ask(store: Store, key: str, currency: str, t: datetime, window: timedelta) -> tuple[Decimal | None, int]:
+    """Median of one ask per listing (its price at t) for listings of `key` in `currency` live during [t-window, t]."""
+    rows = store.conn.execute(
+        f"""select l.id, l.price, l.first_seen_at, l.last_seen_at from listings l
+            join extractions e on e.listing_id=l.id
+            where e.key=? and upper(l.currency)=? and {_SALEABLE}""", (key, currency.upper())).fetchall()
+    lo = t - window
+    asks = [_price_at(store, r["id"], t, r["price"]) for r in rows
+            if _t(r["first_seen_at"]) <= t and _t(r["last_seen_at"]) >= lo]
+    return (median(asks) if asks else None), len(asks)
+
+
+def clears_at(store: Store, key: str, condition: str | None, since: datetime, *,
+              channel_of: Callable[[str], str] = lambda s: s, max_age: timedelta = PROBABLY_SOLD_MAX_AGE,
+              ask_window: timedelta = ASK_WINDOW, min_asks: int = MIN_ASKS) -> list[CompRow]:
+    """Probably-sold comparables for `key` (and `condition`, None = any) that disappeared at or after `since`."""
+    migrate(store)
+    sql = f"""select l.*, e.condition as cond from listings l join extractions e on e.listing_id=l.id
+              where e.key=? and l.disappeared_at is not null and l.disappeared_at>=? and {_SALEABLE}"""
+    args: list = [key, _iso(since)]
+    frag, extra = condition_filter(condition)
+    sql, args = sql + frag, args + extra
+    out = []
+    for r in store.conn.execute(sql + " order by l.disappeared_at, l.id", args).fetchall():
+        gone = _t(r["disappeared_at"])
+        starts = [t for t in (_t(r["posted_at"]), _t(r["appeared_at"])) if t is not None]
+        if not starts:
+            continue  # present when watching started, no posted date: age unknown
+        age = gone - min(starts)
+        if age > max_age:
+            continue
+        price = _price_at(store, r["id"], gone, r["price"])
+        med, n = _median_ask(store, key, r["currency"], gone, ask_window)
+        if med is None or n < min_asks or price > med:
+            continue
+        out.append(CompRow(key=key, condition=r["cond"], channel=channel_of(r["source"]), kind="probably_sold",
+                           price=price, currency=r["currency"].upper(), at=gone, weight=PROBABLY_SOLD_WEIGHT,
+                           ref=r["url"] or f"listing:{r['id']}", price_pln=_pln(price, r["currency"]),
+                           country=r["country"], listing_id=r["id"], days_to_sell=age.total_seconds() / 86400))
+    return out
+
+
+def active_asks(store: Store, key: str, condition: str | None, now: datetime, *,
+                channel_of: Callable[[str], str] = lambda s: s,
+                max_age: timedelta = ACTIVE_ASK_MAX_AGE) -> list[CompRow]:
+    """Live asks for `key` from tracked listings: not disappeared, last seen within `max_age` before `now`."""
+    migrate(store)
+    sql = f"""select l.*, e.condition as cond from listings l join extractions e on e.listing_id=l.id
+              where e.key=? and l.disappeared_at is null and l.last_seen_at>=? and l.last_seen_at<=?
+              and {_SALEABLE}"""
+    args: list = [key, _iso(now - max_age), _iso(now)]
+    frag, extra = condition_filter(condition)
+    sql, args = sql + frag, args + extra
+    out = []
+    for r in store.conn.execute(sql + " order by l.id", args).fetchall():
+        price = Decimal(r["price"])
+        out.append(CompRow(key=key, condition=r["cond"], channel=channel_of(r["source"]), kind="active_ask",
+                           price=price, currency=r["currency"].upper(), at=_t(r["last_seen_at"]),
+                           weight=ACTIVE_ASK_WEIGHT, ref=r["url"] or f"listing:{r['id']}",
+                           price_pln=_pln(price, r["currency"]), country=r["country"], listing_id=r["id"]))
+    return out
+
+
+def watched_hours(store: Store, source: str | None = None, until: datetime | None = None) -> float:
+    """Total observed time (scoreboard, §15a.1). Open windows count up to their last observation."""
+    migrate(store)
+    sql, args = "select * from windows", []
+    if source is not None:
+        sql, args = sql + " where source=?", [source]
+    total = 0.0
+    for w in store.conn.execute(sql, args).fetchall():
+        end = _t(w["closed_at"]) or _t(w["last_obs_at"]) or _t(w["opened_at"])
+        if until is not None:
+            end = min(end, until)
+        total += max(0.0, (end - _t(w["opened_at"])).total_seconds() / 3600)
+    return total

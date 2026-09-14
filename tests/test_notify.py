@@ -49,7 +49,12 @@ def test_push_headers_ok(tmp_path):
     assert ok and seen["url"].endswith("/" + notify.topic(tmp_path))
     assert seen["h"]["priority"] == "urgent" and seen["h"]["tags"] == "moneybag"
     assert seen["h"]["click"] == "https://olx/1" and seen["h"]["actions"] == "view, Card, https://card"
-    assert st.conn.execute("select count(*) from pending_pushes").fetchone()[0] == 0 if _has(st) else True
+    assert not _has(st) or st.conn.execute("select count(*) from pending_pushes").fetchone()[0] == 0
+    # RFC 2047-encoded non-ASCII title
+    import base64
+    raw = seen["h"]["title"]
+    assert raw.startswith("=?UTF-8?B?") and raw.endswith("?=")
+    assert base64.b64decode(raw[10:-2]).decode().startswith("T1 ★ +$640 RTX 4090")
 
 
 def _has(st):
@@ -95,3 +100,60 @@ def test_pending_expires_after_6h(tmp_path):
     asyncio.run(notify.retry_pending(st, cfg, tmp_path, client=down, secret_fn=lambda r: None,
                                      now=t0 + timedelta(hours=6, minutes=1)))
     assert st.conn.execute("select count(*) from pending_pushes").fetchone()[0] == 0
+
+
+def test_title_strips_control_chars():
+    d = deal()
+    d.key = "RTX\r\n4090\x00"
+    assert "\n" not in notify.title(d, "olx", "Kra\x07ków") and "\x07" not in notify.title(d, "olx", "Kra\x07ków")
+
+
+def test_send_test(tmp_path):
+    cfg, st = setup(tmp_path)
+    seen = {}
+
+    def h(req):
+        seen["h"], seen["body"] = req.headers, req.content
+        return httpx.Response(200)
+    c = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    asyncio.run(notify.send_test(cfg, tmp_path, client=c))
+    assert seen["h"]["title"] == "Deal Hunter test" and "priority" not in seen["h"]
+
+
+def test_push_with_cfg_none_does_not_raise(tmp_path):
+    (tmp_path / "config").mkdir()  # no notify.yaml at all
+    st = Store(tmp_path / "t.db")
+    assert asyncio.run(notify.push_tier1(deal(), "https://card", store=st, cfg=None, root=tmp_path)) is False
+
+
+def test_last_error_recorded_and_health_rate_limited(tmp_path):
+    cfg, st = setup(tmp_path)
+    down = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503)))
+    for _ in range(3):
+        asyncio.run(notify.push_tier1(deal(), "https://card", store=st, cfg=cfg, root=tmp_path, client=down,
+                                      secret_fn=lambda r: None))
+    assert st.conn.execute("select count(*) from health where kind='ntfy_failed'").fetchone()[0] == 1
+    assert "503" in st.conn.execute("select last_error from pending_pushes").fetchone()[0]
+
+
+def test_slow_email_does_not_block_loop(tmp_path):
+    import time
+    cfg, st = setup(tmp_path)
+    down = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(503)))
+    creds = json.dumps({"host": "h", "port": 587, "user": "u", "password": "p", "to": "me"})
+
+    async def main():
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.02)
+                ticks += 1
+        tk = asyncio.create_task(ticker())
+        ok = await notify.push_tier1(deal(), "https://card", store=st, cfg=cfg, root=tmp_path, client=down,
+                                     smtp_send=lambda c, s, b: time.sleep(0.5), secret_fn=lambda r: creds)
+        tk.cancel()
+        return ok, ticks
+    ok, ticks = asyncio.run(main())
+    assert ok and ticks >= 10

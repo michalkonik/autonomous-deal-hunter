@@ -1,0 +1,397 @@
+"""Clears-at ledger: observation windows, disappearance inference, probably-sold comps (Review Focus 1)."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+from dh import ledger
+from dh.models import Extraction, Listing
+from dh.store import Store
+
+T0 = datetime(2026, 10, 1, 8, 0, tzinfo=timezone.utc)
+KEY = "gpu:rtx-4090:24"
+SRC = "allegro_lokalnie"
+ARM = ledger.arm_id(SRC, "rtx 4090")
+
+
+def h(hours: float) -> datetime:
+    return T0 + timedelta(hours=hours)
+
+
+def lst(sid: str, price: str, *, source: str = SRC, currency: str = "PLN", posted: datetime | None = None,
+        seen: datetime = T0) -> Listing:
+    return Listing(source=source, source_id=sid, url=f"https://example.test/{source}/{sid}", title=f"RTX 4090 {sid}",
+                   description="", price=Decimal(price), currency=currency, country="PL", city=None, lat=None,
+                   lon=None, seller_hash=None, seller_age_days=None, seller_ratings=None, seller_score=None,
+                   ships=True, pickup_only=False, is_business=False, photos=[], posted_at=posted, seen_at=seen)
+
+
+@pytest.fixture
+def store(tmp_path):
+    s = Store(tmp_path / "dh.db")
+    yield s
+    s.close()
+
+
+def lid(store: Store, sid: str, source: str = SRC) -> int:
+    return store.conn.execute("select id from listings where source=? and source_id=?", (source, sid)).fetchone()["id"]
+
+
+def disappeared(store: Store, sid: str, source: str = SRC) -> str | None:
+    ledger.migrate(store)
+    return store.conn.execute("select disappeared_at from listings where source=? and source_id=?",
+                              (source, sid)).fetchone()["disappeared_at"]
+
+
+def sweep(store: Store, ts: datetime, listings: list[Listing], arm: str = ARM, source: str = SRC) -> None:
+    ledger.observe(store, source, listings, ts, arm=arm)
+    ledger.sweep_disappeared(store, source, ts)
+
+
+def extract_all(store: Store, condition: str = "used") -> None:
+    for r in store.conn.execute("select id from listings").fetchall():
+        store.save_extraction(r["id"], Extraction(key=KEY, category="gpu", certainty=0.95, condition=condition))
+
+
+# ------------------------------------------------------------------ disappearance inference
+
+
+def test_disappearance_needs_two_missed_successful_sweeps(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [a, b])
+    sweep(store, h(1), [b])  # first miss
+    assert disappeared(store, "a") is None
+    sweep(store, h(1.5), [b])  # second miss
+    assert disappeared(store, "a") == h(1).isoformat()  # the first sweep that missed it
+    assert disappeared(store, "b") is None
+
+
+def test_no_disappearance_across_stop(store):
+    """Review Focus 1: the listing vanished while the agent was stopped -> its disappearance is unknown."""
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [a, b])
+    assert ledger.close_all_windows(store, h(1)) == 1  # dh stop
+    w = store.conn.execute("select * from windows").fetchone()
+    assert w["closed_at"] == h(0.5).isoformat()  # closed at the last observation, not at the stop time
+
+    # next start, a day later: the listing is gone from every sweep
+    ledger.open_window(store, SRC, h(24))
+    for t in (24, 24.5, 25, 25.5, 26):
+        sweep(store, h(t), [b])
+    assert disappeared(store, "a") is None
+    assert ledger.clears_at(store, KEY, None, h(-1)) == []
+
+
+def test_no_disappearance_across_a_short_stop(store):
+    """A stop shorter than the gap guard: only the window boundary protects the inference."""
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [a, b])
+    ledger.close_all_windows(store, h(0.75))  # dh stop
+    ledger.open_window(store, SRC, h(1.5))  # dh start 45 minutes later
+    for t in (1.5, 2, 2.5, 3):
+        sweep(store, h(t), [b])
+    assert disappeared(store, "a") is None
+    ledger.close_all_windows(store, h(4))
+    assert disappeared(store, "a") is None
+
+
+def test_missed_sweeps_split_across_a_stop_do_not_add_up(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [b])  # one miss in window 1
+    ledger.close_all_windows(store, h(0.6))
+    sweep(store, h(1), [b])  # one miss in window 2 (auto-opened by observe), well inside the gap guard
+    sweep(store, h(1.5), [b])
+    assert disappeared(store, "a") is None
+
+
+def test_crash_recovery_closes_windows(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [a, b])
+    # crash: nobody closed the window. Startup recovery runs ten hours later.
+    assert len(store.open_windows()) == 1
+    assert ledger.close_all_windows(store, h(10)) == 1
+    assert store.open_windows() == []
+    w = store.conn.execute("select * from windows").fetchone()
+    assert w["closed_at"] == h(0.5).isoformat()
+    ledger.open_window(store, SRC, h(10))
+    sweep(store, h(10), [b])
+    sweep(store, h(10.5), [b])
+    sweep(store, h(11), [b])
+    assert disappeared(store, "a") is None
+    assert len(store.open_windows()) == 1
+
+
+def test_crash_recovery_still_counts_evidence_gathered_inside_the_window(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    ledger.observe(store, SRC, [b], h(0.5), arm=ARM)
+    ledger.observe(store, SRC, [b], h(1), arm=ARM)  # two misses observed, sweep_disappeared never ran: crash
+    ledger.close_all_windows(store, h(9))
+    assert disappeared(store, "a") == h(0.5).isoformat()
+
+
+def test_stale_open_window_without_recovery_is_not_trusted(store):
+    """Belt and braces: if startup recovery was skipped, a long silence inside one window breaks continuity."""
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [a, b])
+    # crash, then restart WITHOUT close_all_windows: observe() reuses the stale open window
+    sweep(store, h(9), [b])
+    sweep(store, h(9.5), [b])
+    sweep(store, h(10), [b])
+    assert disappeared(store, "a") is None
+
+
+def test_open_window_closes_a_stale_window_of_the_same_source(store):
+    sweep(store, h(0), [lst("a", "3000")])
+    ledger.open_window(store, SRC, h(5))
+    rows = store.conn.execute("select * from windows order by id").fetchall()
+    assert len(rows) == 2 and rows[0]["closed_at"] == h(0).isoformat() and rows[1]["closed_at"] is None
+
+
+def test_failed_and_empty_sweeps_do_not_count(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    ledger.record_sweep(store, SRC, ARM, h(0.5), ok=False, note="403")
+    ledger.observe(store, SRC, [], h(1), arm=ARM)  # parser broke: zero results is not evidence
+    ledger.sweep_disappeared(store, SRC, h(1))
+    assert disappeared(store, "a") is None
+    sweep(store, h(1.5), [b])
+    assert disappeared(store, "a") is None  # only one successful non-empty miss so far
+    sweep(store, h(2), [b])
+    assert disappeared(store, "a") == h(1.5).isoformat()
+
+
+def test_other_arms_sweeps_do_not_count(store):
+    a = lst("a", "3000")
+    other = ledger.arm_id(SRC, "rtx 4080")
+    sweep(store, h(0), [a])
+    sweep(store, h(0.5), [lst("x", "2000")], arm=other)
+    sweep(store, h(1), [lst("x", "2000")], arm=other)
+    assert disappeared(store, "a") is None
+
+
+def test_observation_without_arm_records_no_sweep(store):
+    """A mailbox alert or a detail fetch is a sighting, not a sweep: it must not make other listings vanish."""
+    a = lst("a", "3000")
+    sweep(store, h(0), [a])
+    ledger.observe(store, SRC, [lst("m1", "2500")], h(0.5))
+    ledger.observe(store, SRC, [lst("m2", "2600")], h(1))
+    ledger.sweep_disappeared(store, SRC, h(1))
+    assert disappeared(store, "a") is None
+    assert store.conn.execute("select count(*) c from sweeps").fetchone()["c"] == 1
+
+
+def test_reappearance_clears_disappeared_at(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [b])
+    sweep(store, h(1), [b])
+    assert disappeared(store, "a") is not None
+    sweep(store, h(1.5), [a, b])  # it was only pushed off the results page
+    assert disappeared(store, "a") is None
+
+
+def test_observations_record_first_price_and_cuts_only(store):
+    sweep(store, h(0), [lst("a", "3000")])
+    sweep(store, h(0.5), [lst("a", "3000")])
+    sweep(store, h(1), [lst("a", "2800")])
+    rows = store.conn.execute("select price, seen_at from observations order by id").fetchall()
+    assert [(r["price"], r["seen_at"]) for r in rows] == [("3000", h(0).isoformat()), ("2800", h(1).isoformat())]
+    assert store.conn.execute("select last_seen_at from listings").fetchone()["last_seen_at"] == h(1).isoformat()
+
+
+def test_listing_from_another_source_is_rejected(store):
+    with pytest.raises(ValueError):
+        ledger.observe(store, SRC, [lst("a", "3000", source="kleinanzeigen")], h(0), arm=ARM)
+
+
+def test_naive_timestamp_rejected(store):
+    with pytest.raises(ValueError):
+        ledger.observe(store, SRC, [lst("a", "3000")], datetime(2026, 10, 1, 8, 0), arm=ARM)
+
+
+# ------------------------------------------------------------------ probably sold
+
+
+def _market(store: Store) -> None:
+    """Window opens at h(0); four asks already listed (their age is unknown), then sweeps every 4 h."""
+    base = [lst("m1", "3000"), lst("m2", "3200"), lst("m3", "3400"), lst("m4", "3600")]
+    sweep(store, h(0), base)
+    return base
+
+
+def test_quick_disappearance_counts_as_probably_sold(store):
+    base = _market(store)
+    new = lst("new", "3100")
+    sweep(store, h(4), base + [new])  # appeared between h(0) and h(4): watched appearance
+    sweep(store, h(8), base + [new])
+    sweep(store, h(12), base)  # gone
+    sweep(store, h(16), base)
+    extract_all(store)
+    rows = ledger.clears_at(store, KEY, "used", h(-24))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.kind == "probably_sold" and r.weight == 0.5
+    assert r.price == Decimal("3100") and r.currency == "PLN" and r.price_pln == Decimal("3100.00")
+    assert r.at == h(12) and r.key == KEY and r.condition == "used" and r.channel == SRC
+    assert r.days_to_sell == pytest.approx(0.5)  # earliest possible appearance h(0) -> first miss h(12)
+    assert ledger.clears_at(store, KEY, "like_new", h(-24)) == []
+    assert ledger.clears_at(store, KEY, "used", h(13)) == []  # since is on the disappearance time
+
+
+def test_slow_disappearance_not_counted(store):
+    base = _market(store)
+    new = lst("new", "3100")
+    t = 4
+    while t <= 76:
+        sweep(store, h(t), base + [new])
+        t += 4
+    sweep(store, h(80), base)
+    sweep(store, h(84), base)
+    assert disappeared(store, "new") == h(80).isoformat()
+    extract_all(store)
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_disappearance_above_median_ask_not_counted(store):
+    base = _market(store)
+    new = lst("new", "3900")  # above the median ask: probably withdrawn, not sold
+    sweep(store, h(4), base + [new])
+    sweep(store, h(8), base)
+    sweep(store, h(12), base)
+    extract_all(store)
+    assert disappeared(store, "new") is not None
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_listing_present_when_watching_started_has_unknown_age(store):
+    """Seen in the first sweep of a window and no posted date: it may have been listed for weeks."""
+    old = lst("old", "3000")
+    base = [lst("m2", "3200"), lst("m3", "3400"), lst("m4", "3600")]
+    sweep(store, h(0), base + [old])
+    sweep(store, h(4), base)
+    sweep(store, h(8), base)
+    extract_all(store)
+    assert disappeared(store, "old") is not None
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_posted_date_makes_age_known(store):
+    old = lst("old", "3000", posted=h(-10))
+    base = [lst("m2", "3200"), lst("m3", "3400"), lst("m4", "3600")]
+    sweep(store, h(0), base + [old])
+    sweep(store, h(4), base)
+    sweep(store, h(8), base)
+    extract_all(store)
+    rows = ledger.clears_at(store, KEY, "used", h(-24))
+    assert [r.ref for r in rows] == [old.url]
+    assert rows[0].days_to_sell == pytest.approx(14 / 24)
+
+
+def test_posted_long_ago_is_a_slow_sale(store):
+    old = lst("old", "3000", posted=h(-24 * 10))
+    base = [lst("m2", "3200"), lst("m3", "3400"), lst("m4", "3600")]
+    sweep(store, h(0), base)
+    sweep(store, h(4), base + [old])  # newly in the results, but posted ten days ago
+    sweep(store, h(8), base)
+    sweep(store, h(12), base)
+    extract_all(store)
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_appearance_and_disappearance_in_different_windows(store):
+    """Both ends were watched, the stop in between does not matter because the listing was seen again after it."""
+    base = _market(store)
+    new = lst("new", "3100")
+    sweep(store, h(4), base + [new])
+    ledger.close_all_windows(store, h(5))
+    ledger.open_window(store, SRC, h(20))
+    sweep(store, h(20), base + [new])
+    sweep(store, h(24), base)
+    sweep(store, h(28), base)
+    extract_all(store)
+    rows = ledger.clears_at(store, KEY, "used", h(-24))
+    assert len(rows) == 1 and rows[0].at == h(24)
+
+
+def test_too_few_asks_for_a_median(store):
+    sweep(store, h(0), [lst("m1", "3000")])
+    new = lst("new", "2000")
+    sweep(store, h(4), [lst("m1", "3000"), new])
+    sweep(store, h(8), [lst("m1", "3000")])
+    sweep(store, h(12), [lst("m1", "3000")])
+    extract_all(store)
+    assert disappeared(store, "new") is not None
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_bait_and_wanted_extractions_never_become_comps(store):
+    base = _market(store)
+    new = lst("new", "3100")
+    sweep(store, h(4), base + [new])
+    sweep(store, h(8), base)
+    sweep(store, h(12), base)
+    extract_all(store)
+    store.save_extraction(lid(store, "new"), Extraction(key=KEY, category="gpu", certainty=0.95, condition="used",
+                                                         box_only=True))
+    assert ledger.clears_at(store, KEY, "used", h(-24)) == []
+
+
+def test_median_is_per_currency_market(store):
+    """A CZK listing is compared with CZK asks, never with PLN asks."""
+    src = "bazos_cz"
+    arm = ledger.arm_id(src, "rtx 4090")
+    cz = [lst(f"c{i}", p, source=src, currency="CZK") for i, p in enumerate(("40000", "42000", "44000"))]
+    sweep(store, h(0), cz, arm=arm, source=src)
+    _market(store)
+    new = lst("cnew", "41000", source=src, currency="CZK")
+    sweep(store, h(4), cz + [new], arm=arm, source=src)
+    sweep(store, h(8), cz, arm=arm, source=src)
+    sweep(store, h(12), cz, arm=arm, source=src)
+    extract_all(store)
+    rows = ledger.clears_at(store, KEY, "used", h(-24))
+    assert [(r.ref, r.currency, r.price_pln) for r in rows] == [(new.url, "CZK", None)]
+
+
+def test_active_asks(store):
+    base = _market(store)
+    sweep(store, h(4), base[:3])
+    sweep(store, h(8), base[:3])
+    extract_all(store)
+    rows = ledger.active_asks(store, KEY, "used", h(9))
+    assert sorted(r.price for r in rows) == [Decimal("3000"), Decimal("3200"), Decimal("3400")]
+    assert {r.kind for r in rows} == {"active_ask"} and {r.weight for r in rows} == {0.3}
+    assert ledger.active_asks(store, KEY, "used", h(9 + 24 * 4)) == []  # not seen for 4 days
+
+
+def test_watched_hours(store):
+    sweep(store, h(0), [lst("a", "3000")])
+    sweep(store, h(2), [lst("a", "3000")])
+    ledger.close_all_windows(store, h(5))
+    sweep(store, h(10), [lst("a", "3000")])
+    sweep(store, h(11), [lst("a", "3000")])
+    assert ledger.watched_hours(store) == pytest.approx(3.0)
+    assert ledger.watched_hours(store, "kleinanzeigen") == 0.0
+
+
+def test_unknown_condition_is_valued_as_used(store):
+    base = _market(store)
+    new = lst("new", "3100")
+    sweep(store, h(4), base + [new])
+    sweep(store, h(8), base)
+    sweep(store, h(12), base)
+    extract_all(store, condition="unknown")
+    assert len(ledger.clears_at(store, KEY, "used", h(-24))) == 1
+    assert len(ledger.clears_at(store, KEY, "unknown", h(-24))) == 1
+    assert ledger.clears_at(store, KEY, "new", h(-24)) == []
+    store.save_extraction(lid(store, "new"), Extraction(key=KEY, category="gpu", certainty=0.95,
+                                                         condition="for_parts"))
+    assert ledger.clears_at(store, KEY, None, h(-24)) == []

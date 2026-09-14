@@ -144,3 +144,101 @@ def test_mark_imported_even_when_push_fails(tmp_path):
     asyncio.run(publish.sync(st, cfg, tmp_path))
     assert "sold" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()
     assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
+
+
+def seller_card(tmp_path, st):
+    did = add_deal(st, tmp_path)
+    cdir = tmp_path / "var/cards/deals/2026-10-29"
+    (cdir / f"deal-{did}.md").write_text(
+        f"---\ndeal_id: {did}\nseller_hash: abc\noutcome: {{status: open, price_pln: null, date: null, note: ''}}\n---\n"
+        "# RTX\nSeller: Jan Kowalski +48 600 100 200\n- **Seller rating** 4.9\nok line\n")
+    (cdir / f"deal-{did}.json").write_text(json.dumps({
+        "deal_id": did, "key": "RTX 4090", "seller_hash": "h", "seller_name": "Jan",
+        "listing": {"url": "https://olx/1", "title": "t", "price": "1", "seller_id": "9", "phone": "1"},
+        "comps": [{"url": "u", "price": 1, "date": "d", "kind": "sold", "seller_hash": "x", "buyer": "y"}],
+        "breakdown": {"lines": [{"seller_fee": 1, "label": "a"}]}, "raw_html": "<x>"}))
+    return did
+
+
+def test_no_seller_data_published(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = seller_card(tmp_path, st)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    d = tmp_path / "clone/deals/2026-10-29"
+    md, js = (d / f"deal-{did}.md").read_text(), (d / f"deal-{did}.json").read_text()
+    assert "ok line" in md and "Kowalski" not in md and "seller" not in md.lower()
+    data = json.loads(js)
+    assert "seller" not in js.lower() and "raw_html" not in data and "phone" not in js
+    assert data["comps"] == [{"url": "u", "price": 1, "date": "d", "kind": "sold"}]
+    assert data["listing"]["url"] == "https://olx/1" and "seller_id" not in data["listing"]
+
+
+def test_conflict_recovery_imports_remote_mark_and_pushes(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    # unpushed local commit touching the same card (push blocked)
+    hook = bare / "hooks/pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)
+    card = tmp_path / f"var/cards/deals/2026-10-29/deal-{did}.md"
+    card.write_text(card.read_text() + "local change\n")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert not r["pushed"] and r["committed"]
+    # remote edit to the same card (conflicting)
+    hook.unlink()
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("# RTX 4090", "# RTX 4090 edited").replace("status: open", "status: bought"))
+    git(phone, "commit", "-qam", "bought"); git(phone, "push", "-q", "origin", "log")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["marks"] == 1 and r["pushed"]
+    assert st.conn.execute("select status from marks").fetchone()["status"] == "bought"
+    assert git(tmp_path / "clone", "rev-list", "--count", "origin/log..HEAD").strip() == "0"
+    assert "local change" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()
+    assert "bought" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()
+
+
+def test_poison_files_do_not_stop_sync(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    good = add_deal(st, tmp_path)
+    cdir = tmp_path / "var/cards/deals/2026-10-29"
+    (cdir / "deal-99.md").write_text("---\n: : [broken\n---\nx")
+    (cdir / "deal-99.json").write_text("{not json")
+    (cdir / "deal-98.md").write_text("---\ndeal_id: 98\n---\nx")
+    (cdir / "deal-98.json").write_text("[]")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["pushed"] and (tmp_path / f"clone/deals/2026-10-29/deal-{good}.md").is_file()
+    assert st.conn.execute("select count(*) from health where kind='bad_card'").fetchone()[0] >= 1
+
+
+def test_broken_yaml_edit_kept_and_other_cards_import(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    a, b = add_deal(st, tmp_path), add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    phone = clone2(tmp_path, bare)
+    pa = phone / "deals/2026-10-29" / f"deal-{a}.md"
+    pb = phone / "deals/2026-10-29" / f"deal-{b}.md"
+    pa.write_text("---\ndeal_id: %d\noutcome: {status: bought, \n---\nmy notes\n" % a)
+    pb.write_text(pb.read_text().replace("status: open", "status: sold"))
+    git(phone, "commit", "-qam", "edit"); git(phone, "push", "-q", "origin", "log")
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert "my notes" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{a}.md").read_text()
+    assert [r["deal_id"] for r in st.conn.execute("select deal_id from marks")] == [b]
+    assert st.conn.execute("select count(*) from health where kind='bad_card'").fetchone()[0] == 1
+
+
+def test_front_matter_id_beats_filename_and_nonfinite_price_rejected(tmp_path):
+    st = Store(tmp_path / "t.db")
+    ok = "---\ndeal_id: 7\noutcome: {status: bought, price_pln: 10}\n---\n"
+    nan = "---\ndeal_id: 8\noutcome: {status: bought, price_pln: .nan}\n---\n"
+    n, bad = publish.import_texts(st, [("deal-3.md", ok), ("deal-8.md", nan)])
+    assert n == 1 and bad == {8}
+    assert [r["deal_id"] for r in st.conn.execute("select deal_id from marks")] == [7]
+
+
+def test_wrong_branch_refused(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    (tmp_path / "config" / "publish.yaml").write_text(
+        (tmp_path / "config" / "publish.yaml").read_text().replace("branch: log", "branch: main"))
+    r = asyncio.run(publish.sync(st, config.load(tmp_path), tmp_path))
+    assert not r["pushed"] and st.conn.execute("select count(*) from health where kind='bad_branch'").fetchone()[0] == 1

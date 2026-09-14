@@ -413,3 +413,25 @@ Ryczałt is charged on revenue, not profit: on this thin deal it costs more than
 
 Capital 120000 + 300 = **120300.00** PLN = 120300 / 3.65 = **32958.90 USD** > 30000. Flags: `over_capital_cap`
 (tiering then skips the deal).
+
+## Risk score (`dh/risk.py`, weights in `config/economics.yaml` under `risk`)
+
+`p_scam = 1 / (1 + exp(-(bias + sum of weight x feature)))`, features 0 or 1. A hard-excluded listing
+(box only, wanted ad, for parts, off-platform contact, transfer request from a new account) is never
+tiered: `tiering.confidence` returns `excluded` and `tiering.assign` returns tier None at any net.
+
+A deep discount alone must not block tier 1 (stale-priced listings from established sellers are the core
+play in a rising market); a deep discount plus a weak-seller signal is a scam until proven otherwise.
+Bias -4.5, too_cheap 1.4 (robust z < -2.5, log-price sigma floor 0.15), extreme_price 2.5 (< 35% of the
+median), new_account 2.6, no_ratings 2.4:
+
+| Case | Logit | p_scam |
+|---|---|---|
+| normal listing | -4.5 | 1.1% |
+| too cheap, established seller | -3.1 | 4.3% |
+| too cheap + new account | -0.5 | 37.8% |
+| too cheap + 0 ratings | -0.7 | 33.2% |
+| extreme price + new account | 2.0 | 88% |
+| extreme price + 0 ratings (lowest weak signal 2.0) | >= 1.4 | >= 80% |
+
+Each row is pinned by a test in `tests/test_risk.py`.

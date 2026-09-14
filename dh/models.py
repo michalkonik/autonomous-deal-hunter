@@ -70,3 +70,41 @@ class Deal:
     created_at: datetime
     verified_at: datetime | None = None
     status: str = "new"
+
+
+# Comparable kinds, in order of trust (spec §6.2). Default weights live in dh/valuation.py and config/valuation.yaml.
+CompKind = Literal["owner_sale", "ebay_sold", "probably_sold", "active_ask", "ask_history", "retail_new"]
+
+
+@dataclass(frozen=True)
+class CompRow:
+    """One comparable price point for a product key: a sale, a probable sale, an ask, or a new-retail price.
+
+    `price`/`currency` are native; `price_pln` is filled when known (PLN rows, or rows already converted).
+    `at` is when the price was true: sale time, disappearance time, or the time an ask was last seen.
+    """
+    key: str
+    condition: str | None
+    channel: str
+    kind: str
+    price: Decimal
+    currency: str
+    at: datetime
+    weight: float
+    ref: str
+    price_pln: Decimal | None = None
+    country: str | None = None
+    listing_id: int | None = None
+    days_to_sell: float | None = None
+
+
+@dataclass(frozen=True)
+class CompRef:
+    """A comparable as used by a valuation: PLN price after the ask-to-sale discount, effective weight."""
+    kind: str
+    channel: str
+    price_pln: Decimal
+    at: datetime
+    weight: float
+    ref: str
+    fallback: bool = False

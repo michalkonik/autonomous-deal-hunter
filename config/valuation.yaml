@@ -1,0 +1,31 @@
+# Exit valuation (dh/valuation.py). Not part of the frozen layer.
+ask_to_sale_ratio: 0.92       # an active ask is discounted to an expected sale price (spec §6.2 item 4)
+weights:                      # weight of one comparable in the weighted quantiles
+  owner_sale: 1.0
+  ebay_sold: 1.0
+  probably_sold: 0.5          # clears-at ledger (dh/ledger.py)
+  active_ask: 0.3
+  ask_history: 0.2            # seeded history (dh/seed.py)
+fallback_factor: 0.7          # weight multiplier when an exit channel has no recent comps of its own
+ceiling_factor: 0.95          # estimate capped at lowest new-retail price × this
+recent_days: 30               # comps counted for confidence and used for the quantiles
+lookback_days: 90             # older comps (30..60 d) feed only the trend
+active_ask_max_age_days: 3    # a tracked listing still counts as a live ask if seen this recently
+fx_max_back_days: 10          # cached NBP rate may be up to this many days older than the comp
+
+# Comparable channel and market (country) of each source. A per-adapter `channel:` key in sources.yaml
+# (adapters.<source>.channel) overrides the channel name.
+channels:
+  allegro: {channel: allegro, market: PL}
+  allegro_lokalnie: {channel: allegro_lokalnie, market: PL}
+  olx: {channel: olx, market: PL}
+  sprzedajemy: {channel: sprzedajemy, market: PL}
+  ebay_pl: {channel: ebay_pl, market: PL}
+  ebay_de: {channel: ebay_de, market: DE}
+  kleinanzeigen: {channel: kleinanzeigen, market: DE}
+  bazos_cz: {channel: bazos_cz, market: CZ}
+  bazos_sk: {channel: bazos_sk, market: SK}
+  bazos_at: {channel: bazos_at, market: AT}
+  sbazar: {channel: sbazar, market: CZ}
+  hardverapro: {channel: hardverapro, market: HU}
+  marktplaats: {channel: marktplaats, market: NL}

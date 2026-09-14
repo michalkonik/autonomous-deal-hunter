@@ -1,6 +1,7 @@
 """Tier-1 notifier: ntfy push -> SMTP email fallback -> pending_pushes queue (retried for up to 6 h)."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import secrets
@@ -15,6 +16,8 @@ from typing import Any, Callable
 
 import httpx
 import yaml
+
+from . import config
 
 PENDING_SQL = """create table if not exists pending_pushes (
   id integer primary key, payload text not null, created_at text not null,
@@ -44,8 +47,14 @@ def title(deal: Any, source: str | None = None, city: str | None = None) -> str:
     net = Decimal(deal.cons_net_usd).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     star = " ★" if deal.star else ""
     where = " ".join(x for x in (_pretty_source(source), city) if x)
-    t = f"T1{star} +${net} {deal.key or 'deal'}"
+    t = f"T1{star} +${net} {_clean(deal.key) or 'deal'}"
+    where = _clean(where)
     return f"{t} · {where}" if where else t
+
+
+def _clean(x: str | None) -> str:
+    """Drop control characters (incl. CR/LF, which would break headers)."""
+    return "".join(ch for ch in (x or "") if ch.isprintable()).strip()
 
 
 def _pretty_source(s: str | None) -> str | None:
@@ -73,9 +82,19 @@ def _send_smtp(creds: dict, subject: str, body: str) -> None:
         s.send_message(msg)
 
 
+def health_once(store, source: str, kind: str, detail: str) -> None:
+    """Health event, at most one per (source, kind) per 10 minutes."""
+    if store is None:
+        return
+    recent = store.conn.execute(
+        "select 1 from health where source=? and kind=? and at > datetime('now','-10 minutes')",
+        (source, kind)).fetchone()
+    if not recent:
+        store.add_health(source, kind, detail[:500])
+
+
 def _health(store, kind: str, detail: str) -> None:
-    if store is not None:
-        store.add_health("notify", kind, detail[:500])
+    health_once(store, "notify", kind, detail)
 
 
 def _ntfy_cfg(cfg) -> tuple[str, str]:
@@ -94,28 +113,31 @@ async def _ntfy(server: str, tp: str, headers: dict, body: str, client: httpx.As
             await go(c)
 
 
-async def _deliver(payload: dict, store, cfg, root: Path, client, smtp_send, secret_fn) -> bool:
+async def _deliver(payload: dict, store, cfg, root: Path, client, smtp_send, secret_fn) -> str | None:
+    """None on success, else the last error text."""
     server, _ = _ntfy_cfg(cfg)
     headers = dict(payload["headers"])
     if not headers["Title"].isascii():  # ntfy accepts UTF-8 headers as RFC 2047
         headers["Title"] = "=?UTF-8?B?" + base64.b64encode(headers["Title"].encode()).decode() + "?="
     try:
         await _ntfy(server, topic(root), headers, payload["body"], client)
-        return True
+        return None
     except Exception as e:  # network, HTTP error, anything: fall back
         _health(store, "ntfy_failed", repr(e))
+        err = f"ntfy: {e!r}"
     try:
         if not cfg.notify.email_fallback.enabled:
             raise RuntimeError("email fallback disabled")
-        raw = secret_fn("dh-mail#smtp")
+        raw = await asyncio.to_thread(secret_fn, "dh-mail#smtp")  # subprocess: keep the loop free
         if not raw:
             _health(store, "email_disabled", "bw-secret dh-mail#smtp unavailable")
-            return False
-        smtp_send(json.loads(raw), payload["headers"]["Title"], payload["body"] + "\n" + payload["headers"]["Click"])
-        return True
+            return err + "; email disabled"
+        await asyncio.to_thread(smtp_send, json.loads(raw), payload["headers"]["Title"],
+                                payload["body"] + "\n" + payload["headers"]["Click"])
+        return None
     except Exception as e:
         _health(store, "email_failed", repr(e))
-        return False
+        return err + f"; email: {e!r}"
 
 
 async def push_tier1(deal, card_url: str, *, store=None, cfg=None, root: Path | None = None,
@@ -125,19 +147,25 @@ async def push_tier1(deal, card_url: str, *, store=None, cfg=None, root: Path | 
                      now: datetime | None = None) -> bool:
     """Send a tier-1 push. True if delivered by ntfy or email; otherwise queued and False. Never raises."""
     root = Path(root or ".")
-    _, prio = _ntfy_cfg(cfg)
+    try:
+        cfg = cfg or config.load(root)
+        _, prio = _ntfy_cfg(cfg)
+    except Exception as e:
+        _health(store, "config_error", repr(e))
+        return False
     ttl = title(deal, source, city)
     payload = {
         "headers": {"Title": ttl, "Priority": prio, "Tags": "moneybag", "Click": listing_url or card_url,
                     "Actions": f"view, Card, {card_url}"},
         "body": f"{ttl}\nConservative net ${Decimal(deal.cons_net_usd):.0f}, confidence {deal.confidence}",
     }
-    if await _deliver(payload, store, cfg, root, client, smtp_send, secret_fn):
+    err = await _deliver(payload, store, cfg, root, client, smtp_send, secret_fn)
+    if err is None:
         return True
     if store is not None:
         store.ensure_table(PENDING_SQL)
-        store.conn.execute("insert into pending_pushes (payload, created_at) values (?,?)",
-                           (json.dumps(payload), (now or datetime.now(timezone.utc)).isoformat()))
+        store.conn.execute("insert into pending_pushes (payload, created_at, last_error) values (?,?,?)",
+                           (json.dumps(payload), (now or datetime.now(timezone.utc)).isoformat(), err))
         store.conn.commit()
     return False
 
@@ -153,11 +181,13 @@ async def retry_pending(store, cfg, root: Path, *, client=None, smtp_send: Calla
             store.conn.execute("delete from pending_pushes where id=?", (r["id"],))
             _health(store, "push_expired", f"pending push {r['id']} dropped after 6h")
             continue
-        if await _deliver(json.loads(r["payload"]), store, cfg, root, client, smtp_send, secret_fn):
+        err = await _deliver(json.loads(r["payload"]), store, cfg, root, client, smtp_send, secret_fn)
+        if err is None:
             store.conn.execute("delete from pending_pushes where id=?", (r["id"],))
             done += 1
         else:
-            store.conn.execute("update pending_pushes set attempts=attempts+1 where id=?", (r["id"],))
+            store.conn.execute("update pending_pushes set attempts=attempts+1, last_error=? where id=?",
+                               (err, r["id"]))
     store.conn.commit()
     return done
 

@@ -48,7 +48,12 @@ def test_hard_excludes():
     assert assess(e=ext(wanted_ad=True)).hard_exclude
     r = assess(e=ext(for_parts=True))
     assert r.hard_exclude and "for_parts" in r.flags
+    assert assess(e=ext(condition="for_parts")).hard_exclude
     for desc, flag in [("Zadzwon 600 123 456", "offplatform_phone"), ("tel +48 600-123-456", "offplatform_phone"),
+                       ("tel. 600123456", "offplatform_phone"), ("Tel 600123456", "offplatform_phone"),
+                       ("Tel: 600123456", "offplatform_phone"), ("Kontakt: 600123456", "offplatform_phone"),
+                       ("zadzwoń 600123456", "offplatform_phone"), ("ZADZWOŃ 600123456", "offplatform_phone"),
+                       ("Telefon: 600123456", "offplatform_phone"), ("Zadzwoń +48600123456", "offplatform_phone"), ("pisz +49 170 1234567", "offplatform_phone"),
                        ("pisz na WhatsApp", "offplatform_whatsapp"), ("kontakt Telegram @x", "offplatform_telegram"),
                        ("wiecej zdjec https://foto.example/x", "offplatform_url"),
                        ("zdjecia na www.foto.example", "offplatform_url"),
@@ -68,16 +73,33 @@ def test_for_parts_allowed_when_repair_enabled():
 
 
 def test_no_false_phone_on_specs_and_prices():
-    r = assess(l=listing(description="24 GB GDDR6X, 384 bit, 450 W, cena 5 000 zl, SN 1234567890123"))
-    assert not r.hard_exclude
+    for desc in ("24 GB GDDR6X, 384 bit, 450 W, cena 5 000 zl, SN 1234567890123",
+                 "SN 123456789", "S/N: 600123456 gwarancja", "P/N 900-1G136-2514-000", "nr seryjny 123456789012", "P/N 900123456 rev2", "S/N: 123456789", "Hotel 123456789",
+                 "kod 1234 5678 9012", "cena 3.500.000"):
+        r = assess(l=listing(description=desc))
+        assert not r.hard_exclude, (desc, r.flags)
 
 
 def test_too_cheap_new_account_is_risky():
     r = assess(l=listing(price=Decimal("2800"), seller_age_days=5, seller_ratings=0))
     assert r.p_scam > 0.3 and not r.hard_exclude
     assert {"too_cheap", "new_account", "no_ratings"} <= set(r.flags)
-    # even without the zero ratings: -4.5 + 2.5 + 1.5 -> ~0.38
-    assert assess(l=listing(price=Decimal("2800"), seller_age_days=5)).p_scam > 0.3
+    assert assess(l=listing(price=Decimal("3000"), seller_age_days=5)).p_scam > 0.30   # too cheap + new account
+    assert assess(l=listing(price=Decimal("3000"), seller_ratings=0)).p_scam > 0.20    # too cheap + 0 ratings
+
+
+def test_weights_review_round_1():
+    # controller ruling: a deep discount alone from an established seller must not block tier 1
+    assert assess().p_scam < 0.02
+    est = assess(l=listing(price=Decimal("3000"), seller_age_days=180, seller_ratings=5))
+    assert "too_cheap" in est.flags and "extreme_price" not in est.flags and est.p_scam < 0.05
+    # extreme (< 35% of the median) + any one weak-seller signal
+    for weak in (dict(seller_age_days=5), dict(seller_ratings=0), dict(photos=[])):
+        r = assess(l=listing(price=Decimal("1700"), **weak), stock_photo=False)
+        assert "extreme_price" in r.flags and r.p_scam > 0.5, (weak, r.p_scam)
+    assert assess(l=listing(price=Decimal("1700")), stock_photo=True).p_scam > 0.5
+    assert assess(l=listing(price=Decimal("1700"), country="CN")).p_scam > 0.5
+    assert "extreme_price" not in assess(l=listing(price=Decimal("1750"))).flags      # exactly 35% is not below
 
 
 def test_normal_listing_low_risk():
@@ -92,6 +114,10 @@ def test_flagship_signals():
     cn = assess(l=listing(country="CN"))
     assert "origin_cn_hk" in cn.flags and cn.p_scam > assess().p_scam
     assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu:rtx-3070:8")).flags
+    assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu-mobile:rtx-4090:16")).flags
+    assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu:rx-7900-xtx:24")).flags
+    for k in ("rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090"):
+        assert "origin_cn_hk" in assess(l=listing(country="HK"), e=ext(key=f"gpu:{k}:16")).flags, k
     nophoto = assess(l=listing(photos=[]))
     assert "no_photos_flagship" in nophoto.flags
     assert "no_photos_flagship" not in assess(l=listing(photos=[]), e=ext(key="gpu:rtx-4080:16")).flags
@@ -123,9 +149,24 @@ def test_scam_keywords_come_from_playbook(tmp_path):
     assert "scam_kw.prepayment_only" in assess(l=l).flags
 
 
+def test_keywords_cached_per_mtime(tmp_path):
+    import os
+    (tmp_path / "playbook").mkdir()
+    p = tmp_path / "playbook" / "items.yaml"
+    p.write_text(yaml.safe_dump([{"id": "scam_kw.a", "kind": "scam_kw", "target": "risk", "value": "aaa"}]))
+    assert risk._scam_keywords(tmp_path) == [("scam_kw.a", "aaa")]
+    st = p.stat()
+    p.write_text(yaml.safe_dump([{"id": "scam_kw.b", "kind": "scam_kw", "target": "risk", "value": "bbb"}]))
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))            # same mtime: served from cache
+    assert risk._scam_keywords(tmp_path) == [("scam_kw.a", "aaa")]
+    os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+    assert risk._scam_keywords(tmp_path) == [("scam_kw.b", "bbb")]
+
+
 def test_checklist():
     gpu = assess().checklist
     text = " ".join(gpu).lower()
     for needle in ("platform", "gpu-z", "device id", "vram", "12v-2x6", "die side", "serial"):
         assert needle in text
+    assert not any("cash" in c.lower() for c in assess(l=listing(seller_age_days=3)).checklist)
     assert any("ram" in c.lower() or "memtest" in c.lower() for c in assess(e=ext(key="ram:ddr5:32:2x16", category="ram")).checklist)

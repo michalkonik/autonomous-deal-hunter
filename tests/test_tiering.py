@@ -54,6 +54,29 @@ def test_assign(cons, exp, effort, conf, cap, tier, star):
     assert r.floor_usd == Decimal(str(RULES.floors[effort])) and r.reasons
 
 
+@pytest.mark.parametrize("effort", ["easy", "moderate", "heavy"])
+@pytest.mark.parametrize("net", [20, 40, 45, 60, 99, 100, 119, 150, 240, 250, 300, 320, 900, 5000])
+def test_hard_excluded_is_never_tiered(effort, net):
+    level, why = tiering.confidence(ext(), Est(), rk(0.01, hard=True), 60, 1000, RULES)
+    assert level == "excluded" and why[0].startswith("hard exclude")
+    r = tiering.assign(net, net * 2, effort, level, 1000, RULES)
+    assert r.tier is None and r.star is False and r.reasons[0].startswith("hard exclude")
+
+
+def test_hard_exclude_wins_over_everything():
+    # certain match, many comps, verified, low p_scam: still excluded
+    risk = Risk(p_scam=0.0, hard_exclude=True, flags=["offplatform_url"])
+    level, why = tiering.confidence(ext(), Est(n_sold=99), risk, 0, 100, RULES)
+    assert level == "excluded" and "offplatform_url" in why[0]
+
+
+def test_tier4_reason_uses_configured_margin():
+    rules = RULES.to_dict()
+    rules = {**rules, "tiers": {**rules["tiers"], "t4_floor_margin": 0.30}}
+    r = tiering.assign(36, 40, "easy", "high", 100, rules)       # 35 = 50 * 0.7
+    assert r.tier == 4 and any("30%" in x for x in r.reasons)
+
+
 def test_assign_reasons_and_decimal_inputs():
     r = tiering.assign(Decimal("320"), Decimal("520"), "easy", "high", Decimal("2000"), RULES)
     assert r.tier == 1 and r.star and any("high confidence" in x for x in r.reasons)
@@ -81,6 +104,9 @@ def test_high_confidence_needs_more_comps_for_big_capital():
 def test_confidence_high_requires_everything():
     ok = dict(extraction=ext(), estimate=Est(), risk=rk(), verified_age_s=120, capital_usd=1000, rules=RULES)
     assert tiering.confidence(**ok) == ("high", [])
+    # controller-accepted: an unknown condition is never high (it is low), a known one is required for high
+    assert tiering.confidence(**{**ok, "extraction": ext(condition="unknown")})[0] == "low"
+    assert tiering.confidence(**{**ok, "extraction": ext(condition="like_new")})[0] == "high"
     for change, label in [
         (dict(extraction=ext(certainty=0.89)), "certainty"),
         (dict(risk=rk(0.05)), "p_scam"),
@@ -99,7 +125,7 @@ def test_confidence_low():
     ok = dict(extraction=ext(), estimate=Est(), risk=rk(), verified_age_s=120, capital_usd=1000, rules=RULES)
     for change in [dict(extraction=ext(certainty=0.7)), dict(extraction=ext(key=None, certainty=0.95)),
                    dict(risk=rk(0.15)), dict(extraction=ext(condition="unknown")),
-                   dict(estimate=Est(n_sold=5)), dict(estimate=None), dict(risk=rk(0.01, hard=True))]:
+                   dict(estimate=Est(n_sold=5)), dict(estimate=None)]:
         level, why = tiering.confidence(**{**ok, **change})
         assert level == "low" and why, change
     assert tiering.confidence(**{**ok, "estimate": Est(n_sold=6)})[0] == "medium"   # half of 12
@@ -107,7 +133,8 @@ def test_confidence_low():
 
 @pytest.mark.parametrize("country,channel,flags,est,bundle,expected", [
     ("PL", "olx", [], Est(), 0, "easy"),
-    (None, "allegro", [], Est(), 0, "easy"),
+    (None, "allegro", [], Est(), 0, "easy"),          # missing country from a Polish marketplace: PL
+    (None, "kleinanzeigen", [], Est(), 0, "moderate"),  # missing country from anywhere else: unknown, moderate
     ("PL", "allegro", [], Est(days_to_sell=14), 0, "easy"),
     ("PL", "allegro", [], Est(days_to_sell=14.1), 0, "moderate"),
     ("PL", "allegro", [], Est(days_to_sell=None), 0, "easy"),
@@ -123,7 +150,8 @@ def test_confidence_low():
 ])
 def test_effort_class(country, channel, flags, est, bundle, expected):
     e = ext(bundle_items=["x"] * bundle)
-    assert tiering.effort_class(NS(country=country), channel, flags, est, extraction=e) == expected
+    src = "kleinanzeigen" if channel == "kleinanzeigen" else "olx"
+    assert tiering.effort_class(NS(country=country, source=src), channel, flags, est, extraction=e) == expected
 
 
 def test_effort_class_without_extraction():
