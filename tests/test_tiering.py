@@ -15,7 +15,8 @@ RULES = config.load(REPO).rules
 
 @dataclass
 class Est:  # stand-in for valuation.ExitEstimate
-    n_sold: int = 20
+    n_sold_effective: float = 20.0
+    n_sold: int = 20  # display only: confidence must not read it
     days_to_sell: float | None = 5.0
 
 
@@ -66,7 +67,7 @@ def test_hard_excluded_is_never_tiered(effort, net):
 def test_hard_exclude_wins_over_everything():
     # certain match, many comps, verified, low p_scam: still excluded
     risk = Risk(p_scam=0.0, hard_exclude=True, flags=["offplatform_url"])
-    level, why = tiering.confidence(ext(), Est(n_sold=99), risk, 0, 100, RULES)
+    level, why = tiering.confidence(ext(), Est(n_sold_effective=99), risk, 0, 100, RULES)
     assert level == "excluded" and "offplatform_url" in why[0]
 
 
@@ -88,7 +89,7 @@ def test_assign_accepts_plain_dict():
 
 
 def test_high_confidence_needs_more_comps_for_big_capital():
-    est = lambda n: Est(n_sold=n)  # noqa: E731
+    est = lambda n: Est(n_sold_effective=n)  # noqa: E731
     conf = lambda n, cap: tiering.confidence(ext(), est(n), rk(), 60, cap, RULES)[0]  # noqa: E731
     assert conf(12, 5000) == "high"          # 5000 is not "over 5000"
     assert conf(11, 5000) == "medium"
@@ -113,7 +114,7 @@ def test_confidence_high_requires_everything():
         (dict(verified_age_s=601), "verified"),
         (dict(verified_age_s=None), "verified"),
         (dict(extraction=ext(defects=["fan noise"])), "defects"),
-        (dict(estimate=Est(n_sold=11)), "comparables"),
+        (dict(estimate=Est(n_sold_effective=11)), "comparables"),
     ]:
         level, why = tiering.confidence(**{**ok, **change})
         assert level == "medium" and any(label in w for w in why), (change, level, why)
@@ -125,10 +126,10 @@ def test_confidence_low():
     ok = dict(extraction=ext(), estimate=Est(), risk=rk(), verified_age_s=120, capital_usd=1000, rules=RULES)
     for change in [dict(extraction=ext(certainty=0.7)), dict(extraction=ext(key=None, certainty=0.95)),
                    dict(risk=rk(0.15)), dict(extraction=ext(condition="unknown")),
-                   dict(estimate=Est(n_sold=5)), dict(estimate=None)]:
+                   dict(estimate=Est(n_sold_effective=5)), dict(estimate=None)]:
         level, why = tiering.confidence(**{**ok, **change})
         assert level == "low" and why, change
-    assert tiering.confidence(**{**ok, "estimate": Est(n_sold=6)})[0] == "medium"   # half of 12
+    assert tiering.confidence(**{**ok, "estimate": Est(n_sold_effective=6)})[0] == "medium"   # half of 12
 
 
 @pytest.mark.parametrize("country,channel,flags,est,bundle,expected", [
@@ -156,3 +157,12 @@ def test_effort_class(country, channel, flags, est, bundle, expected):
 
 def test_effort_class_without_extraction():
     assert tiering.effort_class(NS(country="PL"), "olx", [], Est()) == "easy"
+
+
+def test_confidence_counts_effective_sold_weight_not_rows():
+    """24 probably-sold rows (weight 0.5) are 12 effective sales; fallback comps count at their reduced weight."""
+    ok = dict(extraction=ext(), risk=rk(), verified_age_s=120, capital_usd=1000, rules=RULES)
+    assert tiering.confidence(estimate=Est(n_sold=24, n_sold_effective=12.0), **ok)[0] == "high"
+    level, why = tiering.confidence(estimate=Est(n_sold=30, n_sold_effective=11.9), **ok)
+    assert level == "medium" and any("11.9 effective sold comparables < 12" in w for w in why)
+    assert tiering.confidence(estimate=Est(n_sold=12, n_sold_effective=5.5), **ok)[0] == "low"  # < half of 12

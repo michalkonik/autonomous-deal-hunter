@@ -84,7 +84,9 @@ async def verify_deal(store, deal_id: int, cfg, fx, customs, adapters, fetcher) 
     net_now = replay.cons_net_pln
     if not alive:
         diffs.append("listing not confirmed alive")
-    elif price_now is not None and price_now != inp.buy_price:
+    elif price_now is None:
+        diffs.append("price not confirmed")  # high confidence needs the same price re-seen live
+    elif price_now != inp.buy_price:
         diffs.append(f"price changed: {inp.buy_price} -> {price_now} {inp.buy_ccy}")
         from dataclasses import replace
         net_now = (await economics.net(replace(inp, buy_price=price_now), cfg, fx, customs)).cons_net_pln
@@ -103,9 +105,11 @@ def record_verification(store, deal_id: int, ok: bool, screenshot: Path | str | 
     store.conn.commit()
 
 
-async def _shoot(url: str, path: Path) -> bool:
-    """Headless system Chrome, 1280x2000, 30 s. False on a bad status or a challenge page."""
+async def _shoot(url: str, path: Path, fetcher) -> bool:
+    """Headless system Chrome, 1280x2000, 30 s. False (nothing saved) on a bad status, a challenge page, or a
+    final URL robots forbids; a block is reported to the fetcher's backoff bookkeeping."""
     from playwright.async_api import async_playwright
+    domain = urlsplit(url).netloc.lower()
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(executable_path=CHROME, headless=True)
         try:
@@ -113,7 +117,13 @@ async def _shoot(url: str, path: Path) -> bool:
             page.set_default_timeout(TIMEOUT_MS)
             resp = await page.goto(url, timeout=TIMEOUT_MS, wait_until="load")
             status = resp.status if resp else 0
-            if status == 0 or status >= 400 or is_challenge(status, await page.content()):
+            final = page.url
+            if status in (403, 429) or is_challenge(status, await page.content()):
+                fetcher.report_block(urlsplit(final).netloc.lower() or domain, f"screenshot got status {status}")
+                return False
+            if status == 0 or status >= 400:
+                return False
+            if final != url and not await fetcher.allowed(final):  # redirected somewhere robots forbids
                 return False
             path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(path))
@@ -124,12 +134,17 @@ async def _shoot(url: str, path: Path) -> bool:
 
 async def screenshot(url: str, path: Path | str, fetcher) -> bool:
     """Evidence screenshot. Only for URLs `fetcher.allowed()` permits (robots) on a domain that is neither
-    blocked nor disabled. Never raises; failure returns False and does not block the caller."""
+    blocked nor disabled, paced like any other request to that domain. Never raises; failure returns False."""
     path = Path(path)
     try:
         domain = urlsplit(url).netloc.lower()
         if fetcher.blocked(domain) or fetcher.disabled(domain) or not await fetcher.allowed(url):
             return False
-        return bool(await _shoot(url, path))
+        if not await fetcher.pace(domain):
+            return False
+        ok = bool(await _shoot(url, path, fetcher))
+        if not ok and path.exists():
+            path.unlink(missing_ok=True)
+        return ok
     except Exception:
         return False

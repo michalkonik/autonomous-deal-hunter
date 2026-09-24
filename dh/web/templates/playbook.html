@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}Playbook{% endblock %}
+{% block body %}<h1>Playbook</h1>
+<h2>Scoreboard</h2><div class="card">Deals: {{score.deals}} &middot; watched hours: {{score.watched_hours if score.watched_hours is not none else "n/a"}} &middot;
+marks: {% for k,v in score.marks.items() %}{{k}} {{v}}{% if not loop.last %}, {% endif %}{% else %}none yet{% endfor %}</div>
+<h2>Items</h2>
+{% if error %}<p class="bad">{{error}}</p>{% endif %}
+{% if not items %}<p class="mut">No data yet.</p>{% else %}
+<div class="tbl"><table><tr><th>Id</th><th>Kind</th><th>Target</th><th>Value</th><th>Provenance</th><th class="n">+</th><th class="n">-</th><th></th></tr>
+{% for i in items %}<tr><td>{{i.id}}</td><td>{{i.kind}}</td><td>{{i.target}}</td><td>{{i.value}}</td><td>{{i.provenance}}</td>
+<td class="n">{{i.helpful}}</td><td class="n">{{i.harmful}}</td><td>{% if i.sentinel %}<span class="tag">sentinel</span>{% endif %}</td></tr>{% endfor %}</table></div>{% endif %}
+<h2>Versions</h2>
+{% if not diffs %}<p class="mut">No data yet.</p>{% endif %}
+{% for d in diffs %}<h3>{{d.v.version}} <span class="mut">{{d.v.created_at}}</span></h3><pre>{{d.diff or "(no change)"}}</pre>{% endfor %}
+{% endblock %}

@@ -44,7 +44,7 @@ def test_every_emitted_key_survives_publish_sanitiser(tmp_path):
     d, res, lst = make_deal(st)
     md, data = cards.render(d, lst, estimate(), res, risk())
     out = json.loads(publish.sanitize_json(json.dumps(data)))
-    assert set(out) == set(data)
+    assert out == data and set(data) == cards.PUBLIC_KEYS
     assert out["comps"] == data["comps"] and out["listing"] == data["listing"]
     # the md survives too: nothing is dropped as a "seller" line, including the checklist item
     assert publish.sanitize_md(md) == md
@@ -77,3 +77,32 @@ def test_slug():
     assert cards.slug("Karta Graśczna RTX 4090 / Ti!") == "karta-grasczna-rtx-4090-ti"
     assert cards.slug("\u0141\u00f3d\u017a G\u00f6rlitz") == "lodz-gorlitz"
     assert cards.slug(None) == "deal"
+
+
+def test_seller_text_is_escaped_in_markdown(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    lst.title = "RTX [click](https://evil.example) | x\n# Injected\nseller: Jan"
+    md, data = cards.render(d, lst, estimate(), res, risk())
+    line = [l for l in md.split("\n") if l.startswith("- Listing:")]
+    assert len(line) == 1 and "\\[click\\]" in line[0] and "\\|" in line[0]
+    assert "\n# Injected" not in md and "[click](https" not in md
+
+
+def test_screenshot_paths_relative_to_root(tmp_path):
+    import json as _j
+    from dh import verify
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    verify.record_verification(st, d.id, True, tmp_path / "shots" / "v.png")
+    verify.record_verification(st, d.id, True, "/etc/elsewhere/leak.png")  # outside root: basename only
+    d = st.get_deal(d.id)
+    ev = _j.loads(d.evidence_json)
+    ev["screenshots"]["discovery"] = str(tmp_path / "shots" / "d.png")
+    d.evidence_json = _j.dumps(ev)
+    _, data = cards.from_deal(d, tmp_path)
+    assert data["screenshots"] == {"discovery": "shots/d.png", "verification": "leak.png"}
+    md, data2 = cards.render(d, lst, estimate(), res, risk(), tmp_path)
+    assert str(tmp_path) not in md and data2["screenshots"]["discovery"] == "shots/d.png"
+    p = cards.write(d, tmp_path)
+    assert str(tmp_path / "shots") not in p.read_text()

@@ -42,8 +42,10 @@ KIND = "ask_history"
 MAX_BYTES = 200 * 1024 * 1024
 USER_AGENT = "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
 CATEGORIES = ("gpu", "ram", "ssd")
-
-csv.field_size_limit(10 * 1024 * 1024)
+# Placeholder prices ("1 Kč", "10 zł") are not asks. Below either floor a row is skipped.
+MIN_NATIVE = {"CZK": Decimal("50"), "PLN": Decimal("20")}
+MIN_PLN = Decimal("20")
+CSV_FIELD_LIMIT = 10 * 1024 * 1024
 
 
 def split_title_price(title: str) -> tuple[str, str | None]:
@@ -92,6 +94,8 @@ def _rows_from_text(f: io.TextIOBase) -> Iterator[tuple[str, str | None, str, da
 
 def iter_rows(path: Path) -> Iterator[tuple[str, str | None, str, datetime]]:
     """(title, price text, link, posted_at UTC) from a .csv or a .zip of CSVs."""
+    if csv.field_size_limit() < CSV_FIELD_LIMIT:
+        csv.field_size_limit(CSV_FIELD_LIMIT)  # long RSS descriptions; raised only while importing
     path = Path(path)
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as z:
@@ -106,7 +110,8 @@ def iter_rows(path: Path) -> Iterator[tuple[str, str | None, str, datetime]]:
 async def import_bazos(store: Store, path: Path, fx, *, categories: tuple[str, ...] = CATEGORIES,
                        min_certainty: float = 0.9) -> dict[str, int]:
     """Import matching rows as ask_history comps. `fx` needs `async rate(ccy, day) -> Decimal` (money.Fx)."""
-    counts = {"rows": 0, "imported": 0, "duplicate": 0, "no_price": 0, "no_key": 0, "excluded": 0}
+    counts = {"rows": 0, "imported": 0, "duplicate": 0, "no_price": 0, "below_floor": 0, "no_key": 0,
+              "excluded": 0}
     rates: dict[tuple[str, date], Decimal] = {}
     for title, price_text, link, when in iter_rows(path):
         counts["rows"] += 1
@@ -115,6 +120,9 @@ async def import_bazos(store: Store, path: Path, fx, *, categories: tuple[str, .
             counts["no_price"] += 1
             continue
         amount, ccy = parsed
+        if amount < MIN_NATIVE.get(ccy, Decimal(0)):
+            counts["below_floor"] += 1
+            continue
         e = rules_extract(title, "", "cs")
         if e.wanted_ad or e.box_only or e.for_parts or e.bundle_items:
             counts["excluded"] += 1
@@ -132,6 +140,9 @@ async def import_bazos(store: Store, path: Path, fx, *, categories: tuple[str, .
             if (ccy, d) not in rates:
                 rates[(ccy, d)] = await fx.rate(ccy, d)
             pln = q2(amount * rates[(ccy, d)])
+        if pln < MIN_PLN:
+            counts["below_floor"] += 1
+            continue
         condition = e.condition if e.condition in ("new", "like_new") else "used"
         store.add_comp(e.key, condition, CHANNEL, pln, when, KIND, link)
         counts["imported"] += 1

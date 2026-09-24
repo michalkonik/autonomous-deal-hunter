@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Deal Hunter{% endblock %}</title>
+<style>
+:root{--bg:#fff;--fg:#1c1c1e;--mut:#6b6b70;--card:#f4f4f6;--line:#d8d8de;--acc:#0a5bd3;--ok:#1a7f37;--bad:#c62828}
+@media (prefers-color-scheme:dark){:root{--bg:#121214;--fg:#e8e8ea;--mut:#9a9aa2;--card:#1d1d21;--line:#34343a;--acc:#6aa5ff;--ok:#4cc26a;--bad:#ff6b6b}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:12px}
+nav{display:flex;flex-wrap:wrap;gap:4px 14px;padding:10px 12px;border-bottom:1px solid var(--line)}
+nav a{color:var(--acc);text-decoration:none}nav a.on{font-weight:700;text-decoration:underline}
+a{color:var(--acc)}h1{font-size:1.35rem}h2{font-size:1.1rem;margin-top:1.4rem}
+.tbl{overflow-x:auto}table{border-collapse:collapse;width:100%}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+.card{background:var(--card);border-radius:8px;padding:10px 12px;margin:10px 0}
+.mut{color:var(--mut)}.star{color:#d89b00}.bad{color:var(--bad)}.ok{color:var(--ok)}
+form.f{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:8px 0}
+label{display:flex;flex-direction:column;font-size:.85rem;color:var(--mut)}
+input,select,button{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+button{background:var(--acc);color:#fff;border-color:var(--acc);cursor:pointer}button.alt{background:transparent;color:var(--acc)}
+pre{white-space:pre-wrap;overflow-x:auto;background:var(--card);padding:8px;border-radius:6px;font-size:.85rem}
+.tag{display:inline-block;padding:0 6px;border-radius:10px;background:var(--card);border:1px solid var(--line);font-size:.8rem}
+</style></head><body>
+<nav>{% for href,label,key in [("/","Deals","deals"),("/rounds","Rounds","rounds"),("/playbook","Playbook","playbook"),("/books","Books","books"),("/health","Health","health")] %}<a href="{{href}}"{% if page==key or (page=="deal" and key=="deals") %} class="on"{% endif %}>{{label}}</a>{% endfor %}</nav>
+<main>{% block body %}{% endblock %}</main></body></html>

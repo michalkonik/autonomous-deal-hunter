@@ -15,4 +15,14 @@ adapters:
   allegro: {enabled: true, via: mailbox}
   vinted: {enabled: false}
   ebay: {enabled: true, via: api}
+  allegro_lokalnie: {enabled: true}
+  sprzedajemy: {enabled: true}
+  kleinanzeigen: {enabled: true}
+  hardverapro: {enabled: true}
+  marktplaats: {enabled: true}
+  # Bazos: search is disallowed by robots.txt; category listing pages only, filtered locally.
+  bazos_cz: {enabled: true, pages: 2}
+  bazos_sk: {enabled: true, pages: 2}
+  bazos_at: {enabled: false, pages: 2, reason: "almost no volume: /grafikkarten/ and /notebooks/ list 0 ads"}
+  sbazar: {enabled: false, reason: "robots.txt disallows all paths for non-Google agents"}
 retention: {photos_days: 90, snapshots_days: 90}

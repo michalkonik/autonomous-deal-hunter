@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from dealfix import NOW, make_deal
+from dh.sources.base import seller_hash
 from dh import dedupe
 from dh.store import Store
 
@@ -32,3 +33,38 @@ def test_same_listing_and_missing_seller(tmp_path):
     assert again.listing_ref == a.listing_ref and dedupe.is_duplicate(st, again) is True
     b, _, _ = make_deal(st, seller=None, sid="2")       # no seller hash and another listing: not provable
     assert dedupe.is_duplicate(st, b) is False
+
+
+def _city(st, d, city):
+    st.conn.execute("update listings set city=? where id=?", (city, d.listing_ref))
+    st.conn.commit()
+
+
+def test_cross_platform_by_city_when_seller_hashes_differ(tmp_path):
+    st = Store(tmp_path / "t.db")
+    a, _, _ = make_deal(st, price="2000", seller=seller_hash("kleinanzeigen", "u1", b"salt"), sid="1")
+    b, _, _ = make_deal(st, price="2060", seller=seller_hash("marktplaats", "u1", b"salt"), sid="2",
+                        source="marktplaats", created=NOW + timedelta(days=2))
+    assert a.listing_ref != b.listing_ref
+    _city(st, a, "Krak\u00f3w")
+    _city(st, b, " krakow ")
+    assert dedupe.is_duplicate(st, b) is True
+
+
+def test_cross_platform_city_negative_cases(tmp_path):
+    st = Store(tmp_path / "t.db")
+    a, _, _ = make_deal(st, price="2000", seller="h1", sid="1")
+    b, _, _ = make_deal(st, price="2000", seller="h2", sid="2", source="marktplaats")
+    c, _, _ = make_deal(st, price="2000", seller="h3", sid="3", source="marktplaats")
+    _city(st, a, "Krak\u00f3w")
+    _city(st, b, "Warszawa")
+    assert dedupe.is_duplicate(st, b) is False            # different city
+    _city(st, a, None)
+    _city(st, b, None)
+    _city(st, c, None)
+    assert dedupe.is_duplicate(st, b) is False and dedupe.is_duplicate(st, c) is False  # missing city never matches
+    _city(st, a, "Krak\u00f3w")
+    _city(st, c, "Krak\u00f3w")
+    far, _, _ = make_deal(st, price="2600", seller="h4", sid="4", source="marktplaats")  # price +30%
+    _city(st, far, "Krak\u00f3w")
+    assert dedupe.is_duplicate(st, far) is False

@@ -1,0 +1,6 @@
+{% extends "base.html" %}{% block title %}Rounds{% endblock %}
+{% block body %}<h1>Rounds</h1>
+{% if not rounds %}<p class="mut">No data yet.</p>{% else %}
+<div class="tbl"><table><tr><th>#</th><th>Started</th><th>Ended</th><th>Source</th><th class="n">Seen</th><th class="n">Deals</th><th class="n">Cost PLN</th><th>Notes</th></tr>
+{% for r in rounds %}<tr><td>{{r.id}}</td><td>{{r.started_at or ""}}</td><td>{{r.ended_at or ""}}</td><td>{{r.source or ""}}</td>
+<td class="n">{{r.listings_seen}}</td><td class="n">{{r.deals_found}}</td><td class="n">{{costs.get(r.id,"")}}</td><td>{{r.notes or ""}}</td></tr>{% endfor %}</table></div>{% endif %}{% endblock %}

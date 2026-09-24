@@ -245,6 +245,25 @@ class Fetcher:
         d.soft_until = self.clock() + delay
         self._health(domain, "soft_backoff", f"{why}; backoff {delay:.0f}s; failures={d.soft_failures}")
 
+    async def pace(self, domain: str) -> bool:
+        """For callers that load a page outside `get` (headless screenshots): wait out the domain's pacing
+        interval and count it as a request. False when the domain is blocked or disabled (do not load)."""
+        d = self._dom(domain)
+        async with d.lock:
+            if self.blocked(domain):
+                return False
+            if d.last_request is not None:
+                wait = (d.last_request + max(self.min_interval, d.crawl_delay)
+                        + random.uniform(0, self.jitter) - self.clock())
+                if wait > 0:
+                    await self.sleep(wait)
+            d.last_request = self.clock()
+            return True
+
+    def report_block(self, domain: str, why: str) -> None:
+        """A block (403/429/challenge) seen outside `get`: same backoff and health bookkeeping."""
+        self._register_block(domain, why)
+
     # --- the one place a request is made ------------------------------------
     async def _locked_request(self, domain: str, url: str, headers: dict | None, *, robots: bool = False) -> _Out:
         d = self._dom(domain)

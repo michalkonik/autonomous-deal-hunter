@@ -1,0 +1,12 @@
+{% extends "base.html" %}{% block title %}Health{% endblock %}
+{% block body %}<h1>Health</h1>
+{% if not events and not windows %}<p class="mut">No data yet.</p>{% else %}
+<h2>Open observation windows</h2>
+{% if windows %}<ul>{% for w in windows %}<li>{{w.source}} since {{w.opened_at}}</li>{% endfor %}</ul>{% else %}<p class="mut">none</p>{% endif %}
+<h2>By source and kind</h2>
+<div class="tbl"><table><tr><th>Source</th><th>Kind</th><th class="n">Count</th><th>Last</th></tr>
+{% for s in summary %}<tr><td>{{s.source}}</td><td>{{s.kind}}</td><td class="n">{{s.n}}</td><td>{{s.last}}</td></tr>{% endfor %}</table></div>
+<h2>Recent events</h2>
+<div class="tbl"><table><tr><th>At</th><th>Source</th><th>Kind</th><th>Detail</th></tr>
+{% for e in events %}<tr><td>{{e.at}}</td><td>{{e.source}}</td><td>{{e.kind}}</td><td>{{e.detail}}</td></tr>{% endfor %}</table></div>
+{% endif %}{% endblock %}

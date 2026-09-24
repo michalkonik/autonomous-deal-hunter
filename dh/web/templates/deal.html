@@ -1,0 +1,44 @@
+{% extends "base.html" %}{% block title %}Deal {{deal.id}}{% endblock %}
+{% block body %}
+<h1>T{{c.tier}}{% if c.star %} <span class="star">&#9733;</span>{% endif %} {{c.key or "deal"}}</h1>
+<p class="mut">{{c.listing.get("title","")}}{% if c.listing.get("city") %} &middot; {{c.listing.city}}{% endif %}{% if c.listing.get("country") %}, {{c.listing.country}}{% endif %}
+{% set u = c.listing.get("url","") %}{% if u.startswith(("http://","https://")) %} &middot; <a href="{{u}}" rel="noopener noreferrer">listing</a>{% endif %}</p>
+<div class="card"><table>
+<tr><th>Buy</th><td>{{c.buy_price}} {{c.buy_currency}} ({{c.buy_pln}} PLN)</td></tr>
+<tr><th>Exit</th><td>P25 {{c.exit_p25_pln}} PLN, median {{c.exit_median_pln}} PLN</td></tr>
+<tr><th>Conservative net</th><td>{{c.cons_net_pln}} PLN ({{c.cons_net_usd}} USD)</td></tr>
+<tr><th>Expected net</th><td>{{c.exp_net_pln}} PLN ({{c.exp_net_usd}} USD)</td></tr>
+<tr><th>Confidence / effort</th><td>{{c.confidence}} / {{c.effort}}</td></tr>
+<tr><th>Capital</th><td>{{c.capital_usd}} USD</td></tr>
+<tr><th>Days to sell</th><td>{{c.days_to_sell}}</td></tr>
+<tr><th>Retail ceiling / trend</th><td>{{c.retail_ceiling_pln}} PLN / {{c.trend_30d}}</td></tr></table></div>
+
+<h2>Outcome</h2>
+<div class="card">
+<p>{% if marks %}Latest: <b>{{marks[0].status}}</b>{% if marks[0].price_pln %} at {{marks[0].price_pln}} PLN{% endif %}{% if marks[0].note %} ({{marks[0].note}}){% endif %}{% else %}Not marked yet.{% endif %}</p>
+<form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="bought">
+<label>Note<input name="note" maxlength="500"></label><button>Bought</button></form>
+<form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="skipped">
+<label>Reason<input name="reason" maxlength="500"></label><button class="alt">Skipped</button></form>
+<form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="sold">
+<label>Sold price (PLN)<input name="price_pln" inputmode="decimal" required pattern="[0-9]+([.,][0-9]{1,2})?"></label>
+<label>Note<input name="note" maxlength="500"></label><button>Sold</button></form>
+{% if marks %}<table><tr><th>When</th><th>Status</th><th class="n">PLN</th><th>Note</th><th>Via</th></tr>
+{% for m in marks %}<tr><td>{{m.created_at}}</td><td>{{m.status}}</td><td class="n">{{m.price_pln or ""}}</td><td>{{m.note or ""}}</td><td>{{m.source}}</td></tr>{% endfor %}</table>{% endif %}</div>
+
+{% for name,rows in (("Conservative (exit at P25)",c.breakdown.cons),("Expected (exit at median)",c.breakdown.exp)) %}
+<h2>Net: {{name}}</h2><div class="tbl"><table><tr><th>Line</th><th class="n">PLN</th><th>Note</th></tr>
+{% for r in rows %}<tr><td>{{r.label}}</td><td class="n">{{r.pln}}</td><td class="mut">{{r.note}}</td></tr>{% endfor %}</table></div>{% endfor %}
+{% if c.fx %}<p class="mut">FX: {{c.fx.rate}} PLN per {{c.fx.currency}} (NBP mid, {{c.fx.date}})</p>{% endif %}
+
+<h2>Evidence</h2>
+<p>Screenshots: discovery {{c.screenshots.get("discovery") or "none"}}, verification {{c.screenshots.get("verification") or "none"}}</p>
+<h3>Comparables</h3>
+{% if c.comps %}<div class="tbl"><table><tr><th>Kind</th><th class="n">PLN</th><th>Date</th><th>Link</th></tr>
+{% for x in c.comps %}<tr><td>{{x.kind}}</td><td class="n">{{x.price}}</td><td>{{(x.date or "")[:10]}}</td>
+<td>{% if (x.url or "").startswith(("http://","https://")) %}<a href="{{x.url}}" rel="noopener noreferrer">link</a>{% else %}{{x.url or ""}}{% endif %}</td></tr>{% endfor %}</table></div>{% else %}<p class="mut">none</p>{% endif %}
+
+<h2>Risk</h2><p>p_scam {{c.risk.p_scam}}; flags: {{c.risk.flags|join(", ") or "none"}}</p>
+<h2>Why this tier</h2><ul>{% for r in c.reasons %}<li>{{r}}</li>{% else %}<li class="mut">n/a</li>{% endfor %}</ul>
+<h2>How to buy safely</h2><ul>{% for r in c.checklist %}<li>{{r}}</li>{% endfor %}</ul>
+{% endblock %}

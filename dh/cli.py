@@ -17,6 +17,11 @@ def build_parser() -> argparse.ArgumentParser:
     for name in COMMANDS:
         sp = sub.add_parser(name, help=f"{name} (stub)")
         sp.set_defaults(func=_stub)
+    from . import probe
+
+    sp = sub.add_parser("probe", help="run one source adapter search live and print the listings")
+    probe.add_arguments(sp)
+    sp.set_defaults(func=probe.run)
     return p
 
 

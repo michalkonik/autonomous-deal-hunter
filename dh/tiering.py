@@ -77,14 +77,15 @@ def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -
     """('high'|'medium'|'low'|'excluded', reasons). The reasons list every unmet condition for high, so a card can say
     why a deal is not tier 1.
 
-    high: match certainty >= 0.9, >= min_comps comparables <= 30 days old (estimate.n_sold: owner sales,
-    eBay sold, probably-sold; asks do not count), p_scam < 0.05, verified live at the same price <= 10 min ago
+    high: match certainty >= 0.9, >= min_comps comparables <= 30 days old (estimate.n_sold_effective: the summed
+    weight of owner sales 1.0, eBay sold 1.0, probably-sold 0.5, each x its fallback multiplier; asks do not
+    count), p_scam < 0.05, verified live at the same price <= 10 min ago
     (`verified_age_s` is None when never verified or when the price changed), no defect flags, condition known, no hard exclude.
     medium: certainty >= 0.75, p_scam < 0.15, known condition, comparables >= half of min_comps, no hard exclude.
     Otherwise low. A hard-excluded listing is 'excluded' and assign() never tiers it."""
     c = _rules(rules).confidence
     need = min_comps(capital_usd, rules)
-    n_sold = getattr(estimate, "n_sold", 0) if estimate is not None else 0
+    n_sold = float(getattr(estimate, "n_sold_effective", 0.0) or 0.0) if estimate is not None else 0.0
     cert = extraction.certainty if extraction.key else 0.0
     if risk.hard_exclude:
         flags = ", ".join(getattr(risk, "flags", []) or [])
@@ -93,7 +94,7 @@ def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -
     if cert < float(c.match_certainty_min):
         why.append(f"match certainty {cert:.2f} < {c.match_certainty_min}")
     if n_sold < need:
-        why.append(f"{n_sold} comparables < {need} needed")
+        why.append(f"{n_sold:g} effective sold comparables < {need} needed")
     if risk.p_scam >= float(c.p_scam_max):
         why.append(f"p_scam {risk.p_scam:.3f} >= {c.p_scam_max}")
     if verified_age_s is None or verified_age_s > float(c.verify_max_age_min) * 60:

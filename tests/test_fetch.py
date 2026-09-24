@@ -359,3 +359,18 @@ async def test_crawl_delay_capped(tmp_path):
     t = ft.t
     await f.get("https://a.test/2", kind="html")
     assert 60 <= ft.t - t < 63
+
+
+async def test_pace_and_report_block_for_external_page_loads(tmp_path):
+    f, ft, st = make(tmp_path, ok_handler([]))
+    await f.get("https://a.test/1", kind="html")
+    t1, n = ft.t, len(ft.sleeps)
+    assert await f.pace("a.test") is True          # waits out the interval like a normal request
+    assert ft.t - t1 >= 4 and len(ft.sleeps) == n + 1
+    assert await f.pace("fresh.test") is True and len(ft.sleeps) == n + 1  # first request to a domain: no wait
+    f.report_block("a.test", "screenshot got status 429")
+    assert f.blocked("a.test") and any(h[1] == "blocked" for h in st.health)
+    assert await f.pace("a.test") is False
+    for _ in range(2):
+        f.report_block("a.test", "again")
+    assert f.disabled("a.test")

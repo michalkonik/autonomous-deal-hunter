@@ -23,7 +23,14 @@ class FakeAdapter:
 
 class FakeFetcher:
     def __init__(self, allowed=True, blocked=False):
-        self.ok, self.bl, self.asked = allowed, blocked, []
+        self.ok, self.bl, self.asked, self.paced, self.reported = allowed, blocked, [], [], []
+
+    async def pace(self, domain):
+        self.paced.append(domain)
+        return True
+
+    def report_block(self, domain, why):
+        self.reported.append((domain, why))
 
     async def allowed(self, url):
         self.asked.append(url)
@@ -88,7 +95,7 @@ def test_record_verification(tmp_path):
 def test_screenshot_respects_robots_and_blocks(tmp_path, monkeypatch):
     called = []
 
-    async def fake_shoot(url, path):
+    async def fake_shoot(url, path, fetcher):
         called.append(url)
         return True
     monkeypatch.setattr(verify, "_shoot", fake_shoot)
@@ -96,11 +103,84 @@ def test_screenshot_respects_robots_and_blocks(tmp_path, monkeypatch):
     assert asyncio.run(verify.screenshot(url, tmp_path / "a.png", FakeFetcher(allowed=False))) is False
     assert asyncio.run(verify.screenshot(url, tmp_path / "a.png", FakeFetcher(blocked=True))) is False
     assert called == []
-    assert asyncio.run(verify.screenshot(url, tmp_path / "a.png", FakeFetcher())) is True and called == [url]
+    f = FakeFetcher()
+    assert asyncio.run(verify.screenshot(url, tmp_path / "a.png", f)) is True and called == [url]
+    assert f.paced == ["www.kleinanzeigen.de"]  # paced like any other request to the domain
 
 
 def test_screenshot_failure_returns_false(tmp_path, monkeypatch):
-    async def boom(url, path):
+    async def boom(url, path, fetcher):
         raise RuntimeError("chrome died")
     monkeypatch.setattr(verify, "_shoot", boom)
     assert asyncio.run(verify.screenshot("https://x.example/a", tmp_path / "a.png", FakeFetcher())) is False
+
+
+def test_verify_price_not_confirmed(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, _, _ = make_deal(st)
+    r = run(st, d, FakeAdapter(True, None))
+    assert r.alive and not r.ok and "price not confirmed" in r.diffs
+
+
+def test_screenshot_discards_blocked_response_and_reports(tmp_path, monkeypatch):
+    """Drive _shoot against a fake Playwright: 429 -> report_block, no file; redirect to a robots-forbidden URL -> no file."""
+    import sys, types
+
+    class Resp:
+        def __init__(self, status):
+            self.status = status
+
+    class Page:
+        def __init__(self, status, final):
+            self.status, self.url = status, final
+
+        def set_default_timeout(self, ms):
+            pass
+
+        async def goto(self, url, **kw):
+            return Resp(self.status)
+
+        async def content(self):
+            return "<html>hi</html>"
+
+        async def screenshot(self, path):
+            open(path, "wb").write(b"png")
+
+    def fake_pw(status, final):
+        class B:
+            async def new_page(self, **kw):
+                return Page(status, final)
+
+            async def close(self):
+                pass
+
+        class CM:
+            async def __aenter__(self):
+                class PW:
+                    class chromium:
+                        @staticmethod
+                        async def launch(**kw):
+                            return B()
+                return PW()
+
+            async def __aexit__(self, *a):
+                pass
+        mod = types.ModuleType("playwright.async_api")
+        mod.async_playwright = lambda: CM()
+        monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+        monkeypatch.setitem(sys.modules, "playwright.async_api", mod)
+
+    url = "https://www.kleinanzeigen.de/s-anzeige/x/1"
+    f = FakeFetcher()
+    fake_pw(429, url)
+    assert asyncio.run(verify.screenshot(url, tmp_path / "b.png", f)) is False
+    assert f.reported and f.reported[0][0] == "www.kleinanzeigen.de" and not (tmp_path / "b.png").exists()
+
+    class F2(FakeFetcher):
+        async def allowed(self, u):
+            return u == url
+    fake_pw(200, "https://www.kleinanzeigen.de/private/area")
+    assert asyncio.run(verify.screenshot(url, tmp_path / "c.png", F2())) is False
+    assert not (tmp_path / "c.png").exists()
+    fake_pw(200, url)
+    assert asyncio.run(verify.screenshot(url, tmp_path / "d.png", F2())) is True and (tmp_path / "d.png").exists()

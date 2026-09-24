@@ -1,11 +1,13 @@
 """Cross-platform dedupe (Review Focus 4): one physical item = one deal = one push.
 
-A new deal is a duplicate of a stored deal when it is the same listing, or when seller hash, product key match,
-the prices are within 5% (in PLN) and the stored deal was created within 7 days.
+A new deal is a duplicate of a stored deal when it is the same listing, or when the key matches, prices are within 5% (PLN),
+it is <= 7 days apart, and the seller hash matches (same platform) or the normalised city matches (cross-platform:
+seller hashes include the source, so they never match across platforms).
 """
 from __future__ import annotations
 
 import json
+import unicodedata
 from datetime import timedelta
 from decimal import Decimal
 
@@ -21,28 +23,42 @@ def _buy_pln(deal) -> Decimal | None:
         return None
 
 
-def _seller(store, listing_ref: int) -> str | None:
-    r = store.conn.execute("select seller_hash from listings where id=?", (listing_ref,)).fetchone()
-    return r["seller_hash"] if r else None
+def norm_city(city: str | None) -> str | None:
+    """lowercase, no diacritics, whitespace collapsed; None when empty."""
+    t = unicodedata.normalize("NFKD", (city or "").translate(str.maketrans("\u0142\u0141", "ll")))
+    t = " ".join("".join(c for c in t if not unicodedata.combining(c)).lower().split())
+    return t or None
+
+
+def _listing(store, listing_ref: int):
+    return store.conn.execute("select seller_hash, city from listings where id=?", (listing_ref,)).fetchone()
+
+
+def _close(a: Decimal | None, b: Decimal | None) -> bool:
+    return a is not None and b is not None and max(a, b) > 0 and abs(a - b) <= PRICE_TOLERANCE * max(a, b)
 
 
 def is_duplicate(store, deal) -> bool:
-    mine_seller = _seller(store, deal.listing_ref)
-    mine_price = _buy_pln(deal)
+    """Same listing; or same key, buy price within 5% (PLN) and created within 7 days, plus either
+    (A) the same seller hash, or (B) on any platform, the same normalised city (missing city never matches)."""
+    mine = _listing(store, deal.listing_ref)
+    seller = mine["seller_hash"] if mine else None
+    city = norm_city(mine["city"]) if mine else None
+    price = _buy_pln(deal)
     for other in store.deals():
         if deal.id is not None and other.id == deal.id:
             continue
         if other.listing_ref == deal.listing_ref:
             return True
-        if not mine_seller or not deal.key or other.key != deal.key:
+        if not deal.key or other.key != deal.key or abs(deal.created_at - other.created_at) > WINDOW:
             continue
-        if abs(deal.created_at - other.created_at) > WINDOW:
+        if not _close(price, _buy_pln(other)):
             continue
-        if _seller(store, other.listing_ref) != mine_seller:
+        theirs = _listing(store, other.listing_ref)
+        if theirs is None:
             continue
-        theirs = _buy_pln(other)
-        if mine_price is None or theirs is None or max(mine_price, theirs) <= 0:
-            continue
-        if abs(mine_price - theirs) <= PRICE_TOLERANCE * max(mine_price, theirs):
+        if seller and theirs["seller_hash"] == seller:
+            return True
+        if city and norm_city(theirs["city"]) == city:
             return True
     return False

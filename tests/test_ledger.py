@@ -159,7 +159,7 @@ def test_open_window_closes_a_stale_window_of_the_same_source(store):
 def test_failed_and_empty_sweeps_do_not_count(store):
     a, b = lst("a", "3000"), lst("b", "3100")
     sweep(store, h(0), [a, b])
-    ledger.record_sweep(store, SRC, ARM, h(0.5), ok=False, note="403")
+    ledger.record_sweep(store, SRC, ARM, h(0.5), note="403")
     ledger.observe(store, SRC, [], h(1), arm=ARM)  # parser broke: zero results is not evidence
     ledger.sweep_disappeared(store, SRC, h(1))
     assert disappeared(store, "a") is None
@@ -395,3 +395,83 @@ def test_unknown_condition_is_valued_as_used(store):
     store.save_extraction(lid(store, "new"), Extraction(key=KEY, category="gpu", certainty=0.95,
                                                          condition="for_parts"))
     assert ledger.clears_at(store, KEY, None, h(-24)) == []
+
+
+def test_record_sweep_cannot_fabricate_successful_sweeps(store):
+    """Review counter-example: two 'ok' sweeps recorded without results must not make a listing disappear."""
+    a = lst("a", "3000")
+    sweep(store, h(0), [a])
+    with pytest.raises(TypeError):
+        ledger.record_sweep(store, SRC, ARM, h(0.5), ok=True, n_results=40)
+    ledger.record_sweep(store, SRC, ARM, h(0.5))
+    ledger.record_sweep(store, SRC, ARM, h(1), note="timeout")
+    ledger.sweep_disappeared(store, SRC, h(1))
+    ledger.close_all_windows(store, h(2))
+    assert disappeared(store, "a") is None
+    rows = store.conn.execute("select ok, n_results from sweeps where ts>?", (h(0).isoformat(),)).fetchall()
+    assert [(r["ok"], r["n_results"]) for r in rows] == [(0, 0), (0, 0)]
+
+
+def test_unpriced_sighting_still_counts_as_seen(store):
+    """'do negocjacji' (price 0) is a sighting: it keeps the listing alive but adds no price observation."""
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [lst("a", "0"), b])
+    sweep(store, h(1), [lst("a", "0"), b])
+    sweep(store, h(1.5), [lst("a", "0"), b])
+    assert disappeared(store, "a") is None
+    row = store.conn.execute("select price, last_seen_at from listings where source_id='a'").fetchone()
+    assert row["price"] == "3000" and row["last_seen_at"] == h(1.5).isoformat()
+    assert store.conn.execute("select count(*) c from observations o join listings l on l.id=o.listing_id "
+                              "where l.source_id='a'").fetchone()["c"] == 1
+    # an untracked unpriced listing is not stored, but the sweep still counts it as a result
+    sweep(store, h(2), [lst("z", "0")])
+    assert store.conn.execute("select count(*) c from listings where source_id='z'").fetchone()["c"] == 0
+    assert store.conn.execute("select n_results from sweeps order by id desc limit 1").fetchone()["n_results"] == 1
+
+
+def test_unpriced_sighting_clears_disappearance(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    sweep(store, h(0.5), [b])
+    sweep(store, h(1), [b])
+    assert disappeared(store, "a") is not None
+    sweep(store, h(1.5), [lst("a", "0"), b])
+    assert disappeared(store, "a") is None
+
+
+def test_max_gap_is_honoured_when_windows_close(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    ledger.observe(store, SRC, [b], h(2), arm=ARM)
+    ledger.observe(store, SRC, [b], h(2.5), arm=ARM)
+    ledger.close_all_windows(store, h(3), max_gap=timedelta(hours=1))  # 2 h silence > 1 h guard
+    assert disappeared(store, "a") is None
+
+
+def test_open_window_honours_max_gap(store):
+    a, b = lst("a", "3000"), lst("b", "3100")
+    sweep(store, h(0), [a, b])
+    ledger.observe(store, SRC, [b], h(2), arm=ARM)
+    ledger.observe(store, SRC, [b], h(2.5), arm=ARM)
+    ledger.open_window(store, SRC, h(3), max_gap=timedelta(hours=1))
+    assert disappeared(store, "a") is None
+    # with the default guard the same evidence is accepted
+    s2 = Store(":memory:")
+    try:
+        sweep(s2, h(0), [a, b])
+        ledger.observe(s2, SRC, [b], h(2), arm=ARM)
+        ledger.observe(s2, SRC, [b], h(2.5), arm=ARM)
+        ledger.open_window(s2, SRC, h(3))
+        assert disappeared(s2, "a") == h(2).isoformat()
+    finally:
+        s2.close()
+
+
+def test_migration_tracked_per_store_object(tmp_path):
+    for i in range(3):
+        s = Store(tmp_path / f"m{i}.db")
+        ledger.observe(s, SRC, [lst("a", "3000")], h(0), arm=ARM)
+        assert s.conn.execute("select count(*) c from sweeps").fetchone()["c"] == 1
+        s.close()
+        del s

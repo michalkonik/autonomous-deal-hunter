@@ -126,7 +126,7 @@ def _estimate_dict(e) -> dict:
 
 # ---------------------------------------------------------------- card data
 
-def card_data(deal, ev: dict, breakdown: dict) -> dict:
+def card_data(deal, ev: dict, breakdown: dict, root: Path | None = None) -> dict:
     """The public card dict, built from the Deal row plus its evidence and breakdown."""
     est = ev.get("estimate") or {}
     lst = ev.get("listing") or {}
@@ -144,7 +144,8 @@ def card_data(deal, ev: dict, breakdown: dict) -> dict:
         "listing": {k: v for k, v in lst.items() if k in PUBLIC_LISTING_KEYS},
         "comps": [{k: v for k, v in c.items() if k in PUBLIC_COMP_KEYS} for c in est.get("comps", [])],
         "retail_ceiling_pln": est.get("ceiling_pln"), "trend_30d": est.get("trend_30d"),
-        "screenshots": ev.get("screenshots") or {"discovery": None, "verification": None},
+        "screenshots": {k: _rel(v, root) for k, v in
+                        (ev.get("screenshots") or {"discovery": None, "verification": None}).items()},
         "risk": {"p_scam": risk.get("p_scam"), "flags": list(risk.get("flags", []))},
         "reasons": list(deal.reasons), "checklist": list(ev.get("checklist", [])),
         "outcome": dict(DEFAULT_OUTCOME),
@@ -154,7 +155,7 @@ def card_data(deal, ev: dict, breakdown: dict) -> dict:
     return out
 
 
-def render(deal, listing, estimate, net, risk) -> tuple[str, dict]:
+def render(deal, listing, estimate, net, risk, root: Path | None = None) -> tuple[str, dict]:
     """(Markdown, JSON dict) for one deal. FX rate/date and screenshots come from `deal.evidence_json`
     (written by `build_evidence`); everything else from the objects passed in."""
     prev = _load(deal.evidence_json)
@@ -166,13 +167,13 @@ def render(deal, listing, estimate, net, risk) -> tuple[str, dict]:
     }
     if ev["buy_pln"] is None and net.lines_cons:
         ev["buy_pln"] = _q2(-net.lines_cons[0].pln)
-    data = card_data(deal, ev, json.loads(breakdown_json(net)))
+    data = card_data(deal, ev, json.loads(breakdown_json(net)), root)
     return _markdown(data), data
 
 
-def from_deal(deal) -> tuple[str, dict]:
+def from_deal(deal, root: Path | None = None) -> tuple[str, dict]:
     """Rebuild the card from stored evidence (no listing or estimate objects needed)."""
-    data = card_data(deal, _load(deal.evidence_json), _load(deal.breakdown_json))
+    data = card_data(deal, _load(deal.evidence_json), _load(deal.breakdown_json), root)
     return _markdown(data), data
 
 
@@ -184,14 +185,33 @@ def _load(text: str | None) -> dict:
         return {}
 
 
+def _esc(x) -> str:
+    """Untrusted (seller-authored) text into one Markdown line: whitespace collapsed, link/table syntax escaped."""
+    t = " ".join(str(x if x is not None else "").split())
+    return re.sub(r"([\\\[\]|<>`])", r"\\\1", t)
+
+
+def _rel(path, root: Path | None) -> str | None:
+    """Screenshot path as stored in the card: relative to the card root, never an absolute local path."""
+    if not path:
+        return None
+    p = Path(str(path))
+    if p.is_absolute():
+        try:
+            return p.relative_to(Path(root).resolve() if root else Path("/nonexistent")).as_posix()
+        except ValueError:
+            return p.name
+    return p.as_posix()
+
+
 def _link(label: str, url: str | None) -> str:
-    return f"[{label}]({url})" if url and str(url).startswith(("http://", "https://")) else (url or label)
+    return f"[{label}]({url})" if url and str(url).startswith(("http://", "https://")) else _esc(url or label)
 
 
 def _table(rows: list[dict]) -> list[str]:
     out = ["| line | PLN | note |", "|---|---:|---|"]
     for r in rows:
-        out.append(f"| {r['label']} | {r['pln']} | {r['note'] or ''} |")
+        out.append(f"| {_esc(r['label'])} | {r['pln']} | {_esc(r['note'])} |")
     return out
 
 
@@ -204,7 +224,7 @@ def _markdown(d: dict) -> str:
     lst = d["listing"]
     fx = d.get("fx") or {}
     shots = d["screenshots"] or {}
-    L = [f"---\n{head}\n---", f"# T{d['tier']}{star} {d['key'] or 'deal'}", "",
+    L = [f"---\n{head}\n---", f"# T{d['tier']}{star} {_esc(d['key'] or 'deal')}", "",
          "## Headline", "",
          f"- Buy: {d['buy_price']} {d['buy_currency']} ({d['buy_pln']} PLN)",
          f"- Exit P25: {d['exit_p25_pln']} PLN, median: {d['exit_median_pln']} PLN",
@@ -218,17 +238,17 @@ def _markdown(d: dict) -> str:
     L += _table(d["breakdown"]["exp"]) + [""]
     L += [f"FX: {fx.get('rate')} PLN per {fx.get('currency')} (NBP mid, {fx.get('date')})", "",
           "## Evidence", "",
-          f"- Listing: {_link(lst.get('title') or 'listing', lst.get('url'))}",
-          f"- Screenshot at discovery: {shots.get('discovery') or 'none'}",
-          f"- Screenshot at verification: {shots.get('verification') or 'none'}",
+          f"- Listing: {_link(_esc(lst.get('title') or 'listing'), lst.get('url'))}",
+          f"- Screenshot at discovery: {_esc(shots.get('discovery') or 'none')}",
+          f"- Screenshot at verification: {_esc(shots.get('verification') or 'none')}",
           f"- Retail ceiling: {d['retail_ceiling_pln']} PLN; 30-day trend: {d['trend_30d']}", "",
           "### Comparables", ""]
     L += [f"- {c['kind']} {c['price']} PLN on {(c['date'] or '')[:10]}: {_link('link', c['url'])}"
           for c in d["comps"]] or ["- none"]
     L += ["", "## Risk", "", f"- p_scam: {d['risk']['p_scam']}",
-          f"- Flags: {', '.join(d['risk']['flags']) or 'none'}", "", "## Why this tier", ""]
-    L += [f"- {r}" for r in d["reasons"]] or ["- n/a"]
-    L += ["", "## How to buy safely", ""] + [f"- [ ] {c}" for c in d["checklist"]]
+          f"- Flags: {_esc(', '.join(d['risk']['flags'])) or 'none'}", "", "## Why this tier", ""]
+    L += [f"- {_esc(r)}" for r in d["reasons"]] or ["- n/a"]
+    L += ["", "## How to buy safely", ""] + [f"- [ ] {_esc(c)}" for c in d["checklist"]]
     L += ["", "## Outcome", "",
           "Edit the `outcome:` block in the front matter (status: bought, skipped or sold; price_pln; date; note).", ""]
     return "\n".join(L)
@@ -238,7 +258,7 @@ def write(deal, root: Path, rendered: tuple[str, dict] | None = None) -> Path:
     """Write `<root>/deals/YYYY-MM-DD/<slug>-<deal_id>.md` and `.json`; returns the .md path.
     Rebuilds the card from the stored Deal when `rendered` is not given. An existing card's
     `outcome:` block is kept (a rewrite after verification must not erase a mark)."""
-    md, data = rendered or from_deal(deal)
+    md, data = rendered or from_deal(deal, root)
     day = deal.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
     folder = Path(root) / "deals" / day
     folder.mkdir(parents=True, exist_ok=True)

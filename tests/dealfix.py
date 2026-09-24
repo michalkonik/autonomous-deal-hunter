@@ -15,7 +15,7 @@ NOW = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
 
 def listing(source="kleinanzeigen", sid="1", seller="s1", price="2000", url="https://www.kleinanzeigen.de/s-anzeige/x/1"):
     return Listing(source=source, source_id=sid, url=url, title="RTX 4090 Gaming", description="d",
-                   price=Decimal(price), currency="PLN", country="PL", city="Krakow", lat=None, lon=None,
+                   price=Decimal(price), currency="PLN", country="PL", city=f"City{sid}", lat=None, lon=None,
                    seller_hash=seller, seller_age_days=400, seller_ratings=50, seller_score=4.9, ships=True,
                    pickup_only=False, is_business=False, photos=[], posted_at=None, seen_at=NOW)
 

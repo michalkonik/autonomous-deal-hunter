@@ -6,12 +6,15 @@ weights:                      # weight of one comparable in the weighted quantil
   probably_sold: 0.5          # clears-at ledger (dh/ledger.py)
   active_ask: 0.3
   ask_history: 0.2            # seeded history (dh/seed.py)
-fallback_factor: 0.7          # weight multiplier when an exit channel has no recent comps of its own
+fallback:                     # weight multipliers when an exit channel has no recent comps of its own
+  pl_pool: 0.7                # PL exit channel -> all PL comps (note "fallback_pl")
+  eu_pool_for_pl: 0.5         # PL exit channel, no PL comps either -> all EU comps incl. PL (note "fallback_eu")
+  eu_pool_for_eu: 0.7         # EU exit channel -> all EU comps incl. PL (note "fallback_eu")
 ceiling_factor: 0.95          # estimate capped at lowest new-retail price × this
 recent_days: 30               # comps counted for confidence and used for the quantiles
-lookback_days: 90             # older comps (30..60 d) feed only the trend
+lookback_days: 90             # how far back comps are read; the trend uses min(lookback, 2 × recent) days
 active_ask_max_age_days: 3    # a tracked listing still counts as a live ask if seen this recently
-fx_max_back_days: 10          # cached NBP rate may be up to this many days older than the comp
+fx_max_back_days: 4           # cached NBP rate may be up to this many days older than the comp ("fx_stale")
 
 # Comparable channel and market (country) of each source. A per-adapter `channel:` key in sources.yaml
 # (adapters.<source>.channel) overrides the channel name.

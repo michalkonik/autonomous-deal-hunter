@@ -8,6 +8,7 @@ import secrets
 import smtplib
 import string
 import subprocess
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from email.message import EmailMessage
@@ -50,6 +51,12 @@ def title(deal: Any, source: str | None = None, city: str | None = None) -> str:
     t = f"T1{star} +${net} {_clean(deal.key) or 'deal'}"
     where = _clean(where)
     return f"{t} · {where}" if where else t
+
+
+def _safe_url(url: str) -> str:
+    """ASCII-only, header-safe URL: non-ASCII, spaces and control characters are percent-encoded; the comma
+    too, since it separates fields inside an ntfy Actions header."""
+    return quote(url or "", safe=":/?&=#%@+~!$()*[]")
 
 
 def _clean(x: str | None) -> str:
@@ -153,11 +160,18 @@ async def push_tier1(deal, card_url: str, *, store=None, cfg=None, root: Path | 
     except Exception as e:
         _health(store, "config_error", repr(e))
         return False
-    ttl = title(deal, source, city)
+    try:
+        ttl = title(deal, source, city)
+        body = f"{ttl}\nConservative net ${Decimal(deal.cons_net_usd):.0f}, confidence {deal.confidence}"
+    except Exception as e:  # a bad deal field must not lose the push: fall back to a plain title
+        _health(store, "title_error", repr(e))
+        ttl = _clean(f"T{getattr(deal, 'tier', '?')} deal {getattr(deal, 'id', '?')}")
+        body = ttl
+    click, card = _safe_url(listing_url or card_url), _safe_url(card_url)
     payload = {
-        "headers": {"Title": ttl, "Priority": prio, "Tags": "moneybag", "Click": listing_url or card_url,
-                    "Actions": f"view, Card, {card_url}"},
-        "body": f"{ttl}\nConservative net ${Decimal(deal.cons_net_usd):.0f}, confidence {deal.confidence}",
+        "headers": {"Title": ttl, "Priority": prio, "Tags": "moneybag", "Click": click,
+                    "Actions": f"view, Card, {card}"},
+        "body": body,
     }
     err = await _deliver(payload, store, cfg, root, client, smtp_send, secret_fn)
     if err is None:

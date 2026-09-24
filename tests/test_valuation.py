@@ -1,6 +1,8 @@
 """Valuation: weighted exit-price distributions per key, condition and channel."""
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -44,6 +46,27 @@ def extract_all(store, condition="used"):
         store.save_extraction(r["id"], Extraction(key=KEY, category="gpu", certainty=0.95, condition=condition))
 
 
+class FakeFx:
+    """Rates per (currency, day): proves conversion happens at the comp date, not today."""
+
+    def __init__(self, rates: dict):
+        self.rates = {k: Decimal(v) for k, v in rates.items()}
+        self.calls: list = []
+
+    async def rate(self, ccy, day):
+        self.calls.append((ccy, day))
+        return self.rates[(ccy, day)]
+
+    async def rate_with_date(self, ccy, day):
+        return await self.rate(ccy, day), day
+
+
+def put_rate(store, day, ccy, rate, effective=None):
+    store.conn.execute("insert or replace into fx (date, currency, rate_pln, effective_date) values (?,?,?,?)",
+                       (day.isoformat(), ccy, rate, (effective or day).isoformat()))
+    store.conn.commit()
+
+
 # ------------------------------------------------------------------ quantiles
 
 
@@ -72,7 +95,7 @@ def test_estimate_weights_by_kind(store):
     assert e is not None and e.channel == "allegro" and e.key == KEY and e.condition == "used"
     assert e.median_pln == Decimal("3000.00")  # 3 sales outweigh 3 asks
     assert Decimal("3000") < e.p75_pln < Decimal("3680")
-    assert e.n_effective == pytest.approx(3.9) and e.n_sold == 3
+    assert e.n_effective == pytest.approx(3.9) and e.n_sold == 3 and e.n_sold_effective == pytest.approx(3.0)
     assert e.newest_days == pytest.approx(1.0)
     assert {c.price_pln for c in e.comps if c.kind == "active_ask"} == {Decimal("3680.00")}
     assert {c.weight for c in e.comps if c.kind == "active_ask"} == {0.3}
@@ -115,8 +138,7 @@ def test_returns_none_when_no_comps(store):
     assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
     comp(store, "3000", condition="new")  # another condition
     assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
-    comp(store, "3000", channel="kleinanzeigen")  # an EU market cannot value a PL exit channel
-    assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
+    assert valuation.estimate(store, KEY, "used", "ebay_us", DAY) is None  # unknown market: own channel only
     comp(store, "3000", days=-2)  # in the future of `day`: ignored
     assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
 
@@ -157,10 +179,11 @@ def test_pl_fallback_pool_with_reduced_weight(store):
     comp(store, "3200", "probably_sold", channel="allegro_lokalnie")
     comp(store, "9000", channel="kleinanzeigen")  # EU: not in a PL channel's pool
     e = valuation.estimate(store, KEY, "used", "allegro", DAY)
-    assert "fallback" in e.notes
+    assert e.notes == ["fallback_pl"]
     assert sorted((c.channel, c.weight) for c in e.comps) == [("allegro_lokalnie", 0.35), ("olx", 0.7)]
     assert all(c.fallback for c in e.comps)
     assert e.n_effective == pytest.approx(1.05)
+    assert e.n_sold == 2 and e.n_sold_effective == pytest.approx(1.05)  # 0.5 × 0.7 + 1.0 × 0.7
 
 
 def test_eu_fallback_converts_at_comp_date(store):
@@ -174,12 +197,14 @@ def test_eu_fallback_converts_at_comp_date(store):
                        ((NOW - timedelta(days=2)).date().isoformat(), "EUR", "4.3000", "2026-10-27"))
     store.conn.commit()
     e = valuation.estimate(store, KEY, "used", "ebay_de", DAY)
-    assert e is not None and "fallback" in e.notes
+    assert e is not None and "fallback_eu" in e.notes
     # 1000 € × 4.30 × 0.92 = 3956.00, 1100 € → 4351.60; weight 0.3 × 0.7
     assert sorted(c.price_pln for c in e.comps) == [Decimal("3956.00"), Decimal("4351.60")]
     assert {c.weight for c in e.comps} == {0.21}
-    # the same EU asks never value a PL exit channel
-    assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
+    assert "fx_stale" in e.notes  # NBP effective date 10-27 is not the comp date 10-28
+    # a PL exit channel with no PL comps uses the EU pool at × 0.5
+    e_pl = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert "fallback_eu" in e_pl.notes and {c.weight for c in e_pl.comps} == {0.15}
 
 
 def test_missing_fx_rate_skips_comp_with_note(store):
@@ -190,7 +215,7 @@ def test_missing_fx_rate_skips_comp_with_note(store):
     comp(store, "4000", channel="kleinanzeigen")  # stored already in PLN
     e = valuation.estimate(store, KEY, "used", "ebay_de", DAY)  # no own comps: EU fallback pool
     assert [c.channel for c in e.comps] == ["kleinanzeigen"] and len(e.comps) == 1
-    assert "fx_missing:EUR" in e.notes and "fallback" in e.notes
+    assert "fx_missing:EUR" in e.notes and "fallback_eu" in e.notes
     # own-channel comps present: the EU pool is not used, so no FX note
     comp(store, "4100", channel="ebay_de")
     assert valuation.estimate(store, KEY, "used", "ebay_de", DAY).notes == []
@@ -239,7 +264,11 @@ def test_params_and_channels_from_repo_config():
     cfg = config.load(ROOT)
     p = valuation.Params.from_config(cfg)
     assert p.ask_to_sale_ratio == Decimal("0.92") and p.weights["probably_sold"] == 0.5
-    assert p.fallback_factor == 0.7 and p.ceiling_factor == Decimal("0.95")
+    assert (p.fallback_pl_pool, p.fallback_eu_pool_for_pl, p.fallback_eu_pool_for_eu) == (0.7, 0.5, 0.7)
+    assert p.ceiling_factor == Decimal("0.95") and p.fx_max_back_days == 4
+    assert ledger.comp_weights() == p.weights  # one source of truth for the weights
+    with pytest.raises(KeyError):
+        valuation.Params.from_config(config.Config({"valuation": {"weights": {}}}))
     ch = valuation.Channels.from_config(cfg)
     assert ch.channel_of("allegro_lokalnie") == "allegro_lokalnie" and ch.market_of("allegro_lokalnie") == "PL"
     assert ch.market_of("kleinanzeigen") == "DE" and ch.market_of("ebay_de") == "DE"
@@ -265,16 +294,26 @@ def test_comp_rows_are_ingested_in_pln(store):
             CompRow(key=KEY, condition="used", channel="ebay_pl", kind="active_ask", price=Decimal("4000"),
                     currency="PLN", at=ago(1), weight=0.3, ref="https://www.ebay.pl/itm/2")]
 
-    class FakeFx:
-        async def rate(self, ccy, day):
-            return {"EUR": Decimal("4.25")}[ccy]
-
-    import asyncio
-    n = asyncio.run(valuation.ingest_comps(store, rows, FakeFx()))
+    n = asyncio.run(valuation.ingest_comps(store, rows, FakeFx({("EUR", ago(1).date()): "4.25"})))
     assert n == 2
     got = sorted((r["channel"], r["price_pln"]) for r in store.comps(KEY))
     assert got == [("ebay_de", "4250.00"), ("ebay_pl", "4000.00")]
-    assert asyncio.run(valuation.ingest_comps(store, rows, FakeFx())) == 0  # idempotent by (kind, ref)
+
+
+def test_ingest_refreshes_active_asks_by_ref(store):
+    fx = FakeFx({("EUR", ago(3).date()): "4.20", ("EUR", ago(1).date()): "4.30"})
+    ask = CompRow(key=KEY, condition="used", channel="ebay_de", kind="active_ask", price=Decimal("1000"),
+                  currency="EUR", at=ago(3), weight=0.3, ref="https://www.ebay.de/itm/1")
+    sold = CompRow(key=KEY, condition="used", channel="ebay_de", kind="ebay_sold", price=Decimal("900"),
+                   currency="EUR", at=ago(3), weight=1.0, ref="https://www.ebay.de/itm/9")
+    assert asyncio.run(valuation.ingest_comps(store, [ask, sold], fx)) == 2
+    # a day later the ask is cut to 950 €: same ref, refreshed price and time, converted at the new date's rate
+    cut = dataclasses.replace(ask, price=Decimal("950"), at=ago(1))
+    assert asyncio.run(valuation.ingest_comps(store, [cut, sold], fx)) == 1  # the sale is not re-written
+    rows = {r["kind"]: r for r in store.comps(KEY)}
+    assert len(store.comps(KEY)) == 2
+    assert rows["active_ask"]["price_pln"] == "4085.00" and rows["active_ask"]["sold_at"] == ago(1).isoformat()
+    assert rows["ebay_sold"]["price_pln"] == "3780.00"  # 900 × 4.20 at its own date
 
 
 def test_unknown_condition_comps_count_as_used(store):
@@ -286,3 +325,77 @@ def test_unknown_condition_comps_count_as_used(store):
     assert len(valuation.estimate(store, KEY, "unknown", "allegro", DAY).comps) == 2
     assert len(valuation.estimate(store, KEY, "new", "allegro", DAY).comps) == 1
     assert len(valuation.estimate(store, KEY, None, "allegro", DAY).comps) == 3
+
+
+def _eur_listing(store, sid, price, seen):
+    src = "kleinanzeigen"
+    ledger.observe(store, src, [lst(sid, price, source=src, currency="EUR")], seen, arm=ledger.arm_id(src, "4090"))
+
+
+def test_fx_conversion_uses_each_comps_own_date(store):
+    d1, d2 = ago(2), ago(1)
+    _eur_listing(store, "k1", "1000", d1)
+    _eur_listing(store, "k2", "1000", d2)
+    extract_all(store)
+    put_rate(store, d1.date(), "EUR", "4.00")
+    put_rate(store, d2.date(), "EUR", "4.50")
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY)
+    by_ref = {c.ref.rsplit("/", 1)[1]: c.price_pln for c in e.comps}
+    assert by_ref == {"k1": Decimal("3680.00"), "k2": Decimal("4140.00")}  # × 0.92 ask discount
+    assert "fx_stale" not in e.notes and "fx_missing:EUR" not in e.notes
+
+
+def test_fx_rate_older_than_four_days_is_missing(store):
+    _eur_listing(store, "k1", "1000", ago(1))
+    extract_all(store)
+    put_rate(store, ago(6).date(), "EUR", "4.30")
+    assert valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY) is None
+    put_rate(store, ago(5).date(), "EUR", "4.30")  # comp date - 4 days: accepted, stale
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY)
+    assert e.notes == ["fx_stale"]
+
+
+def test_fallback_tier_is_decided_after_fx(store):
+    """The own channel has only an unconvertible EUR ask, so the EU pool is used, not an empty own pool."""
+    _eur_listing(store, "k1", "1000", ago(1))
+    extract_all(store)
+    comp(store, "4000", channel="olx")
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY)
+    assert e is not None and "fallback_eu" in e.notes and "fx_missing:EUR" in e.notes
+    assert [c.channel for c in e.comps] == ["olx"] and e.comps[0].weight == 0.7
+
+
+def test_pl_tiers_prefer_pl_pool_over_eu(store):
+    comp(store, "3000", channel="kleinanzeigen")
+    e = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert e.notes == ["fallback_eu"] and e.comps[0].weight == 0.5 and e.n_sold_effective == pytest.approx(0.5)
+    comp(store, "3500", channel="sprzedajemy")
+    e = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert e.notes == ["fallback_pl"] and [c.channel for c in e.comps] == ["sprzedajemy"]
+    comp(store, "3700", channel="allegro")
+    e = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert e.notes == [] and [c.channel for c in e.comps] == ["allegro"]
+
+
+def test_eu_exit_pool_includes_pl(store):
+    comp(store, "3000", channel="olx")
+    e = valuation.estimate(store, KEY, "used", "ebay_de", DAY)
+    assert e.notes == ["fallback_eu"] and e.comps[0].weight == 0.7
+
+
+def test_warm_fx_uses_callers_params(store):
+    _eur_listing(store, "k1", "1000", ago(5))
+    extract_all(store)
+    fx = FakeFx({("EUR", ago(5).date()): "4.30"})
+    assert asyncio.run(valuation.warm_fx(store, fx, KEY, "used", DAY)) == 0  # 5-day-old ask: not live by default
+    wide = dataclasses.replace(valuation.default_params(), active_ask_max_age_days=10)
+    assert asyncio.run(valuation.warm_fx(store, fx, KEY, "used", DAY, params=wide)) == 1
+    assert fx.calls == [("EUR", ago(5).date())]
+
+
+def test_trend_window_follows_lookback(store):
+    comp(store, "4000", days=50)
+    comp(store, "3600", days=2)
+    assert valuation.estimate(store, KEY, "used", "allegro", DAY).trend_30d == pytest.approx(-0.10)
+    short = dataclasses.replace(valuation.default_params(), lookback_days=45)
+    assert valuation.estimate(store, KEY, "used", "allegro", DAY, params=short).trend_30d is None

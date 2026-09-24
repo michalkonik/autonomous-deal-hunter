@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}Books{% endblock %}
+{% block body %}<h1>Books</h1>
+{% if books.empty %}<p class="mut">No data yet.</p>{% else %}
+<div class="card"><table>
+<tr><th>Running cost</th><td class="n">{{books.cost_total}} PLN</td></tr>
+<tr><th>Deals found</th><td class="n">{{books.deals}}</td></tr>
+<tr><th>Expected net, all deals</th><td class="n">{{books.exp}} PLN</td></tr>
+<tr><th>Conservative net, all deals</th><td class="n">{{books.cons}} PLN</td></tr>
+<tr><th>Marked bought (not yet sold)</th><td class="n">{{books.bought}}</td></tr>
+<tr><th>Sold (marks)</th><td class="n">{{books.sold_n}} for {{books.sold_pln}} PLN</td></tr></table></div>
+<h2>Cost by kind</h2>
+{% if kinds %}<div class="tbl"><table><tr><th>Kind</th><th class="n">Entries</th><th class="n">PLN</th><th class="n">Units</th></tr>
+{% for k in kinds %}<tr><td>{{k.kind}}</td><td class="n">{{k.n}}</td><td class="n">{{k.pln}}</td><td class="n">{{k.units}}</td></tr>{% endfor %}</table></div>{% else %}<p class="mut">No data yet.</p>{% endif %}
+{% endif %}{% endblock %}

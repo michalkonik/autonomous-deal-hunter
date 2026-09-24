@@ -41,7 +41,8 @@ def test_split_title_price():
 def test_import_bazos_fixture(store):
     fx = FakeFx()
     counts = asyncio.run(seed.import_bazos(store, FIX, fx))
-    assert counts == {"rows": 10, "imported": 4, "duplicate": 0, "no_price": 1, "no_key": 1, "excluded": 4}
+    assert counts == {"rows": 10, "imported": 4, "duplicate": 0, "no_price": 1, "below_floor": 0, "no_key": 1,
+                      "excluded": 4}
     rows = {r["key"]: r for r in store.conn.execute("select * from comps").fetchall()}
     assert set(rows) == {"gpu:rtx-3080:10", "gpu:rtx-4090:24", "ram:ddr5:32:2x16", "ssd:nvme:2tb"}
     r = rows["gpu:rtx-3080:10"]
@@ -76,3 +77,14 @@ def test_dataset_url_reachable(tmp_path):
     """Live (rig): the PC section downloads within the 200 MB cap."""
     path = asyncio.run(seed.download(seed.BAZOS_PC_URL, tmp_path / "pc.zip"))
     assert zipfile.is_zipfile(path)
+
+
+def test_placeholder_prices_are_skipped(store, tmp_path):
+    p = tmp_path / "cheap.csv"
+    rows = [("RTX 3080 10GB - 1", "1"), ("RTX 3080 10GB - 49", "2"), ("RTX 3080 10GB - 100", "3"),
+            ("RTX 3080 10GB - 150", "4")]
+    p.write_text("".join(f'"{t}","","https://pc.bazos.cz/inzerat/{i}/x.php","Mon, 01 Jul 2024 10:00:00 +0200","pc"\n'
+                         for t, i in rows))
+    counts = asyncio.run(seed.import_bazos(store, p, FakeFx()))  # 0.17 PLN/CZK
+    # 1 and 49 CZK are under the 50 CZK floor; 100 CZK = 17.00 PLN is under the 20 PLN floor; 150 CZK = 25.50 PLN
+    assert counts["below_floor"] == 3 and counts["imported"] == 1

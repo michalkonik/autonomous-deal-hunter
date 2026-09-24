@@ -157,3 +157,41 @@ def test_slow_email_does_not_block_loop(tmp_path):
         return ok, ticks
     ok, ticks = asyncio.run(main())
     assert ok and ticks >= 10
+
+
+def test_title_failure_falls_back_and_still_pushes(tmp_path):
+    cfg, st = setup(tmp_path)
+    bad = deal()
+    bad.cons_net_usd = "not a number"  # title() raises; the push must still go out with a plain title
+    seen = {}
+
+    def h(req):
+        seen["h"], seen["body"] = req.headers, req.content.decode()
+        return httpx.Response(200)
+    c = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    ok = asyncio.run(notify.push_tier1(bad, "https://card", store=st, cfg=cfg, root=tmp_path, client=c))
+    assert ok and seen["h"]["title"] == "T1 deal 1" and seen["body"] == "T1 deal 1"
+    assert st.conn.execute("select count(*) from health where kind='title_error'").fetchone()[0] == 1
+    # and with ntfy down it is queued, not lost
+    down = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    ok = asyncio.run(notify.push_tier1(bad, "https://card", store=st, cfg=cfg, root=tmp_path, client=down,
+                                       secret_fn=lambda ref: None))
+    assert ok is False and st.conn.execute("select count(*) from pending_pushes").fetchone()[0] == 1
+
+
+def test_click_and_actions_urls_are_ascii_and_encoded(tmp_path):
+    cfg, st = setup(tmp_path)
+    seen = {}
+
+    def h(req):
+        seen["h"] = req.headers
+        return httpx.Response(200)
+    c = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    listing = "https://www.olx.pl/d/oferta/karta-grafiki-żółw-ID1.html?a=1&b=x y\r\nX-Evil: 1"
+    card = "https://log.example/deals/kót,1.md?a=1;b='2'&c=\"3\""
+    ok = asyncio.run(notify.push_tier1(deal(), card, store=st, cfg=cfg, root=tmp_path, listing_url=listing, client=c))
+    assert ok
+    click, actions = seen["h"]["click"], seen["h"]["actions"]
+    assert click.isascii() and actions.isascii() and "\n" not in click + actions and "\r" not in click + actions
+    assert click.startswith("https://www.olx.pl/d/oferta/karta-grafiki-%C5%BC%C3%B3%C5%82w-ID1.html?a=1&b=x%20y")
+    assert actions == "view, Card, https://log.example/deals/k%C3%B3t%2C1.md?a=1%3Bb=%272%27&c=%223%22"  # , ; ' " would split/quote the action
