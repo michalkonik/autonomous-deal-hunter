@@ -8,18 +8,26 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
+import logging
 import os
 import re
 import secrets
+import unicodedata
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import Callable
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 from ..models import Listing
 from ..money import parse_price
+from ..risk import PHONE_RE
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parents[2]
 SALT_REL = Path("config/local/secret_salt")
@@ -51,9 +59,17 @@ def get_salt(root: Path | None = None) -> bytes:
         else:
             p.parent.mkdir(parents=True, exist_ok=True)
             salt = secrets.token_hex(32).encode()
-            fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            tmp = p.with_name(f".{p.name}.{os.getpid()}.{secrets.token_hex(4)}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(salt.decode() + "\n")
+            try:
+                os.link(tmp, p)  # atomic create-if-absent: a concurrent first use cannot overwrite the salt
+            except FileExistsError:
+                pass
+            finally:
+                os.unlink(tmp)
+            salt = p.read_text().strip().encode()
         _salt_cache[p] = salt
     return _salt_cache[p]
 
@@ -109,15 +125,87 @@ def relative_day(word: str, hh: int, mm: int, tz: str, today_words: tuple[str, .
     return d.replace(hour=hh, minute=mm, second=0, microsecond=0).astimezone(timezone.utc)
 
 
-def in_range(price: Decimal, ccy: str, q: Query) -> bool:
-    """PLN bounds only apply to PLN listings (no FX here); other currencies pass through."""
-    if ccy != "PLN":
-        return True
-    if q.min_price_pln is not None and price < q.min_price_pln:
-        return False
-    if q.max_price_pln is not None and price > q.max_price_pln:
-        return False
-    return True
+_warned_ccy: set[str] = set()
+
+
+def filter_query(listings: list[Listing], q: Query, to_pln: Callable[[Decimal, str], Decimal | None] | None = None,
+                 *, text: bool = False) -> list[Listing]:
+    """The single place where a Query narrows adapter results.
+
+    Price bounds are in PLN. `to_pln(amount, ccy)` is a sync converter backed by cached NBP rates; PLN listings
+    need none. If a non-PLN listing cannot be converted (no converter or no cached rate) it is KEPT and the gap is
+    logged once per currency. `text=True` additionally requires every query word in title/description (for
+    category-only sources whose search form robots.txt forbids).
+    """
+    out = []
+    bounded = q.min_price_pln is not None or q.max_price_pln is not None
+    for l in listings:
+        if text and not matches_query(l, q):
+            continue
+        if bounded:
+            pln = l.price if l.currency == "PLN" else (to_pln(l.price, l.currency) if to_pln else None)
+            if pln is None:
+                if l.currency not in _warned_ccy:
+                    _warned_ccy.add(l.currency)
+                    log.warning("no PLN rate for %s: price bounds not applied to %s listings", l.currency, l.currency)
+            elif (q.min_price_pln is not None and pln < q.min_price_pln) or \
+                    (q.max_price_pln is not None and pln > q.max_price_pln):
+                continue
+        out.append(l)
+    return out
+
+
+def product_ld(html: str) -> dict:
+    """First schema.org Product JSON-LD object on a page ({} if none)."""
+    for m in re.finditer(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            d = json.loads(m.group(1))
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("@type") == "Product":
+            return d
+    return {}
+
+
+def _fold(text: str) -> str:
+    """Length-preserving lowercase/accent fold so risk's phone regex (written for normalised text) fits."""
+    out = []
+    for c in text:
+        b = "".join(x for x in unicodedata.normalize("NFKD", c.lower().replace("ł", "l")) if not unicodedata.combining(x))
+        out.append(b if len(b) == 1 else c)
+    return "".join(out)
+
+
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_TEL_LINK = re.compile(r"\btel:\S+", re.I)
+REDACTED = "[redacted]"
+
+
+def redact(text: str | None) -> tuple[str, bool]:
+    """Replace phone numbers (risk._PHONE), e-mail addresses and tel: links by "[redacted]".
+
+    Returns (clean text, whether anything was redacted). Callers record the boolean in `Listing.contact_in_text`
+    because risk's off-platform detection can no longer see the number once it is gone.
+    """
+    if not text:
+        return text or "", False
+    spans = [m.span() for m in PHONE_RE.finditer(_fold(text))]
+    spans += [m.span() for rx in (_EMAIL, _TEL_LINK) for m in rx.finditer(text)]
+    if not spans:
+        return text, False
+    spans.sort()
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    out, pos = [], 0
+    for a, b in merged:
+        out += [text[pos:a], REDACTED]
+        pos = b
+    out.append(text[pos:])
+    return "".join(out), True
 
 
 # Product kinds, used by adapters that can only browse category pages (robots.txt forbids their search).
@@ -156,7 +244,7 @@ def abs_url(base: str, href: str) -> str:
     return base.rstrip("/") + "/" + href.lstrip("/")
 
 
-class Adapter(ABC):
+class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
     name: str = ""
     domain: str = ""
     country: str = ""
@@ -165,18 +253,33 @@ class Adapter(ABC):
     gone_markers: tuple[str, ...] = ()
     #: the listing id must still appear in the final URL (sites that redirect dead ads elsewhere)
     id_in_final_url: bool = False
+    #: the final URL path must equal the listing URL path (ids that are not part of the URL)
+    path_must_match: bool = False
+    #: robots.txt forbids the site's search: only category pages are read and filtered by query words
+    category_only: bool = False
+    #: optional sync (amount, ccy) -> PLN|None backed by cached NBP rates; used by filter_query
+    to_pln: Callable[[Decimal, str], Decimal | None] | None = None
 
-    @abstractmethod
-    async def search(self, query: Query, fetcher) -> list[Listing]: ...
+    # ---- to implement
+    # HTML adapters implement page_urls/parse_page/_parse_detail and inherit search/parse_detail/alive.
+    # API/RSS adapters (eBay, RSS, retail) override search/parse_detail themselves.
+    def page_urls(self, q: Query) -> list[str]:
+        """URLs to fetch for a search (one for real search sites, several category pages otherwise)."""
+        raise NotImplementedError
 
-    @abstractmethod
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def parse_page(self, text: str) -> list[Listing]:
+        """Pure: search/category page body -> listings with price > 0 (unfiltered)."""
+        raise NotImplementedError
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         """Pure: fill description/photos/seller fields from a detail page body."""
+        raise NotImplementedError
 
     def detail_price(self, html: str) -> Decimal | None:
         """Pure: current price on a detail page, or None when it can't be read."""
         return None
 
+    # ---- shared behaviour
     async def _get(self, fetcher, url: str, kind: str = "html"):
         res = await fetcher.get(url, kind=kind)
         if res.blocked:
@@ -184,6 +287,31 @@ class Adapter(ABC):
         if res.disallowed:
             raise AdapterError(f"{self.name}: robots.txt disallows {url}")
         return res
+
+    async def search(self, query: Query, fetcher, to_pln=None) -> list[Listing]:
+        urls = self.page_urls(query)
+        found: dict[str, Listing] = {}
+        failed, last = 0, 0
+        for url in urls:
+            res = await self._get(fetcher, url)
+            if res.status != 200:
+                failed, last = failed + 1, res.status
+                continue
+            for l in self.parse_page(res.text):
+                found.setdefault(l.source_id, l)
+        if failed == len(urls):
+            raise AdapterError(f"{self.name}: search status {last}")
+        return filter_query(list(found.values()), query, to_pln or self.to_pln, text=self.category_only)
+
+    def parse_detail(self, listing: Listing, html: str) -> Listing:
+        return self.finish(self._parse_detail(listing, html))
+
+    def finish(self, l: Listing) -> Listing:
+        """Redact contact data from free text before it is stored; remember that we did."""
+        l.title, t = redact(l.title)
+        l.description, d = redact(l.description)
+        l.contact_in_text = l.contact_in_text or t or d
+        return l
 
     async def detail(self, listing: Listing, fetcher) -> Listing:
         res = await self._get(fetcher, listing.url)
@@ -199,18 +327,33 @@ class Adapter(ABC):
         low = res.text.lower()
         if any(m in low for m in self.gone_markers):
             return True
-        return self.id_in_final_url and listing.source_id not in res.url
+        if self.id_in_final_url and listing.source_id not in res.url:
+            return True
+        if self.path_must_match and urlsplit(res.url).path != urlsplit(listing.url).path:
+            return True
+        return False
 
     def gone_on_transport_failure(self, res) -> bool:
         return False
 
     async def alive(self, listing: Listing, fetcher) -> tuple[bool, Decimal | None]:
+        """Is the ad still on sale, and at what price?
+
+        Contract (the verifier relies on it):
+        - (False, None): the ad is gone (404/410, a known "gone" marker, or redirected away from its URL).
+        - (True, price): the page loaded and the CURRENT price was read. Only this means "confirmed live".
+        - AdapterError: blocked, disallowed by robots.txt, transport/5xx failure, or the page loaded with no gone
+          marker but no readable price ("unverifiable"). The verifier must treat that as NOT confirmed.
+        """
         res = await self._get(fetcher, listing.url)
         if self.is_gone_response(listing, res):
             return False, None
         if res.status != 200:
             raise AdapterError(f"{self.name}: alive check status {res.status} for {listing.url}")
-        return True, self.detail_price(res.text)
+        price = self.detail_price(res.text)
+        if price is None:
+            raise AdapterError(f"{self.name}: unverifiable (no readable price) for {listing.url}")
+        return True, price
 
     def make(self, **kw) -> Listing:
         base = dict(source=self.name, country=self.country, currency=self.currency, description="", city=None,
@@ -218,4 +361,4 @@ class Adapter(ABC):
                     seller_score=None, ships=None, pickup_only=False, is_business=None, photos=[],
                     posted_at=None, seen_at=now_utc())
         base.update(kw)
-        return Listing(**base)
+        return self.finish(Listing(**base))

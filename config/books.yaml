@@ -1,0 +1,4 @@
+# Books (dh/books.py): energy cost per round = (mean GPU power from rocm-smi + base_w) x hours x tariff.
+tariff_pln_kwh: 1.10     # owner's electricity tariff, PLN per kWh (gross)
+base_w: 120              # CPU, RAM, disks, PSU losses: fixed estimate added to the measured GPU power
+gpu_sample_s: 15         # rocm-smi sampling interval during a round

@@ -15,8 +15,7 @@ from decimal import Decimal
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import (Adapter, AdapterError, Query, abs_url, age_days, in_range, kinds_for, local_dt, matches_query,
-                   norm, price_of, seller_hash)
+from .base import Adapter, Query, abs_url, age_days, kinds_for, local_dt, norm, price_of, product_ld, seller_hash
 
 BASE = "https://sprzedajemy.pl"
 CARD = "article.element"
@@ -39,6 +38,7 @@ class Sprzedajemy(Adapter):
     gone_markers = ("ogłoszenie nieaktualne", "ogłoszenie zakończone", "ogłoszenie wygasło",
                     "ogłoszenie zostało usunięte", "oferta nieaktualna")
     id_in_final_url = True
+    category_only = True
 
     pages = 2
     PAGE = 30
@@ -57,24 +57,12 @@ class Sprzedajemy(Adapter):
         paths = [self.CATEGORIES[k] for k in kinds_for(q) if k in self.CATEGORIES] or [self.ELEKTRONIKA]
         return [f"{BASE}{p}" + (f"?offset={self.PAGE * i}" if i else "") for p in paths for i in range(self.pages)]
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        out: dict[str, Listing] = {}
-        urls = self.page_urls(query)
-        failed = 0
-        for url in urls:
-            res = await self._get(fetcher, url)
-            if res.status != 200:
-                failed += 1
-                continue
-            for l in parse_search(res.text, query):
-                out.setdefault(l.source_id, l)
-        if failed == len(urls):
-            raise AdapterError(f"{self.name}: every category page failed")
-        return list(out.values())
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text)
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         tree = LexborHTMLParser(html)
-        ld = _product_ld(html)
+        ld = product_ld(html)
         d = tree.css_first(".offerDescription")
         desc = norm(d.text(separator="\n")) if d is not None else norm(ld.get("description"))
         extra = []
@@ -89,9 +77,10 @@ class Sprzedajemy(Adapter):
             imgs = [imgs]
         if imgs:
             listing.photos = imgs
-        name = tree.css_first(".userInfo .name")
-        if name is not None:
-            listing.seller_hash = seller_hash(self.name, name.attributes.get("title") or name.text(strip=True))
+        # stable numeric seller id from the profile link; never hash a display name (changeable, personal data)
+        uid = re.search(r"/oferty-uzytkownika-(\d+)", html)
+        if uid:
+            listing.seller_hash = seller_hash(self.name, uid.group(1))
         m = re.search(r"Na Sprzedajemy\.pl od (\w{3})\w*\s+(\d{4})", html)
         if m and m.group(1).lower() in MONTHS:
             listing.seller_age_days = age_days(datetime(int(m.group(2)), MONTHS[m.group(1).lower()], 1))
@@ -101,30 +90,19 @@ class Sprzedajemy(Adapter):
         return listing
 
     def detail_price(self, html: str) -> Decimal | None:
-        ld = _product_ld(html)
+        ld = product_ld(html)
+        # main ad only: JSON-LD, else the offer's own price box (other ".price" nodes belong to similar ads)
         pr = price_of(str((ld.get("offers") or {}).get("price") or ""), "PLN")
-        if pr:
-            return pr[0]
-        n = LexborHTMLParser(html).css_first(".price")
-        pr = price_of(n.text() if n is not None else "", "PLN")
+        if pr is None:
+            n = LexborHTMLParser(html).css_first(".offer-price-box .price")
+            pr = price_of(n.text() if n is not None else "", "PLN")
         return pr[0] if pr else None
-
-
-def _product_ld(html: str) -> dict:
-    for m in re.finditer(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
-        try:
-            d = json.loads(m.group(1))
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("@type") == "Product":
-            return d
-    return {}
 
 
 ADAPTER = Sprzedajemy()
 
 
-def parse_search(html: str, q: Query | None = None) -> list[Listing]:
+def parse_search(html: str) -> list[Listing]:
     tree = LexborHTMLParser(html)
     out: list[Listing] = []
     for card in tree.css(CARD):
@@ -154,6 +132,5 @@ def parse_search(html: str, q: Query | None = None) -> list[Listing]:
                          is_business=("prywatn" not in st.text().lower()) if st is not None else None,
                          photos=[img.attributes["src"]] if img is not None and img.attributes.get("src") else [],
                          posted_at=posted)
-        if q is None or (in_range(l.price, l.currency, q) and matches_query(l, q)):
-            out.append(l)
+        out.append(l)
     return out

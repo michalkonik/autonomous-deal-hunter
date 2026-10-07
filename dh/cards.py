@@ -12,6 +12,7 @@ Storage contract (a card can be rebuilt from the Deal alone, which `dh verify` r
 from __future__ import annotations
 
 import json
+import os
 import re
 import unicodedata
 from datetime import date, datetime, timezone
@@ -273,8 +274,8 @@ def write(deal, root: Path, rendered: tuple[str, dict] | None = None) -> Path:
                 data = {**data, "outcome": old}
         except (OSError, yaml.YAMLError):
             pass
-    p.write_text(md)
-    p.with_suffix(".json").write_text(json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
+    _atomic_write(p, md)
+    _atomic_write(p.with_suffix(".json"), json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n")
     return p
 
 
@@ -283,3 +284,27 @@ def _swap_outcome(md: str, outcome: dict) -> str:
     fm = yaml.safe_load(m.group(1))
     fm["outcome"] = outcome
     return "---\n" + yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).rstrip() + "\n---\n" + m.group(2)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def set_outcome(path_md: Path, outcome: dict) -> None:
+    """Set the `outcome:` block of an existing card (.md front matter and the sibling .json).
+    Each file is replaced atomically (temp file + os.replace), so a crash never leaves a half-written card."""
+    path_md = Path(path_md)
+    js = path_md.with_suffix(".json")
+    new_md = _swap_outcome(path_md.read_text(), outcome)
+    new_js = None
+    try:
+        data = json.loads(js.read_text())
+        if isinstance(data, dict):
+            new_js = json.dumps({**data, "outcome": outcome}, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+    except (OSError, ValueError):
+        pass
+    _atomic_write(path_md, new_md)
+    if new_js is not None:
+        _atomic_write(js, new_js)

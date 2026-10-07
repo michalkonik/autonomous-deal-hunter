@@ -1,0 +1,1 @@
+pepper.xml / hotukdeals.xml: trimmed from live captures of /rss/hot on 2026-10-29 (item bodies shortened). Items marked SYNTHETIC are hand-written in the same shape (a GPU deal, a bait item mentioning RTX 4090 in a monitor deal, a "Gratis" item with no price).

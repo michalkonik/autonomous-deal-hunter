@@ -5,6 +5,7 @@ Used for live smoke tests. Writes nothing to the real DB: it uses a throw-away s
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -58,17 +59,27 @@ async def probe(source: str, query: str, limit: int = 15, detail: bool = False, 
             print("  reason: " + ("; ".join(hl) if hl else "the source returned no matching ads"), file=out)
             return 0
         first = listings[0]
+        rc = 0
         if detail:
-            d = await ad.detail(first, fetcher)
-            print(f"  detail: desc={len(d.description)} chars, photos={len(d.photos)}, seller_hash="
-                  f"{(d.seller_hash or '-')[:12]}, age_days={d.seller_age_days}, ships={d.ships}, city={d.city}",
-                  file=out)
+            try:
+                d = await ad.detail(first, fetcher)
+                print(f"  detail: desc={len(d.description)} chars, photos={len(d.photos)}, seller_hash="
+                      f"{(d.seller_hash or '-')[:12]}, age_days={d.seller_age_days}, ships={d.ships}, city={d.city},"
+                      f" contact_redacted={d.contact_in_text}", file=out)
+            except AdapterError as e:
+                print(f"  detail: failed: {e}", file=out)
+                rc = 1
         if alive:
-            print(f"  alive({first.source_id}): {await ad.alive(first, fetcher)}", file=out)
-        return 0
+            try:
+                print(f"  alive({first.source_id}): {await ad.alive(first, fetcher)}", file=out)
+            except AdapterError as e:
+                print(f"  alive({first.source_id}): not confirmed: {e}", file=out)
+                rc = 1
+        return rc
     finally:
         await fetcher.aclose()
         store.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def run(args) -> int:

@@ -48,6 +48,7 @@ class FetchResult:
     raw_path: Path | None = None
     blocked: bool = False
     disallowed: bool = False
+    content: bytes = b""  # raw body, filled only by `get_bytes`
 
 
 def is_challenge(status: int, text: str) -> bool:
@@ -393,9 +394,22 @@ class Fetcher:
     async def get(self, url: str, *, kind: Literal["html", "json"], headers: dict | None = None) -> FetchResult:
         h = dict(headers or {})
         h.setdefault("Accept", "application/json" if kind == "json" else "text/html,application/xhtml+xml")
+        return await self._follow(url, h, binary=False)
+
+    async def get_bytes(self, url: str, *, headers: dict | None = None, max_bytes: int = 5_000_000) -> FetchResult:
+        """Same etiquette as `get` (robots.txt, pacing, block backoff, redirects) for a binary body (a photo).
+        `content` holds the body (empty when it is larger than `max_bytes`); nothing is written to the snapshot dir."""
+        h = dict(headers or {})
+        h.setdefault("Accept", "image/*")
+        res = await self._follow(url, h, binary=True)
+        if len(res.content) > max_bytes:
+            res.content = b""
+        return res
+
+    async def _follow(self, url: str, h: dict, *, binary: bool) -> FetchResult:
         cur = url
         for _ in range(MAX_REDIRECTS + 1):
-            res, nxt = await self._get_hop(cur, h)
+            res, nxt = await self._get_hop(cur, h, binary)
             if nxt is None:
                 return res
             if urlsplit(nxt).netloc.lower() != urlsplit(cur).netloc.lower():
@@ -405,7 +419,7 @@ class Fetcher:
         self._health(host, "redirect_loop", f"more than {MAX_REDIRECTS} redirects from {url}")
         return FetchResult(0, "", cur)
 
-    async def _get_hop(self, url: str, headers: dict) -> tuple[FetchResult, str | None]:
+    async def _get_hop(self, url: str, headers: dict, binary: bool = False) -> tuple[FetchResult, str | None]:
         try:
             parts = urlsplit(url)
             domain = parts.netloc.lower()
@@ -436,6 +450,8 @@ class Fetcher:
         loc = r.headers.get("location")
         if 300 <= r.status_code < 400 and loc:
             return FetchResult(r.status_code, "", url), urljoin(url, loc)
+        if binary:
+            return FetchResult(r.status_code, "", url, content=r.content if r.status_code == 200 else b""), None
         text = r.text
         path = None
         if r.status_code < 400 or (r.status_code < 500 and r.status_code != 404):

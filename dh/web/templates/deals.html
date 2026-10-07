@@ -14,4 +14,7 @@
 <td><a href="/deal/{{r.d.id}}">{{r.d.key or "deal"}}</a><div class="mut">{{r.l["title"] if r.l else ""}}</div></td>
 <td>{{r.l["source"] if r.l else ""}}</td><td>{{(r.l["country"] if r.l else "") or ""}}</td>
 <td class="n">{{r.cons_usd}}</td><td class="n">{{r.exp_usd}}</td><td>{{r.d.confidence}}</td><td>{{r.mark or ""}}</td></tr>{% endfor %}
-</table></div>{% endif %}{% endblock %}
+</table></div>
+<p class="mut">{{total}} deals &middot; page {{page_no}} of {{pages}}
+{% if page_no > 1 %}<a href="/?page={{page_no-1}}{{qs}}">prev</a>{% endif %}
+{% if page_no < pages %}<a href="/?page={{page_no+1}}{{qs}}">next</a>{% endif %}</p>{% endif %}{% endblock %}

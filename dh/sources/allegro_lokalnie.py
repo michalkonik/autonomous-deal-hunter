@@ -10,7 +10,7 @@ from urllib.parse import quote
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import (Adapter, AdapterError, Query, abs_url, in_range, norm, price_of, seller_hash, years_to_days)
+from .base import Adapter, Query, abs_url, norm, price_of, seller_hash, years_to_days
 
 BASE = "https://allegrolokalnie.pl"
 # selectors (search page)
@@ -30,6 +30,7 @@ DESC = ".mlc-offer__description"
 PARAM_ROW = "tr[data-mlc-param]"
 GALLERY_IMG = ".mlc-offer__gallery img"
 DELIVERY_ROW = ".mlc-delivery-options__row"
+DELIVERY_SECTION = "[data-mlc-delivery-location], .mlc-delivery-location"
 PRICE_META = "meta[itemprop=price]"
 SELLER_ATTR = "data-mlc-seller-details"
 OFFER_ID_RE = re.compile(r"/oferta/([^/?#]+)")
@@ -44,7 +45,7 @@ def _is_business(badge_text: str) -> bool | None:
     return None
 
 
-def parse_search(html: str, q: Query | None = None, now=None) -> list[Listing]:
+def parse_search(html: str) -> list[Listing]:
     tree = LexborHTMLParser(html)
     out: list[Listing] = []
     ad = ADAPTER.make
@@ -55,7 +56,7 @@ def parse_search(html: str, q: Query | None = None, now=None) -> list[Listing]:
             continue
         href = a.attributes.get("href") or ""
         m = OFFER_ID_RE.search(href)
-        uid = a.attributes.get("data-card-analytics-click") or (m.group(1) if m else None)
+        uid = m.group(1) if m else None  # URL slug: stable and present in the final URL of a live ad
         if not uid:
             continue
         pi = card.css_first(CARD_PRICE_INT)
@@ -81,8 +82,7 @@ def parse_search(html: str, q: Query | None = None, now=None) -> list[Listing]:
         # auctions ("Licytacja") show the current bid, not a price a buyer can pay
         if typ is not None and "licyt" in typ.text().lower():
             continue
-        if q is None or in_range(l.price, l.currency, q):
-            out.append(l)
+        out.append(l)
     return out
 
 
@@ -94,16 +94,15 @@ class AllegroLokalnie(Adapter):
     gone_markers = ("oferta jest już nieaktywna", "oferta nieaktualna", "ogłoszenie nieaktualne",
                     "oferta zakończona", "oferta została zakończona")
 
-    def search_url(self, q: Query) -> str:
-        return f"{BASE}/oferty/q/{quote(q.text, safe='')}?sort=startingTime-desc"
+    id_in_final_url = True
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        res = await self._get(fetcher, self.search_url(query))
-        if res.status != 200:
-            raise AdapterError(f"{self.name}: search status {res.status}")
-        return parse_search(res.text, query)
+    def page_urls(self, q: Query) -> list[str]:
+        return [f"{BASE}/oferty/q/{quote(q.text, safe='')}?sort=startingTime-desc"]
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text)
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         tree = LexborHTMLParser(html)
         parts = []
         d = tree.css_first(DESC)
@@ -143,8 +142,10 @@ class AllegroLokalnie(Adapter):
             if loc.get("city"):
                 listing.city = loc["city"]
         rows = tree.css(DELIVERY_ROW)
-        listing.ships = bool(rows)
-        listing.pickup_only = not rows
+        if rows:
+            listing.ships, listing.pickup_only = True, False
+        elif tree.css_first(DELIVERY_SECTION) is not None:  # delivery block parsed and lists no option
+            listing.ships, listing.pickup_only = False, True
         return listing
 
     def detail_price(self, html: str) -> Decimal | None:

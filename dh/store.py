@@ -17,6 +17,7 @@ create table if not exists listings (
   seller_hash text, seller_age_days integer, seller_ratings integer, seller_score real,
   ships integer, pickup_only integer, is_business integer, photos text,
   posted_at text, first_seen_at text, last_seen_at text, raw_path text,
+  contact_in_text integer not null default 0,
   unique (source, source_id)
 );
 create table if not exists observations (
@@ -96,6 +97,8 @@ class Store:
         self.conn.execute("pragma journal_mode=wal")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        if "contact_in_text" not in {r["name"] for r in self.conn.execute("pragma table_info(listings)")}:
+            self.ensure_table("alter table listings add column contact_in_text integer not null default 0")
 
     def ensure_table(self, sql: str) -> None:
         self.conn.execute(sql)
@@ -110,8 +113,8 @@ class Store:
         self.conn.execute(
             """insert into listings (source, source_id, url, title, description, price, currency, country,
               city, lat, lon, seller_hash, seller_age_days, seller_ratings, seller_score, ships, pickup_only,
-              is_business, photos, posted_at, first_seen_at, last_seen_at, raw_path)
-              values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              is_business, photos, posted_at, first_seen_at, last_seen_at, raw_path, contact_in_text)
+              values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
               on conflict(source, source_id) do update set
               url=excluded.url, title=excluded.title, description=excluded.description, price=excluded.price,
               currency=excluded.currency, country=excluded.country, city=excluded.city, lat=excluded.lat,
@@ -120,12 +123,13 @@ class Store:
               pickup_only=excluded.pickup_only, is_business=excluded.is_business, photos=excluded.photos,
               posted_at=coalesce(excluded.posted_at, posted_at),
               last_seen_at=max(coalesce(last_seen_at,''), excluded.last_seen_at),
-              raw_path=coalesce(excluded.raw_path, raw_path)""",
+              raw_path=coalesce(excluded.raw_path, raw_path),
+              contact_in_text=max(contact_in_text, excluded.contact_in_text)""",
             (l.source, l.source_id, l.url, l.title, l.description, str(l.price), l.currency, l.country, l.city,
              l.lat, l.lon, l.seller_hash, l.seller_age_days, l.seller_ratings, l.seller_score,
              None if l.ships is None else int(l.ships), int(l.pickup_only),
              None if l.is_business is None else int(l.is_business), json.dumps(l.photos),
-             _iso(l.posted_at), seen, seen, l.raw_path),
+             _iso(l.posted_at), seen, seen, l.raw_path, int(bool(l.contact_in_text))),
         )
         self.conn.commit()
         return self.conn.execute("select id from listings where source=? and source_id=?",

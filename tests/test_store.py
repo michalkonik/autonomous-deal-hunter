@@ -152,3 +152,33 @@ def test_older_seen_at_does_not_move_last_seen_back(store):
     store.upsert_listing(mk_listing(seen_at=T0))
     row = store.conn.execute("select last_seen_at from listings where id=?", (lid,)).fetchone()
     assert row["last_seen_at"] == (T0 + timedelta(minutes=30)).isoformat()
+
+
+def test_contact_in_text_roundtrip_and_sticky(store):
+    lid = store.upsert_listing(mk_listing(contact_in_text=True))
+    row = lambda: store.conn.execute("select contact_in_text from listings where id=?", (lid,)).fetchone()[0]  # noqa: E731
+    assert row() == 1
+    store.upsert_listing(mk_listing(contact_in_text=False, seen_at=T0 + timedelta(minutes=5)))
+    assert row() == 1  # once true it stays true
+    other = store.upsert_listing(mk_listing(source_id="clean"))
+    assert store.conn.execute("select contact_in_text from listings where id=?", (other,)).fetchone()[0] == 0
+    from dh.verify import load_listing
+    assert load_listing(store, lid).contact_in_text is True and load_listing(store, other).contact_in_text is False
+
+
+def test_contact_in_text_column_added_to_existing_db(tmp_path):
+    import sqlite3
+    from dh.store import Store
+    db = tmp_path / "old.db"
+    c = sqlite3.connect(db)
+    c.execute("create table listings (id integer primary key, source text not null, source_id text not null, unique(source, source_id))")
+    c.commit(); c.close()
+    s = Store(db)
+    assert "contact_in_text" in {r["name"] for r in s.conn.execute("pragma table_info(listings)")}
+    s.close()
+    Store(db).close()  # second open: guarded, no error
+
+
+def test_risk_phone_re_public_alias():
+    from dh import risk
+    assert risk.PHONE_RE is risk._PHONE

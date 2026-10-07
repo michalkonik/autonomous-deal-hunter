@@ -14,8 +14,7 @@ from decimal import Decimal
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import (Adapter, AdapterError, Query, abs_url, in_range, kinds_for, local_dt, matches_query, norm,
-                   price_of, seller_hash)
+from .base import Adapter, Query, abs_url, kinds_for, local_dt, norm, price_of, seller_hash
 
 CARD = "div.inzeraty"
 ID_RE = re.compile(r"/(?:inzerat|anzeige)/(\d+)/")
@@ -60,21 +59,13 @@ class Bazos(Adapter):
                 urls.append(f"https://{self.domain}/{sec}/" + (f"{20 * p}/" if p else ""))
         return urls
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        out: dict[str, Listing] = {}
-        errors = 0
-        for url in self.page_urls(query):
-            res = await self._get(fetcher, url)
-            if res.status != 200:
-                errors += 1
-                continue
-            for l in parse_search(res.text, self, query):
-                out.setdefault(l.source_id, l)
-        if errors and not out and errors == len(self.page_urls(query)):
-            raise AdapterError(f"{self.name}: every category page failed")
-        return list(out.values())
+    id_in_final_url = True
+    category_only = True
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text, self)
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         tree = LexborHTMLParser(html)
         d = tree.css_first(".popisdetail")
         if d is not None:
@@ -106,7 +97,7 @@ class Bazos(Adapter):
         return pr[0] if pr else None
 
 
-def parse_search(html: str, adapter: Bazos, q: Query | None = None) -> list[Listing]:
+def parse_search(html: str, adapter: Bazos) -> list[Listing]:
     tree = LexborHTMLParser(html)
     out: list[Listing] = []
     for card in tree.css(CARD):
@@ -139,6 +130,5 @@ def parse_search(html: str, adapter: Bazos, q: Query | None = None) -> list[List
                          city=city, seller_hash=seller_hash(adapter.name, rm.group(1)) if rm else None,
                          photos=[img.attributes["src"]] if img is not None and img.attributes.get("src") else [],
                          posted_at=posted)
-        if (q is None or (in_range(l.price, l.currency, q) and matches_query(l, q))):
-            out.append(l)
+        out.append(l)
     return out

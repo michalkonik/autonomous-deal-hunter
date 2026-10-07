@@ -8,24 +8,37 @@ from .base import Adapter, AdapterError, Query, ROOT
 __all__ = ["Adapter", "AdapterError", "Query", "registry", "ADAPTER_NAMES", "DROPPED"]
 
 # Sources evaluated and dropped because robots.txt forbids polite access (see task-8-report.md).
-DROPPED = {"sbazar": "robots.txt: `User-agent: *  Disallow: /` (only Googlebot-style agents are allowed)"}
+DROPPED = {"sbazar": "robots.txt: `User-agent: *  Disallow: /` (only Googlebot-style agents are allowed)",
+           "willhaben": "robots.txt header: \"expressively forbidden to use spiders, search robots or other automatic "
+                        "methods\" without willhaben.at's permission; keyword search and paging are Disallowed too",
+           "olx_ro": "OLX (ro, bg, pt) blocks polite polling like olx.pl: dropped, same mailbox-only rule",
+           "olx_bg": "see olx_ro", "olx_pt": "see olx_ro"}
 
 
-def _build() -> dict[str, Adapter]:
+def _build(conf: dict | None = None) -> dict[str, Adapter]:
     from .allegro_lokalnie import AllegroLokalnie
     from .bazos import Bazos
     from .hardverapro import Hardverapro
     from .kleinanzeigen import Kleinanzeigen
+    from .ebay import EbayBrowse
+    from .mailbox import Mailbox
     from .marktplaats import Marktplaats
+    from .retail import RetailWatch
+    from .rss import RssAdapter
     from .sprzedajemy import Sprzedajemy
 
     adapters: list[Adapter] = [AllegroLokalnie(), Sprzedajemy(), Kleinanzeigen(), Hardverapro(), Marktplaats(),
-                               Bazos("cz"), Bazos("sk"), Bazos("at")]
+                               Bazos("cz"), Bazos("sk"), Bazos("at"),
+                               EbayBrowse("EBAY_DE"), EbayBrowse("EBAY_PL"),
+                               RssAdapter("pepper_pl", "https://www.pepper.pl/rss/hot", "PL", "PLN"),
+                               RssAdapter("hotukdeals", "https://www.hotukdeals.com/rss/hot", "GB", "GBP"),
+                               Mailbox(),
+                               RetailWatch((conf or {}).get("watch"), float((conf or {}).get("drop_pct", 0.10)))]
     return {a.name: a for a in adapters}
 
 
 ADAPTER_NAMES = ["allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats",
-                 "bazos_cz", "bazos_sk", "bazos_at"]
+                 "bazos_cz", "bazos_sk", "bazos_at", "ebay_de", "ebay_pl", "pepper_pl", "hotukdeals", "mailbox", "retail"]
 
 
 def registry(cfg=None, root: Path | None = None) -> dict[str, Adapter]:
@@ -38,8 +51,17 @@ def registry(cfg=None, root: Path | None = None) -> dict[str, Adapter]:
     except (AttributeError, KeyError):
         conf = {}
     out = {}
-    for name, ad in _build().items():
-        entry = conf.get(name) or conf.get(name.split("_")[0]) if name.startswith("bazos") else conf.get(name)
+    try:
+        retail_conf = cfg.sources.retail.to_dict()
+    except (AttributeError, KeyError):
+        retail_conf = {}
+    for name, ad in _build(retail_conf).items():
+        if name.startswith("bazos"):
+            entry = conf.get(name) or conf.get(name.split("_")[0])
+        elif name.startswith("ebay_"):
+            entry = conf.get(name) or conf.get("ebay")
+        else:
+            entry = conf.get(name)
         if isinstance(entry, dict) and entry.get("enabled") is False:
             continue
         if isinstance(entry, dict) and name.startswith("bazos") and "pages" in entry:

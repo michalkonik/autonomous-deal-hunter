@@ -5,19 +5,25 @@ from decimal import Decimal
 import pytest
 from starlette.testclient import TestClient
 
-from dealfix import NOW, make_deal
-from dh import config, publish
+import asyncio
+from dataclasses import replace
+
+from dealfix import NOW, make_deal, net_inputs
+from test_economics import FakeCustoms, FakeFx, load_cfg_data
+from dh import cards, config, economics, publish
 from dh.store import Store
 from dh.web.app import create_app
 
 
-def build(tmp_path):
-    (tmp_path / "config").mkdir(exist_ok=True)
-    (tmp_path / "config" / "publish.yaml").write_text("cards_dir: var/cards/deals\n")
-    cfg = config.load(tmp_path)
+def build(tmp_path, hosts=("testserver",)):
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    data["web"] = {"allowed_hosts": list(hosts)}
+    cfg = config.Config(data)
     db = tmp_path / "t.db"
     st = Store(db)
-    return st, TestClient(create_app(db, cfg, tmp_path)), cfg
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    return st, TestClient(app, raise_server_exceptions=False), cfg
 
 
 def post(c, deal_id, **data):
@@ -138,3 +144,175 @@ def test_pages_with_data(tmp_path):
     assert "http_403" in h and "<b>x</b>" not in h
     p = c.get("/playbook").text
     assert "v2" in p and "-b" in p and "+c" in p
+
+
+def test_books_realised_net_from_sold_deals(tmp_path):
+    st, c, cfg = build(tmp_path)
+    d, res, _ = make_deal(st)
+    d2, _, _ = make_deal(st, sid="2", seller="s2", key="OPEN-ONE")
+    assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
+    inp = replace(net_inputs(), exit_price_cons_pln=Decimal("3000"), exit_price_exp_pln=Decimal("3000"))
+    want = asyncio.run(economics.net(inp, cfg, FakeFx(), FakeCustoms())).cons_net_pln
+    assert want != res.cons_net_pln
+    t = c.get("/books").text
+    assert f"{want:.2f} PLN" in t and "Realised net" in t and "Forecast: expected net" in t
+    assert f"<td class=\"n\">{want:.2f}</td>" in t and "OPEN-ONE" not in t
+    usd = FakeFx()
+    assert f"{asyncio.run(usd.pln_to_usd(want, NOW.date())):.2f} USD" in t
+
+
+def test_books_realised_row_survives_bad_evidence(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    post(c, d.id, status="sold", price_pln="3000")
+    st.conn.execute("update deals set evidence_json='{}'")
+    st.conn.commit()
+    r = c.get("/books")
+    assert r.status_code == 200 and "not computable" in r.text
+
+
+def test_card_write_failure_keeps_mark(tmp_path, monkeypatch):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(cards, "set_outcome", boom)
+    assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
+    row = st.conn.execute("select outcome from mark_imports where deal_id=?", (d.id,)).fetchone()
+    assert json.loads(row["outcome"])["status"] == "sold"  # the publisher writes this into the log copy
+    assert st.conn.execute("select count(*) from health where kind='card_write_failed'").fetchone()[0] == 1
+
+
+def test_add_mark_failure_changes_nothing(tmp_path, monkeypatch):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    cards.write(d, tmp_path / "var/cards")
+    md = next((tmp_path / "var/cards/deals").glob("*/*.md"))
+    before = md.read_text()
+
+    def boom(self, *a, **k):
+        raise RuntimeError("db locked")
+    monkeypatch.setattr(Store, "add_mark", boom)
+    assert post(c, d.id, status="bought").status_code == 500
+    assert md.read_text() == before
+    assert st.conn.execute("select count(*) from mark_imports").fetchone()[0] == 0
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 0
+
+
+def test_set_outcome_is_atomic_and_public(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    p = cards.write(d, tmp_path)
+    o = {"status": "bought", "price_pln": None, "date": "2026-10-29", "note": "n"}
+    cards.set_outcome(p, o)
+    assert publish.parse_outcome(p.read_text())["status"] == "bought"
+    assert json.loads(p.with_suffix(".json").read_text())["outcome"] == o
+    assert not list(tmp_path.glob("deals/*/*.tmp"))
+    cards.write(d, tmp_path)  # rewrite keeps it
+    assert publish.parse_outcome(p.read_text())["status"] == "bought"
+
+
+@pytest.mark.parametrize("price", ["1e10", "1E3", "1234567890", "12.345", "0", "0.00", "-5", "NaN", "Infinity",
+                                   "", "abc", "1 000", "0x10", ".5"])
+def test_bad_sold_prices_rejected(tmp_path, price):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    r = post(c, d.id, status="sold", price_pln=price)
+    assert r.status_code == 400 and "Not saved" in r.text
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 0
+
+
+def test_good_prices_and_bought_with_price(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    assert post(c, d.id, status="sold", price_pln="2 900".replace(" ", "")).status_code == 303
+    assert post(c, d.id, status="sold", price_pln="2900,5").status_code == 303
+    assert post(c, d.id, status="bought", price_pln="1999.99").status_code == 303
+    assert post(c, d.id, status="bought", price_pln="1e9").status_code == 400
+    prices = [r[0] for r in st.conn.execute("select price_pln from marks order by id")]
+    assert prices == ["2900", "2900.5", "1999.99"]
+
+
+def test_validation_error_rerenders_card(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    r = post(c, d.id, status="sold", price_pln="x")
+    assert r.status_code == 400 and "Conservative net" in r.text and "price must" in r.text
+
+
+def test_referer_fallback_null_origin_and_host_allowlist(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    url = f"/deal/{d.id}/mark"
+    ok = c.post(url, data={"status": "bought"}, headers={"Referer": "http://testserver/deal/1"}, follow_redirects=False)
+    assert ok.status_code == 303
+    assert c.post(url, data={"status": "bought"}, headers={"Referer": "http://evil/x"}).status_code == 403
+    assert c.post(url, data={"status": "bought"}, headers={"Origin": "null"}).status_code == 403
+    assert c.post(url, data={"status": "bought"}, headers={"Origin": ""}).status_code == 403
+    # same-origin but Host not on the allowlist (DNS rebinding style)
+    st2, c2, _ = build(tmp_path, hosts=("rig.lan", "192.168.1.5"))
+    r = c2.post(url, data={"status": "bought"}, headers={"Origin": "http://testserver"})
+    assert r.status_code == 403
+    r = c2.post(url, data={"status": "bought"}, headers={"Origin": "http://rig.lan:8711", "Host": "rig.lan:8711"},
+                follow_redirects=False)
+    assert r.status_code == 303
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 2
+
+
+def test_default_allowed_hosts_include_localhost():
+    from dh.web.app import default_allowed_hosts
+    h = default_allowed_hosts()
+    assert "localhost" in h and "127.0.0.1" in h
+
+
+def test_pagination(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    st.conn.executemany(
+        "insert into deals select null, listing_ref, key || ?, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
+        " from deals where id=?", [(f"-{i:03d}", d.id) for i in range(104)])
+    st.conn.commit()
+    p1, p2 = c.get("/").text, c.get("/?page=2").text
+    assert p1.count('href="/deal/') == 100 and "page 1 of 2" in p1 and "next" in p1
+    assert p2.count('href="/deal/') == 5 and "page 2 of 2" in p2 and "prev" in p2
+    assert c.get("/?page=3").status_code == 200
+    for q in ("page=0", "page=x", "page=-1"):
+        assert c.get("/?" + q).status_code == 400
+
+
+def test_books_realised_net_margin_scheme_hand_computed(tmp_path):
+    """Private PL seller, no VAT invoice, PLN, allegro exit: margin scheme. Sold at 3000, hand computation:
+    fees 8% x 3000 + 1 = 241.00; VAT due 23/123 x (3000 - 2000) = 186.99; input VAT on services
+    23/123 x (241 + 25) = 45.07 + 4.67 = 49.74; returns reserve 5% x 3000 = 150; risk haircut 0.02 x 2000 = 40;
+    pre-tax = 3000 - 241 - 2000 - 20 - 186.99 + 49.74 - 25 - 150 - 40 = 386.75; tax 23.9% = 92.43;
+    realised net = 294.32 PLN."""
+    st, c, _ = build(tmp_path)
+    d, _, lst = make_deal(st)
+    assert lst.is_business is False and not json.loads(d.evidence_json)["net_inputs"]["has_vat_invoice"]
+    post(c, d.id, status="sold", price_pln="3000")
+    t = c.get("/books").text
+    assert 'class="n">294.32</td>' in t and "294.32 PLN" in t
+
+
+def test_existing_card_only_touched_via_set_outcome(tmp_path, monkeypatch):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    cards.write(d, tmp_path / "var/cards")
+    calls = []
+    monkeypatch.setattr(cards, "write", lambda *a, **k: calls.append(a) or (_ for _ in ()).throw(AssertionError))
+    assert post(c, d.id, status="bought").status_code == 303 and not calls
+
+
+def test_pagination_links_urlencoded(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    st.conn.executemany(
+        "insert into deals select null, listing_ref, key, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
+        " from deals where id=?", [(d.id,)] * 101)
+    st.conn.commit()
+    t = c.get("/?source=kleinanzeigen&since=2026-01-01").text
+    assert 'href="/?page=2&amp;source=kleinanzeigen&amp;since=2026-01-01"' in t

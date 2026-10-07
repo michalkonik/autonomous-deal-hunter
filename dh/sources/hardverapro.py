@@ -10,8 +10,7 @@ from urllib.parse import quote_plus
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import (Adapter, AdapterError, Query, abs_url, in_range, local_dt, norm, price_of, relative_day,
-                   seller_hash, years_to_days)
+from .base import Adapter, Query, abs_url, local_dt, norm, price_of, relative_day, seller_hash, years_to_days
 
 BASE = "https://hardverapro.hu"
 CARD = "li.media[data-uadid]"
@@ -47,16 +46,18 @@ class Hardverapro(Adapter):
     gone_markers = ("a hirdetés nem elérhető", "a hirdetés lejárt", "a hirdetés törölve", "törölt hirdetés",
                     "a keresett hirdetés nem található")
 
+    path_must_match = True  # the numeric ad id is not part of the URL; compare paths instead
+
     def search_url(self, q: Query) -> str:
         return f"{BASE}/aprok/keres.php?stext={quote_plus(q.text)}&buying=0"
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        res = await self._get(fetcher, self.search_url(query))
-        if res.status != 200:
-            raise AdapterError(f"{self.name}: search status {res.status}")
-        return parse_search(res.text, query)
+    def page_urls(self, q: Query) -> list[str]:
+        return [self.search_url(q)]
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text)
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         tree = LexborHTMLParser(html)
         parts = []
         d = tree.css_first(".rtif-content.uad-content")
@@ -101,7 +102,7 @@ class Hardverapro(Adapter):
 ADAPTER = Hardverapro()
 
 
-def parse_search(html: str, q: Query | None = None) -> list[Listing]:
+def parse_search(html: str) -> list[Listing]:
     tree = LexborHTMLParser(html)
     out: list[Listing] = []
     for li in tree.css(CARD):
@@ -132,6 +133,5 @@ def parse_search(html: str, q: Query | None = None) -> list[Listing]:
                          seller_ratings=ratings, is_business=True if "uad-business-user" in cls else None,
                          photos=[abs_url("https://hardverapro.hu", src)] if src else [],
                          posted_at=_posted(tm.text()) if tm is not None else None)
-        if q is None or in_range(l.price, l.currency, q):
-            out.append(l)
+        out.append(l)
     return out

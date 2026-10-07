@@ -24,10 +24,13 @@ _ROOT = Path(__file__).resolve().parent.parent
 # A phone number needs phone-like formatting: a +CC / 00CC prefix, spaced or dashed 3-3-3 groups, or a bare
 # 9-digit run right after a "tel"/"telefon"/"zadzwon"/"kontakt"/"call" cue. A bare digit run (serial, part
 # number) does not match.
-_PHONE = re.compile(
+PHONE_RE = re.compile(
     r"(?<![\w.,])(?:\+|00)\d{1,3}[\s.-]?\d(?:[\s.-]?\d){7,11}(?!\d)"                 # +48 600123456, +49 170 1234567
     r"|(?<![\w.,])\d{3}[\s.-]\d{3}[\s.-]\d{3}(?![\d])"                              # 600 123 456, 600-123-456
-    r"|\b(?:tel|telefon|tel\.|zadzwon|dzwon|kom|komorka|kontakt|call|anruf\w*|handy)\W{0,12}\d{9}(?!\d)", re.I)
+    r"|\b(?:tel|telefon\w*|zadzwon|dzwon|kom|komorka|kontakt|call|anruf\w*|handy|mobil\w*|rufnummer|volejte|"
+    r"hivj\w*|elerhetoseg\w*|phone)\W{0,12}(?:\d{9}(?!\d)"                       # tel 600123456
+    r"|0\d(?:[\s./-]?\d){8,10}(?![\d]))", re.I)                                   # Handy 0176 1234 5678, tel 06 30 123 4567
+_PHONE = PHONE_RE  # backwards-compatible alias
 _WHATSAPP = re.compile(r"\bwh?ats?\s?-?app\b|\bwhatsap\b|\bwa\.me\b", re.I)
 _TELEGRAM = re.compile(r"\btelegram\b|\bt\.me/", re.I)
 _URL = re.compile(r"https?://|\bwww\.", re.I)
@@ -151,6 +154,8 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
     if (extraction.for_parts or extraction.condition == "for_parts") and not cfg.rules.repair.enabled:
         hard.append("for_parts")
     hard += _offplatform(ntext)  # normalised: lowercase, no diacritics
+    if getattr(listing, "contact_in_text", False) and "offplatform_phone" not in hard:
+        hard.append("offplatform_phone")  # the adapter redacted the contact before storage
     if _TRANSFER.search(ntext) and new_account:
         hard.append("transfer_new_account")
     flags += hard

@@ -1,0 +1,229 @@
+{
+ "href": "https://api.ebay.com/buy/browse/v1/item_summary/search?q=rtx+4090&limit=50",
+ "total": 6,
+ "next": null,
+ "limit": 50,
+ "offset": 0,
+ "itemSummaries": [
+  {
+   "itemId": "v1|314159265358|0",
+   "title": "NVIDIA GeForce RTX 4090 24GB Founders Edition Grafikkarte",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "1549.00",
+    "currency": "EUR"
+   },
+   "condition": "USED",
+   "conditionId": "3000",
+   "seller": {
+    "username": "private_seller_1",
+    "feedbackPercentage": "99.2",
+    "feedbackScore": 412,
+    "sellerAccountType": "INDIVIDUAL"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265358",
+   "itemLocation": {
+    "city": "Berlin",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "FIXED_PRICE"
+   ],
+   "shippingOptions": [
+    {
+     "shippingCostType": "FIXED",
+     "shippingCost": {
+      "value": "9.99",
+      "currency": "EUR"
+     }
+    }
+   ],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  },
+  {
+   "itemId": "v1|314159265359|0",
+   "title": "MSI GeForce RTX 4090 Gaming X Trio 24GB neu OVP",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "1899.00",
+    "currency": "EUR"
+   },
+   "condition": "NEW",
+   "conditionId": "1000",
+   "seller": {
+    "username": "shop_tech_de",
+    "feedbackPercentage": "99.8",
+    "feedbackScore": 18230,
+    "sellerAccountType": "BUSINESS"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265359",
+   "itemLocation": {
+    "city": "Hamburg",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "FIXED_PRICE"
+   ],
+   "shippingOptions": [
+    {
+     "shippingCostType": "FIXED",
+     "shippingCost": {
+      "value": "9.99",
+      "currency": "EUR"
+     }
+    }
+   ],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  },
+  {
+   "itemId": "v1|314159265360|0",
+   "title": "Verpackung leer RTX 4090 Karton nur OVP",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "25.00",
+    "currency": "EUR"
+   },
+   "condition": "USED",
+   "conditionId": "3000",
+   "seller": {
+    "username": "box_seller",
+    "feedbackPercentage": "100.0",
+    "feedbackScore": 12,
+    "sellerAccountType": "INDIVIDUAL"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265360",
+   "itemLocation": {
+    "city": "Köln",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "FIXED_PRICE"
+   ],
+   "shippingOptions": [
+    {
+     "shippingCostType": "FIXED",
+     "shippingCost": {
+      "value": "9.99",
+      "currency": "EUR"
+     }
+    }
+   ],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  },
+  {
+   "itemId": "v1|314159265361|0",
+   "title": "ASUS RTX 4090 TUF 24GB defekt Bastler",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "600.00",
+    "currency": "EUR"
+   },
+   "condition": "FOR_PARTS_OR_NOT_WORKING",
+   "conditionId": "7000",
+   "seller": {
+    "username": "bastler77",
+    "feedbackPercentage": "97.0",
+    "feedbackScore": 55,
+    "sellerAccountType": "INDIVIDUAL"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265361",
+   "itemLocation": {
+    "city": "München",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "FIXED_PRICE"
+   ],
+   "shippingOptions": [
+    {
+     "shippingCostType": "FIXED",
+     "shippingCost": {
+      "value": "9.99",
+      "currency": "EUR"
+     }
+    }
+   ],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  },
+  {
+   "itemId": "v1|314159265362|0",
+   "title": "Gigabyte RTX 4090 Gaming OC 24GB - Auktion",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "1200.00",
+    "currency": "EUR"
+   },
+   "condition": "USED",
+   "conditionId": "3000",
+   "seller": {
+    "username": "auctioneer",
+    "feedbackPercentage": "98.0",
+    "feedbackScore": 300,
+    "sellerAccountType": "INDIVIDUAL"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265362",
+   "itemLocation": {
+    "city": "Dresden",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "AUCTION"
+   ],
+   "shippingOptions": [],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  },
+  {
+   "itemId": "v1|314159265363|0",
+   "title": "Zotac RTX 4090 Trinity 24GB",
+   "image": {
+    "imageUrl": "https://i.ebayimg.com/images/g/314159265/s-l225.jpg"
+   },
+   "price": {
+    "value": "0",
+    "currency": "EUR"
+   },
+   "condition": "USED",
+   "conditionId": "3000",
+   "seller": {
+    "username": "free_seller",
+    "feedbackPercentage": "98.0",
+    "feedbackScore": 300,
+    "sellerAccountType": "INDIVIDUAL"
+   },
+   "itemWebUrl": "https://www.ebay.de/itm/314159265363",
+   "itemLocation": {
+    "city": "Bonn",
+    "country": "DE",
+    "postalCode": "10***"
+   },
+   "buyingOptions": [
+    "FIXED_PRICE"
+   ],
+   "shippingOptions": [
+    {
+     "shippingCostType": "FIXED",
+     "shippingCost": {
+      "value": "9.99",
+      "currency": "EUR"
+     }
+    }
+   ],
+   "itemCreationDate": "2026-10-27T08:15:00.000Z"
+  }
+ ]
+}

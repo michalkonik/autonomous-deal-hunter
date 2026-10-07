@@ -1,0 +1,22 @@
+From: eBay <ebay@ebay.de>
+To: dh@example.invalid
+Subject: Neue Artikel für Ihre gespeicherte Suche: rtx 4090
+Date: Thu, 29 Oct 2026 08:15:00 +0100
+Message-ID: <ebay-1@ebay.de>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="BND"
+
+--BND
+Content-Type: text/plain; charset=utf-8
+
+Neue Artikel. Siehe HTML.
+--BND
+Content-Type: text/html; charset=utf-8
+
+<html><body>
+<div><a href="https://www.ebay.de/itm/305123456789?hash=item&amp;mkevt=1">Gigabyte GeForce RTX 4090 Windforce 24GB</a>
+<div>EUR 1.389,00</div><div>Sofort-Kaufen</div></div>
+<div><a href="https://www.ebay.de/itm/305123456790?hash=item">MSI RTX 4090 Gaming X Trio 24G</a>
+<div>EUR 1.450,50</div></div>
+</body></html>
+--BND--

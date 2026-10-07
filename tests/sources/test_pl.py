@@ -8,9 +8,11 @@ from decimal import Decimal
 import pytest
 
 from dh.sources import AdapterError, Query
+from dh.sources.base import filter_query
 from dh.sources import allegro_lokalnie as al
 from dh.sources import sprzedajemy as sp
 
+from dh.sources.base import seller_hash as base_hash
 from helpers import FakeFetcher, Res, check_listings, fixture_text, sub_first
 
 run = asyncio.run
@@ -70,7 +72,7 @@ def test_allegro_lokalnie_pln_price_bounds():
     html = fixture_text("allegro_lokalnie", "search.html")
     prices = sorted(l.price for l in al.parse_search(html))
     lo, hi = prices[len(prices) // 4], prices[3 * len(prices) // 4]
-    ls = al.parse_search(html, Query("x", min_price_pln=lo, max_price_pln=hi))
+    ls = filter_query(al.parse_search(html), Query("x", min_price_pln=lo, max_price_pln=hi))
     assert ls and len(ls) < len(prices) and all(lo <= l.price <= hi for l in ls)
 
 
@@ -111,9 +113,10 @@ def test_sprzedajemy_local_query_filter():
     html = fixture_text("sprzedajemy", "search.html")
     allq = sp.parse_search(html)
     word = re.findall(r"[A-Za-z]{4,}", allq[0].title)[0].lower()
-    some = sp.parse_search(html, Query(word))
+    some = filter_query(allq, Query(word), text=True)
     assert some and len(some) <= len(allq) and all(word in l.title.lower() for l in some)
-    assert sp.parse_search(html, Query("zzzz-no-such-product-qq")) == []
+    assert filter_query(allq, Query("zzzz-no-such-product-qq"), text=True) == []
+    assert sp.ADAPTER.category_only
 
 
 def test_sprzedajemy_detail_fixture():
@@ -147,3 +150,50 @@ def test_sprzedajemy_alive():
     redirected = Res(200, "<html>lista</html>", "https://sprzedajemy.pl/elektronika")
     assert run(ad.alive(l, FakeFetcher(default=redirected))) == (False, None)
     assert run(ad.alive(l, FakeFetcher(default=Res(200, "<html>Ogłoszenie nieaktualne</html>", l.url)))) == (False, None)
+
+
+def test_allegro_lokalnie_source_id_is_url_slug_and_alive_checks_it():
+    ad = al.ADAPTER
+    l = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[0]
+    assert l.url.endswith("/oferta/" + l.source_id)
+    moved = Res(200, fixture_text("allegro_lokalnie", "detail.html"), "https://allegrolokalnie.pl/oferty/q/x")
+    assert run(ad.alive(l, FakeFetcher(default=moved))) == (False, None)
+
+
+def test_allegro_lokalnie_pickup_only_only_when_delivery_block_was_parsed():
+    ad = al.ADAPTER
+    base = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))
+    l = base[0]
+    none = ad.parse_detail(base[1], "<html><body><div class='mlc-offer__description'>x</div></body></html>")
+    assert none.ships is None and none.pickup_only is False  # page not understood: no claim
+    pick = ad.parse_detail(base[2], "<html><body><section data-mlc-delivery-location>Dostawa</section></body></html>")
+    assert pick.ships is False and pick.pickup_only is True
+    ship = ad.parse_detail(l, fixture_text("allegro_lokalnie", "detail.html"))
+    assert ship.ships is True and ship.pickup_only is False
+
+
+def test_sprzedajemy_seller_is_stable_id_never_display_name():
+    ad = sp.ADAPTER
+    html = fixture_text("sprzedajemy", "detail.html")
+    l = sp.parse_search(fixture_text("sprzedajemy", "search.html"))[0]
+    d = ad.parse_detail(l, html)
+    assert d.seller_hash == base_hash("sprzedajemy", re.search(r"/oferty-uzytkownika-(\d+)", html).group(1))
+    no_id = re.sub(r"/oferty-uzytkownika-\d+", "/x", html)
+    l2 = sp.parse_search(fixture_text("sprzedajemy", "search.html"))[1]
+    assert ad.parse_detail(l2, no_id).seller_hash is None
+
+
+def test_sprzedajemy_detail_price_only_from_main_ad_block():
+    ad = sp.ADAPTER
+    assert ad.detail_price('<html><body><span class="price">9 999 zł</span></body></html>') is None
+    box = '<div class="offer-price-box"><strong class="price"><span> 4 000 zł </span></strong></div>'
+    assert ad.detail_price(f'<html><body><span class="price">9 999 zł</span>{box}</body></html>') == 4000
+
+
+def test_search_403_is_one_request_and_adapter_error():
+    """Block handling (backoff, disable) lives in the Fetcher; adapters neither retry nor probe other URLs."""
+    for mod, q in ((al, "rtx"), (sp, "rtx")):
+        f = FakeFetcher(default=Res(403, "", "", blocked=True))
+        with pytest.raises(AdapterError, match="blocked"):
+            run(mod.ADAPTER.search(Query(q), f))
+        assert len(f.urls) == 1

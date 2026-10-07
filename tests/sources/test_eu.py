@@ -13,8 +13,11 @@ from dh.sources import bazos as bz
 from dh.sources import hardverapro as hv
 from dh.sources import kleinanzeigen as ka
 from dh.sources import marktplaats as mp
-from dh.sources.base import price_of
+from dh.sources.base import filter_query, price_of
 
+from pathlib import Path
+
+from dh.sources import allegro_lokalnie as al
 from helpers import FakeFetcher, Res, check_listings, fixture_text, sub_first
 
 run = asyncio.run
@@ -107,15 +110,16 @@ def test_bazos_local_filter_and_sections():
     ad = bz.Bazos("cz")
     html = fixture_text("bazos_cz", "search.html")
     allq = bz.parse_search(html, ad)
-    rtx = bz.parse_search(html, ad, Query("rtx"))
+    rtx = filter_query(allq, Query("rtx"), text=True)
     assert 0 < len(rtx) <= len(allq)
     assert all("rtx" in f"{l.title} {l.description}".lower() for l in rtx)
-    assert bz.parse_search(html, ad, Query("zzz-nonexistent-qq")) == []
+    assert filter_query(allq, Query("zzz-nonexistent-qq"), text=True) == []
+    assert ad.category_only
     assert bz.sections_for("cz", Query("rtx 4090")) == ["graficka"]
     assert bz.sections_for("cz", Query("macbook pro")) == ["notebook"]
     assert bz.sections_for("cz", Query("something else")) == ["pc"]
     assert bz.sections_for("at", Query("rtx 4090")) == ["grafikkarten"]
-    assert bz.matches_query(allq[0], Query(""))
+    assert filter_query(allq, Query(""), text=True) == allq
 
 
 def test_bazos_never_uses_search_form():
@@ -259,8 +263,10 @@ def test_marktplaats_detail_and_alive():
     assert d.description and d.photos
     assert "Levering:" in d.description or "Staat:" in d.description
     ok, price = run(ad.alive(l, FakeFetcher(default=Res(200, html, l.url))))
-    assert ok and (price is None or price >= 0)
+    assert ok and price > 0
     assert run(ad.alive(l, FakeFetcher(default=Res(410)))) == (False, None)
+    moved = Res(200, html, "https://www.marktplaats.nl/q/rtx/")  # redirected away: id not in the final URL
+    assert run(ad.alive(l, FakeFetcher(default=moved))) == (False, None)
 
 
 def test_marktplaats_skips_wanted_ads():
@@ -269,3 +275,94 @@ def test_marktplaats_skips_wanted_ads():
     victim = ls[0].title
     mutated = html.replace(json.dumps(victim, ensure_ascii=False)[1:-1], "GEZOCHT: " + victim, 1)
     assert len(mp.parse_search(mutated)) == len(ls) - 1
+
+
+def test_alive_requires_price_confirmation_everywhere():
+    """A page that loads with no gone marker but no readable price is "unverifiable", never (True, None)."""
+    cases = [(ka.ADAPTER, ka.parse_search(fixture_text("kleinanzeigen", "search.html"))[0]),
+             (hv.ADAPTER, hv.parse_search(fixture_text("hardverapro", "search.html"))[0]),
+             (mp.ADAPTER, mp.parse_search(fixture_text("marktplaats", "search.html"))[0]),
+             (bz.Bazos("cz"), bz.parse_search(fixture_text("bazos_cz", "search.html"), bz.Bazos("cz"))[0])]
+    for ad, l in cases:
+        with pytest.raises(AdapterError, match="unverifiable"):
+            run(ad.alive(l, FakeFetcher(default=Res(200, "<html><body>ok</body></html>", l.url))))
+
+
+def test_hardverapro_and_bazos_alive_detect_redirect_away():
+    ad = hv.ADAPTER
+    l = hv.parse_search(fixture_text("hardverapro", "search.html"))[0]
+    html = fixture_text("hardverapro", "detail.html")
+    assert run(ad.alive(l, FakeFetcher(default=Res(200, html, "https://hardverapro.hu/aprok/index.html")))) == (False, None)
+    b = bz.Bazos("cz")
+    bl = bz.parse_search(fixture_text("bazos_cz", "search.html"), b)[0]
+    assert run(b.alive(bl, FakeFetcher(default=Res(200, fixture_text("bazos_cz", "detail.html"),
+                                                   "https://pc.bazos.cz/graficka/")))) == (False, None)
+
+
+# ---------------------------------------------------------------- FX-aware bounds (one place: filter_query)
+def test_filter_query_converts_foreign_prices_to_pln():
+    rates = {"EUR": Decimal("4.30"), "HUF": Decimal("0.0110")}
+    conv = lambda amt, ccy: amt * rates[ccy]  # noqa: E731
+    eur = ka.parse_search(fixture_text("kleinanzeigen", "search.html"))
+    huf = hv.parse_search(fixture_text("hardverapro", "search.html"))
+    q = Query("x", min_price_pln=Decimal(5000), max_price_pln=Decimal(12000))
+    for ls, ccy in ((eur, "EUR"), (huf, "HUF")):
+        out = filter_query(ls, q, conv)
+        assert out and len(out) < len(ls)
+        assert all(Decimal(5000) <= l.price * rates[ccy] <= Decimal(12000) for l in out)
+        assert all(l not in out for l in ls if not Decimal(5000) <= l.price * rates[ccy] <= Decimal(12000))
+
+
+def test_filter_query_missing_rate_keeps_listing_and_logs_once(caplog):
+    from dh.sources import base
+    base._warned_ccy.clear()
+    eur = ka.parse_search(fixture_text("kleinanzeigen", "search.html"))
+    q = Query("x", max_price_pln=Decimal(1))
+    with caplog.at_level("WARNING"):
+        assert filter_query(eur, q, None) == eur
+        assert filter_query(eur, q, lambda a, c: None) == eur
+    assert len([r for r in caplog.records if "no PLN rate" in r.message]) == 1
+
+
+def test_adapter_search_applies_fx_bounds():
+    ad = hv.ADAPTER
+    f = FakeFetcher(default=Res(200, fixture_text("hardverapro", "search.html")))
+    all_ = run(ad.search(Query("rtx 4090"), f))
+    q = Query("rtx 4090", max_price_pln=Decimal(5000))
+    some = run(ad.search(q, f, to_pln=lambda a, c: a * Decimal("0.011")))
+    assert 0 < len(some) < len(all_) and all(l.price * Decimal("0.011") <= 5000 for l in some)
+
+
+# ---------------------------------------------------------------- redaction at storage
+def test_redact_phone_email_tel():
+    from dh.sources.base import redact
+    t, hit = redact("Zadzwoń 600 123 456 lub pisz a.b@example.com, tel:+48600123456 albo +49 170 1234567. Serial 12345678.")
+    assert hit and "600" not in t and "@" not in t and "tel:" not in t and "170" not in t
+    assert t.count("[redacted]") == 4 and "Serial 12345678." in t
+    assert redact("Karta RTX 4090, 24GB, stan idealny") == ("Karta RTX 4090, 24GB, stan idealny", False)
+    t, hit = redact("Telefon: 600123456")
+    assert hit and "600123456" not in t
+
+
+def test_search_and_detail_redact_contact_and_flag_it():
+    html = fixture_text("allegro_lokalnie", "detail.html")
+    l = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[0]
+    d = al.ADAPTER.parse_detail(l, html + "<div class='mlc-offer__description'>Sprzedam. SMS: 600 062 184 lub x@y.pl</div>")
+    # the fixture description may differ; build a controlled one
+    d = al.ADAPTER.parse_detail(l, "<div class='mlc-offer__description'>Sprzedam. SMS: 600 062 184 lub x@y.pl</div>")
+    assert "600 062" not in d.description and "x@y.pl" not in d.description and d.contact_in_text is True
+    clean = al.ADAPTER.parse_detail(l, "<div class='mlc-offer__description'>Sprzedam, odbior Krakow</div>")
+    assert clean.contact_in_text is True  # sticky: the flag never resets once set
+    fresh = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[1]
+    assert al.ADAPTER.parse_detail(fresh, "<div class='mlc-offer__description'>Sprzedam</div>").contact_in_text is False
+
+
+def test_redacted_listing_still_trips_risk_offplatform_flag():
+    from dh import config, risk
+    from dh.models import Extraction
+    l = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[0]
+    d = al.ADAPTER.parse_detail(l, "<div class='mlc-offer__description'>Sprzedam. Zadzwon 600 123 456</div>")
+    assert "600" not in d.description and d.contact_in_text
+    cfg = config.load(Path(__file__).resolve().parents[2])
+    r = risk.assess(d, Extraction(key=None, category=None, certainty=0.9, condition="used"), None, cfg)
+    assert r.hard_exclude and "offplatform_phone" in r.flags

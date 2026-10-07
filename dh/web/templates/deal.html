@@ -15,6 +15,7 @@
 
 <h2>Outcome</h2>
 <div class="card">
+{% if error %}<p class="bad" role="alert"><b>Not saved:</b> {{error}}</p>{% endif %}
 <p>{% if marks %}Latest: <b>{{marks[0].status}}</b>{% if marks[0].price_pln %} at {{marks[0].price_pln}} PLN{% endif %}{% if marks[0].note %} ({{marks[0].note}}){% endif %}{% else %}Not marked yet.{% endif %}</p>
 <form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="bought">
 <label>Note<input name="note" maxlength="500"></label><button>Bought</button></form>

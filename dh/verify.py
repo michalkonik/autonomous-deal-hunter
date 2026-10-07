@@ -57,7 +57,7 @@ def load_listing(store, listing_ref: int) -> Listing | None:
         seller_ratings=r["seller_ratings"], seller_score=r["seller_score"], ships=flag(r["ships"]),
         pickup_only=bool(r["pickup_only"]), is_business=flag(r["is_business"]), photos=json.loads(r["photos"] or "[]"),
         posted_at=ts(r["posted_at"]), seen_at=ts(r["last_seen_at"]) or datetime.now(timezone.utc),
-        raw_path=r["raw_path"])
+        raw_path=r["raw_path"], contact_in_text=bool(r["contact_in_text"]) if "contact_in_text" in r.keys() else False)
 
 
 async def verify_deal(store, deal_id: int, cfg, fx, customs, adapters, fetcher) -> VerifyResult:

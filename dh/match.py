@@ -6,6 +6,8 @@ Design rules (see tests/test_match.py):
   and the LLM stage (method="llm") can still pick it up.
 - Wanted ads ("kupię", "WTB"...) and box-only listings never get a key. Comparisons ("jak RTX 4090", "like", "vs")
   never match the chip they mention.
+- A whole gaming PC ("Komputer gamingowy", "Gaming PC", "Herní PC", "Gamer PC") maps to key `pc:bundle` (0.5) whose
+  bundle_items list the detected parts; dh.partout values it part by part.
 - Certainty: 0.95 = chip/model and memory unambiguous (stated, or the chip has a single variant);
   0.7 = the variant was inferred from the taxonomy default; 0.0 = no key. A bundle (PC, extra RAM/SSD in a GPU
   title) is capped at 0.5.
@@ -429,6 +431,39 @@ def _ssd(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
     return taxonomy.canonical("ssd", {"iface": iface, "capacity": next(iter(caps))}), "ssd", cert
 
 
+# ---------------------------------------------------------------------------------------- whole PCs
+
+_PC_NOUN = r"(?:komputer\w*|pc|computer|rechner|pocitac\w*|desktop|stacjonarn\w*)"
+_PC_GAMING = r"(?:gamingow\w*|gaming|gamer|herni|do\s+gier|fur\s+gamer|zocker)"
+_PC_TITLE = re.compile(
+    r"(?<!do\s)(?<!for\s)(?<!fur\s)(?<!pro\s)(?<!na\s)(?<![a-z0-9])"
+    r"(?:" + _PC_NOUN + r"[\s-]+" + _PC_GAMING + r"|" + _PC_GAMING + r"[\s-]*" + _PC_NOUN + r")(?![a-z0-9])")
+_PC_ACCESSORY = re.compile(
+    r"(?<![a-z])(?:case|gehause|obudow\w*|skrzyn\w*|chassis|tower|stolik|biurko|desk|fotel|krzeslo|chair|mysz|maus|"
+    r"mouse|klawiatur\w*|keyboard|monitor|zasilacz\w*|netzteil|kabel\w*|cooler|chlodzeni\w*|naklejk\w*)(?![a-z])")
+
+
+def _pc_parts(t: str) -> list[str]:
+    parts = []
+    if _gpu_hits(t, "gpu") or _gpu_hits(t, "gpu-mobile"):
+        parts.append("gpu")
+    if _CPU.search(t):
+        parts.append("cpu")
+    if _RAM_EVIDENCE.search(t):
+        parts.append("ram")
+    if _SSD_EVIDENCE.search(t):
+        parts.append("ssd")
+    return parts
+
+
+def _pc(t: str) -> tuple[str, str, float, list[str]] | None:
+    """`pc:bundle` for a whole gaming PC title (certainty 0.5, the bundle cap); bundle_items = detected parts.
+    The key carries no price comparables of its own: `dh.partout` values the parts."""
+    if not _PC_TITLE.search(t) or _PC_ACCESSORY.search(t) or _VERSUS.search(t):
+        return None
+    return "pc:bundle", "pc", 0.5, _pc_parts(t) or ["system"]
+
+
 # ---------------------------------------------------------------------------------------- public API
 
 
@@ -483,6 +518,13 @@ def rules_extract(title: str, description: str, lang: str) -> Extraction:
     if _MULTI.search(t):
         gpu_bundle.append("multiple")
     other_bundle: list[str] = []  # why a RAM/SSD title was rejected as a bundle
+
+    if not (wanted or box_only or _MERCH.search(t)):
+        pc = _pc(t)
+        if pc:
+            return Extraction(key=pc[0], category=pc[1], certainty=pc[2], condition=condition, defects=defects,
+                              box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=pc[3],
+                              method="rules")
 
     result: tuple[str, str, float] | None = None
     if not (wanted or box_only or _MERCH.search(t)):

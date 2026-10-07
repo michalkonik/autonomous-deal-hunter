@@ -67,6 +67,30 @@ def test_hard_excludes():
     assert r.hard_exclude and "transfer_new_account" in r.flags
 
 
+@pytest.mark.parametrize("desc", [
+    "Handy 0176 1234 5678", "pisz +49 176 12345678", "ruf an 0049 176 12345678", "Rufnummer: 0176 12345678",
+    "volejte +420 777 123 456", "Mobil: 777 123 456", "hivj +36 30 123 4567", "telefon 06 30 123 4567",
+    "Tel 06-30-123-4567", "+36 30 123 4567"])
+def test_de_cz_hu_mobile_formats_are_phone_numbers(desc):
+    r = assess(l=listing(description=desc))
+    assert r.hard_exclude and "offplatform_phone" in r.flags, (desc, r.flags)
+
+
+@pytest.mark.parametrize("desc", [
+    "Seriennummer 0176123456789012", "Part no 0176 1234 5678 9012", "Artikel 06 30 123 4567 8", "Model 0123456",
+    "GTX 1080 8GB 256bit 2020", "ISBN 978-3-16-148410-0", "Nr 06301234567"])
+def test_serials_and_part_numbers_are_not_phone_numbers(desc):
+    r = assess(l=listing(description=desc))
+    assert "offplatform_phone" not in r.flags, (desc, r.flags)
+
+
+def test_redacted_contact_flag_counts_as_offplatform_phone():
+    clean = listing(description="Karta sprawna, [redacted]")
+    assert not assess(l=clean).hard_exclude
+    r = assess(l=replace(clean, contact_in_text=True))
+    assert r.hard_exclude and "offplatform_phone" in r.flags
+
+
 def test_for_parts_allowed_when_repair_enabled():
     cfg = config.Config({**CFG.to_dict(), "rules": {**CFG.rules.to_dict(), "repair": {"enabled": True}}})
     assert not risk.assess(listing(), ext(for_parts=True), Est(), cfg).hard_exclude

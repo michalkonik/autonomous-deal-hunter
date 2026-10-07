@@ -106,3 +106,11 @@ def test_screenshot_paths_relative_to_root(tmp_path):
     assert str(tmp_path) not in md and data2["screenshots"]["discovery"] == "shots/d.png"
     p = cards.write(d, tmp_path)
     assert str(tmp_path / "shots") not in p.read_text()
+
+
+def test_write_is_atomic_no_temp_left(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    cards.write(d, tmp_path)
+    cards.write(d, tmp_path)
+    assert not list(tmp_path.glob("deals/*/*.tmp"))

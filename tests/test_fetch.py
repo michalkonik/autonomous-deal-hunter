@@ -374,3 +374,20 @@ async def test_pace_and_report_block_for_external_page_loads(tmp_path):
     for _ in range(2):
         f.report_block("a.test", "again")
     assert f.disabled("a.test")
+
+
+async def test_get_bytes_binary_body_obeys_robots_and_skips_snapshot(tmp_path):
+    seen = []
+
+    def h(req):
+        seen.append(req.url.path)
+        if req.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /private/\n")
+        return httpx.Response(200, content=b"\xff\xd8\xff\xe0JPEG\x00\x80", headers={"content-type": "image/jpeg"})
+    f, ft, st = make(tmp_path, h)
+    r = await f.get_bytes("https://img.example/p/1.jpg")
+    assert r.status == 200 and r.content == b"\xff\xd8\xff\xe0JPEG\x00\x80" and r.raw_path is None and not list(tmp_path.iterdir())
+    d = await f.get_bytes("https://img.example/private/1.jpg")
+    assert d.disallowed and d.content == b""
+    big = await f.get_bytes("https://img.example/p/2.jpg", max_bytes=3)
+    assert big.content == b""

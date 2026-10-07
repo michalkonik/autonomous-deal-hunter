@@ -96,6 +96,15 @@ def _deal_id(name: str, text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def record_import(conn, deal_id: int, outcome: dict) -> None:
+    """Record `outcome` as already imported for `deal_id` (so the publisher will not import a card edit that
+    equals it as a second mark). Does NOT commit: call it in the same transaction as the `marks` insert.
+    The table must exist (`store.ensure_table(MARK_IMPORTS_SQL)`)."""
+    norm = parse_outcome(_with_outcome("---\ndeal_id: 0\n---\n", outcome))
+    conn.execute("insert or replace into mark_imports (deal_id, hash, outcome) values (?,?,?)",
+                 (deal_id, _ohash(norm), json.dumps(norm)))
+
+
 def import_texts(store, items) -> tuple[int, set[int]]:
     """items: iterable of (label, text). Imports changed outcome blocks as marks via store.add_mark.
     Returns (imported, deal_ids of unparseable cards). A poison file never stops the import."""

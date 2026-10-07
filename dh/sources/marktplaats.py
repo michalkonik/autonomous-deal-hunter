@@ -14,10 +14,9 @@ from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 from ..models import Listing
-from .base import Adapter, AdapterError, Query, abs_url, in_range, local_dt, norm, now_utc, price_of, seller_hash
+from .base import Adapter, AdapterError, Query, abs_url, local_dt, norm, now_utc, price_of, product_ld, seller_hash
 
 BASE = "https://www.marktplaats.nl"
-LIMIT = 30
 # FIXED = asking price; FAST_BID = "Bieden" with an asking price. MIN_BID is a starting bid, SEE_DESCRIPTION/
 # RESERVED/FREE etc. have no usable price.
 PRICE_TYPES = {"FIXED", "FAST_BID"}
@@ -52,17 +51,19 @@ class Marktplaats(Adapter):
     currency = "EUR"
     gone_markers = ("deze advertentie is niet meer beschikbaar", "advertentie niet gevonden")
 
+    id_in_final_url = True
+
     def search_url(self, q: Query) -> str:
         return f"{BASE}/q/{quote_plus(q.text)}/"
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        res = await self._get(fetcher, self.search_url(query))
-        if res.status != 200:
-            raise AdapterError(f"{self.name}: search status {res.status}")
-        return parse_search(res.text, query)
+    def page_urls(self, q: Query) -> list[str]:
+        return [self.search_url(q)]
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
-        ld = _product_ld(html)
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text)
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
+        ld = product_ld(html)
         full = norm(ld.get("description"))
         if full:
             # keep the structured lines (Staat/Levering) the search JSON added
@@ -76,19 +77,8 @@ class Marktplaats(Adapter):
         return listing
 
     def detail_price(self, html: str) -> Decimal | None:
-        pr = price_of(str(((_product_ld(html)).get("offers") or {}).get("price") or ""), "EUR")
+        pr = price_of(str(((product_ld(html)).get("offers") or {}).get("price") or ""), "EUR")
         return pr[0] if pr else None
-
-
-def _product_ld(html: str) -> dict:
-    for m in re.finditer(r'<script type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S):
-        try:
-            d = json.loads(m.group(1))
-        except ValueError:
-            continue
-        if isinstance(d, dict) and d.get("@type") == "Product":
-            return d
-    return {}
 
 
 ADAPTER = Marktplaats()
@@ -108,7 +98,7 @@ def extract_listings(html: str) -> list[dict]:
         raise AdapterError(f"marktplaats: unexpected __NEXT_DATA__ shape ({e!r})") from e
 
 
-def parse_search(html: str, q: Query | None = None) -> list[Listing]:
+def parse_search(html: str) -> list[Listing]:
     items = extract_listings(html)
     out: list[Listing] = []
     for it in items:
@@ -146,6 +136,5 @@ def parse_search(html: str, q: Query | None = None) -> list[Listing]:
             city=loc.get("cityName"), lat=loc.get("latitude"), lon=loc.get("longitude"),
             seller_hash=seller_hash("marktplaats", sid), ships=ships, pickup_only=pickup_only, photos=photos,
             posted_at=_posted(it.get("date")))
-        if q is None or in_range(l.price, l.currency, q):
-            out.append(l)
+        out.append(l)
     return out

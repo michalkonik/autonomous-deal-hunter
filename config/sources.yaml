@@ -13,8 +13,13 @@ fetch:
   logged_in: false
 adapters:
   allegro: {enabled: true, via: mailbox}
+  olx: {enabled: true, via: mailbox}   # OLX blocks polite polling: saved-search alert e-mails only
+  mailbox: {enabled: false}            # IMAP alert mailbox; enable once `bw-secret dh-mail#imap` exists
   vinted: {enabled: false}
-  ebay: {enabled: true, via: api}
+  ebay: {enabled: true, via: api}   # applies to ebay_de and ebay_pl; disabled at run time without keys (bw-secret ebay#client_id / #client_secret)
+  pepper_pl: {enabled: true, via: rss}
+  hotukdeals: {enabled: true, via: rss}
+  retail: {enabled: true}
   allegro_lokalnie: {enabled: true}
   sprzedajemy: {enabled: true}
   kleinanzeigen: {enabled: true}
@@ -24,5 +29,19 @@ adapters:
   bazos_cz: {enabled: true, pages: 2}
   bazos_sk: {enabled: true, pages: 2}
   bazos_at: {enabled: false, pages: 2, reason: "almost no volume: /grafikkarten/ and /notebooks/ list 0 ads"}
+  willhaben: {enabled: false, reason: "robots.txt header forbids automatic access without permission (checked 2026-10-29); keyword search and paging are also Disallowed"}
   sbazar: {enabled: false, reason: "robots.txt disallows all paths for non-Google agents"}
+# Retail price watch (dh/sources/retail.py). Product or category pages carrying JSON-LD offers.price; emits a listing on a
+# >= drop_pct fall vs the last seen price or below the key's clears-at P25, and feeds retail_new comps (the ceiling).
+# Checked 2026-10-29 with the polite Fetcher: morele.net and x-kom.pl pass robots.txt and serve JSON-LD;
+# mediaexpert.pl answers 403 (bot interstitial) and komputronik.pl category pages answer 403 (challenge): dropped, not circumvented.
+retail:
+  drop_pct: 0.10
+  watch:
+    - {shop: morele, url: "https://www.morele.net/kategoria/karty-graficzne-12/"}
+    - {shop: xkom, url: "https://www.x-kom.pl/p/1317828-karta-graficzna-nvidia-msi-geforce-rtx-5070-ti-ventus-3x-oc-16gb-gddr7-dlss5.html"}
+    - {shop: xkom, url: "https://www.x-kom.pl/p/1318500-karta-graficzna-nvidia-msi-geforce-rtx-5070-gaming-trio-oc-12gb-gddr7-dlss5.html"}
+    - {shop: xkom, url: "https://www.x-kom.pl/p/1318534-karta-graficzna-nvidia-gigabyte-geforce-rtx-5070-windforce-oc-12gb-gddr7-dlss5.html"}
+    - {shop: xkom, url: "https://www.x-kom.pl/p/1321564-karta-graficzna-amd-gigabyte-radeon-rx-9070-xt-gaming-oc-16gb-gddr6.html"}
+    - {shop: xkom, url: "https://www.x-kom.pl/p/1309815-karta-graficzna-nvidia-gigabyte-geforce-rtx-5090-windforce-oc-32gb-gddr7-dlss5.html"}
 retention: {photos_days: 90, snapshots_days: 90}

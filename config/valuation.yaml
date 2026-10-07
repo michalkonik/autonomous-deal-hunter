@@ -32,3 +32,11 @@ channels:
   sbazar: {channel: sbazar, market: CZ}
   hardverapro: {channel: hardverapro, market: HU}
   marktplaats: {channel: marktplaats, market: NL}
+
+# Part-out valuation of whole PCs (dh/partout.py): sum of per-part P25/median/P75, less a parting-out cost and the
+# outbound shipping of every part but the first (the net engine already charges one outbound leg).
+partout:
+  parting_cost: 0.12          # share of the parts' value lost to listing, haggling, returns and unsold leftovers
+  heavy_parts: 3              # effort is heavy from this many valued parts
+  max_components: 6
+  exit_channel: allegro       # channel the parts are valued on (falls back like any other estimate)

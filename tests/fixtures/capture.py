@@ -34,7 +34,7 @@ KEEP_INLINE = [r'"posterid":"\d+"', r'"Verkaeufer":"\w+"', r'"versand":"\w+"', r
 
 KEEP_ATTRS = {"class", "id", "href", "src", "title", "datetime", "content", "itemprop", "data-adid", "data-href",
               "data-uadid", "data-card-analytics-click", "data-retina-url", "data-flickity-lazyload",
-              "data-mlc-seller-details", "data-mlc-param", "onclick", "name", "property"}
+              "data-mlc-seller-details", "data-mlc-param", "onclick", "name", "property", "type"}
 # search pages: keep only the result cards (wrapped in `shell`); detail pages: keep only these regions
 SEARCH = {  # source -> (card selector, shell open, shell close, max cards)
     "allegro_lokalnie": ("article.mlc-itembox__container", "", "", 30),
@@ -110,6 +110,7 @@ async def main(argv: list[str]) -> int:
     ap.add_argument("source")
     ap.add_argument("query")
     ap.add_argument("--detail-url")
+    ap.add_argument("--detail-only", action="store_true", help="skip the search page (needs --detail-url)")
     a = ap.parse_args(argv)
     cfg = load(ROOT)
     ad = registry(cfg, ROOT)[a.source]
@@ -120,6 +121,15 @@ async def main(argv: list[str]) -> int:
     out.mkdir(parents=True, exist_ok=True)
     q = Query(text=a.query)
     url = ad.page_urls(q)[0] if hasattr(ad, "page_urls") else ad.search_url(q)
+    if a.detail_only:
+        r2 = await f.get(a.detail_url, kind="html")
+        print("detail", r2.status, a.detail_url)
+        if r2.status == 200:
+            d = trim(r2.text, a.source, kind="detail")
+            (out / "detail.html").write_text(d)
+            print("  detail.html", len(d), "bytes")
+        await f.aclose()
+        return 0 if r2.status == 200 else 1
     res = await f.get(url, kind="html")
     print("search", res.status, "disallowed" if res.disallowed else "", "blocked" if res.blocked else "", url)
     if res.status != 200:

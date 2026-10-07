@@ -1,0 +1,15 @@
+{"href": "https://api.ebay.com/buy/marketplace_insights/v1_beta/item_sales/search?q=rtx+4090&limit=50", "total": 6, "limit": 50, "offset": 0,
+ "itemSales": [
+  {"itemId": "v1|314000000001|0", "title": "MSI GeForce RTX 4090 Gaming X Trio 24GB GDDR6X", "lastSoldDate": "2026-10-25T10:12:00.000Z",
+   "lastSoldPrice": {"value": "1480.00", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "Used", "conditionId": "3000", "buyingOptions": ["FIXED_PRICE"]},
+  {"itemId": "v1|314000000002|0", "title": "ASUS ROG Strix RTX 4090 OC 24GB", "lastSoldDate": "2026-10-20T18:00:00.000Z",
+   "lastSoldPrice": {"value": "1525.50", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "Used", "conditionId": "3000"},
+  {"itemId": "v1|314000000003|0", "title": "Pudełko po RTX 4090 Founders Edition", "lastSoldDate": "2026-10-24T09:00:00.000Z",
+   "lastSoldPrice": {"value": "25.00", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "Used", "conditionId": "3000"},
+  {"itemId": "v1|314000000004|0", "title": "RTX 4090 24GB defekt für Bastler", "lastSoldDate": "2026-10-22T09:00:00.000Z",
+   "lastSoldPrice": {"value": "400.00", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "For parts or not working", "conditionId": "7000"},
+  {"itemId": "v1|314000000005|0", "title": "Gigabyte RTX 4090 Windforce 24GB", "lastSoldDate": "2026-10-23T09:00:00.000Z",
+   "lastSoldPrice": {"value": "0", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "Used", "conditionId": "3000"},
+  {"itemId": "v1|314000000006|0", "title": "Palit GeForce RTX 4080 Super 16GB", "lastSoldDate": "2026-10-21T09:00:00.000Z",
+   "lastSoldPrice": {"value": "990.00", "currency": "EUR"}, "totalSoldQuantity": 1, "condition": "Used", "conditionId": "3000"}
+ ]}

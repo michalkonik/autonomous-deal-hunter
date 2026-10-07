@@ -33,6 +33,7 @@ class Listing:
     posted_at: datetime | None
     seen_at: datetime
     raw_path: str | None = None
+    contact_in_text: bool = False  # a phone/email/tel: link was redacted from title/description at the source
 
 
 @dataclass

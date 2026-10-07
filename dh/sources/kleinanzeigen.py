@@ -11,8 +11,7 @@ from urllib.parse import quote
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import (Adapter, AdapterError, Query, abs_url, age_days, in_range, local_dt, norm, price_of,
-                   relative_day, seller_hash)
+from .base import Adapter, Query, abs_url, age_days, local_dt, norm, price_of, relative_day, seller_hash
 
 BASE = "https://www.kleinanzeigen.de"
 CARD = "#srchrslt-adtable article[data-adid]"
@@ -45,13 +44,13 @@ class Kleinanzeigen(Adapter):
         slug = re.sub(r"[^\w]+", "-", q.text.strip().lower()).strip("-")
         return f"{BASE}/s-{quote(slug)}/k0"
 
-    async def search(self, query: Query, fetcher) -> list[Listing]:
-        res = await self._get(fetcher, self.search_url(query))
-        if res.status != 200:
-            raise AdapterError(f"{self.name}: search status {res.status}")
-        return parse_search(res.text, query)
+    def page_urls(self, q: Query) -> list[str]:
+        return [self.search_url(q)]
 
-    def parse_detail(self, listing: Listing, html: str) -> Listing:
+    def parse_page(self, text: str) -> list[Listing]:
+        return parse_search(text)
+
+    def _parse_detail(self, listing: Listing, html: str) -> Listing:
         tree = LexborHTMLParser(html)
         d = tree.css_first("#viewad-description-text")
         parts = [norm(d.text(separator="\n")) if d is not None else ""]
@@ -102,7 +101,7 @@ class Kleinanzeigen(Adapter):
 ADAPTER = Kleinanzeigen()
 
 
-def parse_search(html: str, q: Query | None = None) -> list[Listing]:
+def parse_search(html: str) -> list[Listing]:
     tree = LexborHTMLParser(html)
     out: list[Listing] = []
     for card in tree.css(CARD):
@@ -132,6 +131,5 @@ def parse_search(html: str, q: Query | None = None) -> list[Listing]:
                          city=city, ships=ships, is_business=True if is_pro else None,
                          photos=[img.attributes["src"]] if img is not None and img.attributes.get("src") else [],
                          posted_at=_posted(when) if when else None)
-        if q is None or in_range(l.price, l.currency, q):
-            out.append(l)
+        out.append(l)
     return out

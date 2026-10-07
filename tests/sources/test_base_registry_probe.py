@@ -22,8 +22,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_registry_default_and_enabled_filter():
     reg = registry(load(ROOT), ROOT)
-    assert set(reg) == {"allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats",
-                        "bazos_cz", "bazos_sk"}
+    assert {"allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats",
+            "bazos_cz", "bazos_sk"} <= set(reg)
+    assert "bazos_at" not in reg
     assert all(isinstance(a, Adapter) and a.domain and a.country and a.currency for a in reg.values())
     assert "olx" not in reg and "olx_pl" not in reg  # OLX moved to the mailbox channel
     assert "sbazar" not in reg and "sbazar" in DROPPED and "robots" in DROPPED["sbazar"]
@@ -75,6 +76,8 @@ class _FakeFetcher:
     async def get(self, url, *, kind="html", headers=None):
         from helpers import Res
         self.urls.append(url)
+        if "/oferta/" in url and self.status == 200:  # detail page of the allegro_lokalnie fixture
+            return Res(200, fixture_text("allegro_lokalnie", "detail.html"), url)
         return Res(self.status, self.html, url)
 
     async def aclose(self):
@@ -118,3 +121,10 @@ def test_cli_probe_subcommand_registered():
     from dh.cli import build_parser
     a = build_parser().parse_args(["probe", "--source", "marktplaats", "--query", "rtx 4090"])
     assert a.source == "marktplaats" and a.query == "rtx 4090" and callable(a.func)
+
+
+def test_long_tail_dropped_not_registered():
+    reg = registry(load(ROOT), ROOT)
+    for name in ("willhaben", "olx_ro", "olx_bg", "olx_pt"):
+        assert name not in reg and name in DROPPED
+    assert "forbidden" in DROPPED["willhaben"]
