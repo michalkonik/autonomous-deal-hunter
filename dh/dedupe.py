@@ -23,6 +23,26 @@ def _buy_pln(deal) -> Decimal | None:
         return None
 
 
+PC_KEY = "pc:bundle"
+
+
+def components_of(store, deal) -> list[str] | None:
+    """Sorted component set of a `pc:bundle` deal: `evidence.components` when the pipeline stored it, else the parts
+    the rules find in the stored listing text (keys). None when unknown."""
+    try:
+        ev = json.loads(deal.evidence_json or "{}").get("components")
+    except ValueError:
+        ev = None
+    if ev:
+        return sorted(str(c) for c in ev)
+    r = store.conn.execute("select title, description from listings where id=?", (deal.listing_ref,)).fetchone()
+    if r is None:
+        return None
+    from .partout import rule_components  # lazy: partout pulls valuation and economics
+    got = [c.key for c in rule_components(r["title"] or "", r["description"] or "")]
+    return sorted(got) or None
+
+
 def norm_city(city: str | None) -> str | None:
     """lowercase, no diacritics, whitespace collapsed; None when empty."""
     t = unicodedata.normalize("NFKD", (city or "").translate(str.maketrans("\u0142\u0141", "ll")))
@@ -45,6 +65,7 @@ def is_duplicate(store, deal) -> bool:
     seller = mine["seller_hash"] if mine else None
     city = norm_city(mine["city"]) if mine else None
     price = _buy_pln(deal)
+    mine_parts = components_of(store, deal) if deal.key == PC_KEY else None
     for other in store.deals():
         if deal.id is not None and other.id == deal.id:
             continue
@@ -54,6 +75,8 @@ def is_duplicate(store, deal) -> bool:
             continue
         if not _close(price, _buy_pln(other)):
             continue
+        if deal.key == PC_KEY and components_of(store, other) != mine_parts:
+            continue  # one key for every PC: two machines of one seller are the same item only with the same parts
         theirs = _listing(store, other.listing_ref)
         if theirs is None:
             continue

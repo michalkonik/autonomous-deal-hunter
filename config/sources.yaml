@@ -14,7 +14,13 @@ fetch:
 adapters:
   allegro: {enabled: true, via: mailbox}
   olx: {enabled: true, via: mailbox}   # OLX blocks polite polling: saved-search alert e-mails only
-  mailbox: {enabled: false}            # IMAP alert mailbox; enable once `bw-secret dh-mail#imap` exists
+  mailbox:                             # IMAP alert mailbox; enable once `bw-secret dh-mail#imap` exists
+    enabled: false
+    image_hosts:                       # a mail's photos are kept only from these hosts (https, suffix match)
+      allegro: [allegroimg.com]
+      olx: [olxcdn.com]
+      kleinanzeigen: [kleinanzeigen.de, classistatic.de]
+      ebay: [ebayimg.com]
   vinted: {enabled: false}
   ebay: {enabled: true, via: api}   # applies to ebay_de and ebay_pl; disabled at run time without keys (bw-secret ebay#client_id / #client_secret)
   pepper_pl: {enabled: true, via: rss}

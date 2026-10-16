@@ -1,0 +1,148 @@
+{"id": "g-bait-00", "why": "bait (box_only)", "listing": {"title": "Pudełko po RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-01", "why": "bait (box_only)", "listing": {"title": "RTX 4090 box only", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-02", "why": "bait (wanted_ad)", "listing": {"title": "Kupię RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-03", "why": "bait (None)", "listing": {"title": "Laptop z wydajnością jak RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-04", "why": "bait (None)", "listing": {"title": "RTX 4090 *like* performance", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-05", "why": "bait (box_only)", "listing": {"title": "Karton od RTX 4090 Gaming OC", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-06", "why": "bait (box_only)", "listing": {"title": "RTX 4090 nur OVP", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-07", "why": "bait (box_only)", "listing": {"title": "Leere Verpackung RTX 4090 Suprim", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-08", "why": "bait (box_only)", "listing": {"title": "Krabice od RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-09", "why": "bait (box_only)", "listing": {"title": "RTX 4090 doboz", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-10", "why": "bait (wanted_ad)", "listing": {"title": "Szukam RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-11", "why": "bait (wanted_ad)", "listing": {"title": "Suche RTX 4090 24GB", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-12", "why": "bait (wanted_ad)", "listing": {"title": "Koupím RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-13", "why": "bait (wanted_ad)", "listing": {"title": "Veszek RTX 4090-et", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-14", "why": "bait (wanted_ad)", "listing": {"title": "WANTED: RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-15", "why": "bait (wanted_ad)", "listing": {"title": "WTB RTX 4090 FE", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-16", "why": "bait (None)", "listing": {"title": "RTX 4090 vs RX 7900 XTX", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-17", "why": "bait (None)", "listing": {"title": "Karta lepsza niż RTX 4090", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-18", "why": "bait (None)", "listing": {"title": "Grafikkarte wie RTX 4090 Leistung", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-bait-19", "why": "bait (box_only)", "listing": {"title": "Pudełko po RX 7900 XTX", "description": "", "price": 500}, "market": null, "expect": {"key": null}}
+{"id": "g-gpu-000", "why": "gpu key", "listing": {"title": "MSI RTX 4070 Ti SUPER Gaming X Slim 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4070-ti-super:16"}}
+{"id": "g-gpu-001", "why": "gpu key", "listing": {"title": "Gigabyte RX 7900XTX 24G", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7900-xtx:24"}}
+{"id": "g-gpu-002", "why": "gpu key", "listing": {"title": "rtx3080ti", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3080-ti:12"}}
+{"id": "g-gpu-003", "why": "gpu key", "listing": {"title": "RTX 4090D", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090d:24"}}
+{"id": "g-gpu-004", "why": "gpu key", "listing": {"title": "RTX4070TiSuper", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4070-ti-super:16"}}
+{"id": "g-gpu-005", "why": "gpu key", "listing": {"title": "4070ti 12GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4070-ti:12"}}
+{"id": "g-gpu-006", "why": "gpu key", "listing": {"title": "7900xtx", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7900-xtx:24"}}
+{"id": "g-gpu-007", "why": "gpu key", "listing": {"title": "Karta graficzna Gigabyte GeForce RTX 3060 Gaming OC 12GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3060:12"}}
+{"id": "g-gpu-008", "why": "gpu key", "listing": {"title": "Palit RTX 3060 8GB Dual", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3060:8"}}
+{"id": "g-gpu-009", "why": "gpu key", "listing": {"title": "RTX 3060", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3060:12"}}
+{"id": "g-gpu-010", "why": "gpu key", "listing": {"title": "ASUS TUF RTX4090 OC 24GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090:24"}}
+{"id": "g-gpu-011", "why": "gpu key", "listing": {"title": "Grafikkarte NVIDIA GeForce RTX 5090 32GB Founders Edition", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-5090:32"}}
+{"id": "g-gpu-012", "why": "gpu key", "listing": {"title": "ASUS Dual RTX 4060 Ti 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4060-ti:16"}}
+{"id": "g-gpu-013", "why": "gpu key", "listing": {"title": "Zotac RTX 4060 Ti 8 GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4060-ti:8"}}
+{"id": "g-gpu-014", "why": "gpu key", "listing": {"title": "Sapphire Nitro+ Radeon RX 7900 XT 20GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7900-xt:20"}}
+{"id": "g-gpu-015", "why": "gpu key", "listing": {"title": "Sapphire Pulse RX 9070 XT 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-9070-xt:16"}}
+{"id": "g-gpu-016", "why": "gpu key", "listing": {"title": "Intel Arc B580 12GB Limited Edition", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:arc-b580:12"}}
+{"id": "g-gpu-017", "why": "gpu key", "listing": {"title": "Sparkle Arc A770 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:arc-a770:16"}}
+{"id": "g-gpu-018", "why": "gpu key", "listing": {"title": "Grafická karta Palit GeForce RTX 3070 Ti 8GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3070-ti:8"}}
+{"id": "g-gpu-019", "why": "gpu key", "listing": {"title": "Prodám grafickou kartu RTX 3060 Ti 8GB, záruka", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3060-ti:8"}}
+{"id": "g-gpu-020", "why": "gpu key", "listing": {"title": "Videókártya Gigabyte RTX 4080 Super 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4080-super:16"}}
+{"id": "g-gpu-021", "why": "gpu key", "listing": {"title": "Eladó Gigabyte RTX 3070 8GB videokártya", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3070:8"}}
+{"id": "g-gpu-022", "why": "gpu key", "listing": {"title": "Gebraucht: Zotac RTX 3060 Ti Twin Edge 8GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3060-ti:8"}}
+{"id": "g-gpu-023", "why": "gpu key", "listing": {"title": "Verkaufe MSI RX 6700 XT 12GB Mech 2X", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-6700-xt:12"}}
+{"id": "g-gpu-024", "why": "gpu key", "listing": {"title": "Radeon RX 6800 XT 16GB Sapphire", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-6800-xt:16"}}
+{"id": "g-gpu-025", "why": "gpu key", "listing": {"title": "Karta MSI RTX 2080 Ti 11GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-2080-ti:11"}}
+{"id": "g-gpu-026", "why": "gpu key", "listing": {"title": "Gainward RTX 3080 12GB LHR", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3080:12"}}
+{"id": "g-gpu-027", "why": "gpu key", "listing": {"title": "ASUS ROG Strix RTX 3080 10GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3080:10"}}
+{"id": "g-gpu-028", "why": "gpu key", "listing": {"title": "Gigabyte RX 7600 XT 16GB OC", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7600-xt:16"}}
+{"id": "g-gpu-029", "why": "gpu key", "listing": {"title": "MSI GeForce RTX 5070 Ti Ventus 16G", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-5070-ti:16"}}
+{"id": "g-gpu-030", "why": "gpu key", "listing": {"title": "Palit RTX 3050 6GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3050:6"}}
+{"id": "g-gpu-031", "why": "gpu key", "listing": {"title": "RTX 4070 Super 12GB Inno3D", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4070-super:12"}}
+{"id": "g-gpu-032", "why": "gpu key", "listing": {"title": "Radeon RX 7900 GRE 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7900-gre:16"}}
+{"id": "g-gpu-033", "why": "gpu key", "listing": {"title": "RTX 3090 Ti 24GB Zotac", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3090-ti:24"}}
+{"id": "g-gpu-034", "why": "gpu key", "listing": {"title": "Karta graficzna Radeon 7900 XTX Nitro+", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rx-7900-xtx:24"}}
+{"id": "g-gpu-035", "why": "gpu key", "listing": {"title": "RTX 5060 Ti 16GB Gigabyte Windforce", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-5060-ti:16"}}
+{"id": "g-gpu-036", "why": "gpu key", "listing": {"title": "NVIDIA A100 80GB PCIe", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:a100:80"}}
+{"id": "g-gpu-037", "why": "gpu key", "listing": {"title": "nvidia a100 40gb", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:a100:40"}}
+{"id": "g-gpu-038", "why": "gpu key", "listing": {"title": "NVIDIA RTX A6000 48GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-a6000:48"}}
+{"id": "g-gpu-039", "why": "gpu key", "listing": {"title": "NVIDIA L40S 48GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:l40s:48"}}
+{"id": "g-gpu-040", "why": "gpu key", "listing": {"title": "RTX PRO 6000 Blackwell 96GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-pro-6000:96"}}
+{"id": "g-gpu-041", "why": "gpu key", "listing": {"title": "NVIDIA RTX 6000 Ada Generation 48GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-6000-ada:48"}}
+{"id": "g-gpu-042", "why": "gpu key", "listing": {"title": "Tesla H100 80GB PCIe", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:h100:80"}}
+{"id": "g-gpu-043", "why": "gpu key", "listing": {"title": "Laptop ASUS ROG Strix RTX 4090 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-4090:16"}}
+{"id": "g-gpu-044", "why": "gpu key", "listing": {"title": "MSI Titan GT77 Notebook RTX 4080 12GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-4080:12"}}
+{"id": "g-gpu-045", "why": "gpu key", "listing": {"title": "RTX 4090 Laptop GPU", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-4090:16"}}
+{"id": "g-gpu-046", "why": "gpu key", "listing": {"title": "RTX 3080 Ti Mobile 16GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-3080-ti:16"}}
+{"id": "g-gpu-047", "why": "gpu key", "listing": {"title": "Herní notebook RTX 4070 8GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-4070:8"}}
+{"id": "g-gpu-048", "why": "gpu key", "listing": {"title": "Gaming laptop RTX 5090 24GB Max-Q", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu-mobile:rtx-5090:24"}}
+{"id": "g-ram-00", "why": "ram key", "listing": {"title": "Corsair Vengeance 32GB (2x16GB) DDR5 6000MHz CL30", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr5:32:2x16"}}
+{"id": "g-ram-01", "why": "ram key", "listing": {"title": "Kingston Fury 16GB DDR4 3200 2x8GB", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr4:16:2x8"}}
+{"id": "g-ram-02", "why": "ram key", "listing": {"title": "G.Skill Trident Z 64GB 4x16GB DDR4 3600", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr4:64:4x16"}}
+{"id": "g-ram-03", "why": "ram key", "listing": {"title": "Pamięć RAM DDR5 2 x 24GB 48GB 7200", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr5:48:2x24"}}
+{"id": "g-ram-04", "why": "ram key", "listing": {"title": "Crucial 16GB DDR4 3200MHz", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr4:16:1x16"}}
+{"id": "g-ram-05", "why": "ram key", "listing": {"title": "Arbeitsspeicher 32GB Kit 2x16GB DDR4-3200", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr4:32:2x16"}}
+{"id": "g-ram-06", "why": "ram key", "listing": {"title": "Operační paměť 16GBx2 DDR5 5600", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr5:32:2x16"}}
+{"id": "g-ram-07", "why": "ram key", "listing": {"title": "RAM 64 GB (2*32 GB) DDR5-6400", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr5:64:2x32"}}
+{"id": "g-ram-08", "why": "ram key", "listing": {"title": "Memória 32 GB DDR4 2x16 GB 3200 MHz", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr4:32:2x16"}}
+{"id": "g-ram-09", "why": "ram key", "listing": {"title": "Pamięć RAM DDR5 32GB 6000 CL36 (kit 2x16GB)", "description": "", "price": 200}, "market": null, "expect": {"key": "ram:ddr5:32:2x16"}}
+{"id": "g-ram-10", "why": "ram key", "listing": {"title": "Kingston 8GB DDR4 SO-DIMM 2666", "description": "", "price": 200}, "market": null, "expect": {"key": "ram-sodimm:ddr4:8:1x8"}}
+{"id": "g-ram-11", "why": "ram key", "listing": {"title": "Pamięć do laptopa 2x8GB DDR5 SODIMM 4800", "description": "", "price": 200}, "market": null, "expect": {"key": "ram-sodimm:ddr5:16:2x8"}}
+{"id": "g-ram-12", "why": "ram key", "listing": {"title": "Samsung 32GB DDR4 ECC REG RDIMM", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-13", "why": "ram key", "listing": {"title": "Zestaw Ryzen 5 7600 + 32GB DDR5 + płyta główna", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-14", "why": "ram key", "listing": {"title": "DDR3 8GB 1600", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-15", "why": "ram key", "listing": {"title": "Dell Latitude 16GB DDR4 laptop", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-16", "why": "ram key", "listing": {"title": "Pamięć RAM DDR4 2x16GB DDR5", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-17", "why": "ram key", "listing": {"title": "RAM 32GB kit DDR5 6000", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ram-18", "why": "ram key", "listing": {"title": "Pamięć 2x8GB DDR4 32GB", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-00", "why": "ssd key", "listing": {"title": "Samsung 980 Pro 1TB NVMe M.2", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:1tb"}}
+{"id": "g-ssd-01", "why": "ssd key", "listing": {"title": "Dysk SSD Kingston A400 480GB SATA", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:sata:480gb"}}
+{"id": "g-ssd-02", "why": "ssd key", "listing": {"title": "WD Black SN850X 2TB NVMe", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:2tb"}}
+{"id": "g-ssd-03", "why": "ssd key", "listing": {"title": "Crucial MX500 1TB SSD SATA 2.5", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:sata:1tb"}}
+{"id": "g-ssd-04", "why": "ssd key", "listing": {"title": "SSD M.2 NVMe 512 GB Lexar", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:512gb"}}
+{"id": "g-ssd-05", "why": "ssd key", "listing": {"title": "Samsung 990 Pro 4 TB PCIe 4.0 NVMe", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:4tb"}}
+{"id": "g-ssd-06", "why": "ssd key", "listing": {"title": "SSD-Festplatte 1000GB SATA Samsung 870 EVO", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:sata:1tb"}}
+{"id": "g-ssd-07", "why": "ssd key", "listing": {"title": "SSD disk 2TB M.2 NVMe Gen4 Kingston KC3000", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:2tb"}}
+{"id": "g-ssd-08", "why": "ssd key", "listing": {"title": "SSD 1TB M.2", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:1tb"}}
+{"id": "g-ssd-09", "why": "ssd key", "listing": {"title": "Kingston NV2 250GB NVMe SSD", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:250gb"}}
+{"id": "g-ssd-10", "why": "ssd key", "listing": {"title": "Intel SSD D7-P5520 3.84TB NVMe", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:nvme:3.84tb"}}
+{"id": "g-ssd-11", "why": "ssd key", "listing": {"title": "Samsung 870 QVO 2TB SSD 2.5", "description": "", "price": 200}, "market": null, "expect": {"key": "ssd:sata:2tb"}}
+{"id": "g-ssd-12", "why": "ssd key", "listing": {"title": "Samsung T7 1TB USB external SSD", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-13", "why": "ssd key", "listing": {"title": "Przenośny dysk SSD 1TB USB-C", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-14", "why": "ssd key", "listing": {"title": "SSD 1TB", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-15", "why": "ssd key", "listing": {"title": "Dysk HDD 2TB 3.5", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-16", "why": "ssd key", "listing": {"title": "Laptop Lenovo 16GB DDR4 512GB SSD NVMe", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-17", "why": "ssd key", "listing": {"title": "NVMe 1TB / 2TB do wyboru", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-ssd-18", "why": "ssd key", "listing": {"title": "SSD NVMe SATA adapter 1TB", "description": "", "price": 200}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx4090-0", "why": "accessory alone", "listing": {"title": "Waterblock RTX 4090 EK", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx4090-1", "why": "accessory alone", "listing": {"title": "Backplate RTX 4090", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx4090-2", "why": "accessory alone", "listing": {"title": "Kabel 12VHPWR do RTX 4090", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx4090-3", "why": "accessory alone", "listing": {"title": "Riser RTX 4090", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx4090-4", "why": "accessory alone", "listing": {"title": "Cooler RTX 4090", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx3060ti-0", "why": "accessory alone", "listing": {"title": "Waterblock RTX 3060 Ti EK", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx3060ti-1", "why": "accessory alone", "listing": {"title": "Backplate RTX 3060 Ti", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx3060ti-2", "why": "accessory alone", "listing": {"title": "Kabel 12VHPWR do RTX 3060 Ti", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx3060ti-3", "why": "accessory alone", "listing": {"title": "Riser RTX 3060 Ti", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx3060ti-4", "why": "accessory alone", "listing": {"title": "Cooler RTX 3060 Ti", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx7900xtx-0", "why": "accessory alone", "listing": {"title": "Waterblock RX 7900 XTX EK", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx7900xtx-1", "why": "accessory alone", "listing": {"title": "Backplate RX 7900 XTX", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx7900xtx-2", "why": "accessory alone", "listing": {"title": "Kabel 12VHPWR do RX 7900 XTX", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx7900xtx-3", "why": "accessory alone", "listing": {"title": "Riser RX 7900 XTX", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx7900xtx-4", "why": "accessory alone", "listing": {"title": "Cooler RX 7900 XTX", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx5080-0", "why": "accessory alone", "listing": {"title": "Waterblock RTX 5080 EK", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx5080-1", "why": "accessory alone", "listing": {"title": "Backplate RTX 5080", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx5080-2", "why": "accessory alone", "listing": {"title": "Kabel 12VHPWR do RTX 5080", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx5080-3", "why": "accessory alone", "listing": {"title": "Riser RTX 5080", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rtx5080-4", "why": "accessory alone", "listing": {"title": "Cooler RTX 5080", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx9070xt-0", "why": "accessory alone", "listing": {"title": "Waterblock RX 9070 XT EK", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx9070xt-1", "why": "accessory alone", "listing": {"title": "Backplate RX 9070 XT", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx9070xt-2", "why": "accessory alone", "listing": {"title": "Kabel 12VHPWR do RX 9070 XT", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx9070xt-3", "why": "accessory alone", "listing": {"title": "Riser RX 9070 XT", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-acc-rx9070xt-4", "why": "accessory alone", "listing": {"title": "Cooler RX 9070 XT", "description": "", "price": 100}, "market": null, "expect": {"key": null}}
+{"id": "g-miss-4090fe", "why": "glued FE suffix", "listing": {"title": "RTX 4090FE 24GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090:24"}}
+{"id": "g-miss-3090fe", "why": "glued FE suffix", "listing": {"title": "RTX 3090FE 24GB", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3090:24"}}
+{"id": "g-miss-suprim", "why": "MSI Suprim line without RTX", "listing": {"title": "MSI 3090 Suprim X 24G", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-3090:24"}}
+{"id": "g-miss-tuf", "why": "Asus TUF without RTX", "listing": {"title": "Asus TUF 4090 OC", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090:24"}}
+{"id": "g-miss-strix", "why": "ROG Strix without RTX", "listing": {"title": "ROG Strix 4090 OC", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090:24"}}
+{"id": "g-miss-fe-first", "why": "Founders Edition first", "listing": {"title": "Founders Edition 4090", "description": "", "price": 1500}, "market": null, "expect": {"key": "gpu:rtx-4090:24"}}
+{"id": "g-miss-sn850x", "why": "SSD model without NVMe word", "listing": {"title": "WD Black SN850X 2TB", "description": "", "price": 1500}, "market": null, "expect": {"key": "ssd:nvme:2tb"}}
+{"id": "g-miss-die-pl", "why": "stripped die PL (bez rdzenia): never a card", "listing": {"title": "RTX 4090 bez rdzenia", "description": "", "price": 1500}, "market": null, "expect": {"key": null}}
+{"id": "g-miss-die-chip", "why": "stripped die PL (bez chipu)", "listing": {"title": "RTX 4090 bez chipu", "description": "", "price": 1500}, "market": null, "expect": {"key": null}}
+{"id": "g-miss-die-en", "why": "stripped die EN", "listing": {"title": "RTX 4090 no die", "description": "", "price": 1500}, "market": null, "expect": {"key": null}}
+{"id": "g-miss-pcb-only", "why": "PCB only", "listing": {"title": "RTX 4090 tylko PCB", "description": "", "price": 1500}, "market": null, "expect": {"key": null}}
+{"id": "g-econ-3090-deal-0", "why": "3090 under market", "listing": {"title": "RTX 3090 Gigabyte Gaming OC 24GB używana", "description": "", "price": 1800}, "market": {"key": "gpu:rtx-3090:24", "p25_pln": 3000, "median_pln": 3200, "p75_pln": 3400, "n_sold_effective": 15, "n_effective": 20}, "expect": {"max_tier": 3}}
+{"id": "g-econ-3090-deal-1", "why": "3090 under market", "listing": {"title": "RTX 3090 Gigabyte Gaming OC 24GB używana", "description": "", "price": 2000}, "market": {"key": "gpu:rtx-3090:24", "p25_pln": 3000, "median_pln": 3200, "p75_pln": 3400, "n_sold_effective": 15, "n_effective": 20}, "expect": {"max_tier": 3}}
+{"id": "g-econ-3090-deal-2", "why": "3090 under market", "listing": {"title": "RTX 3090 Gigabyte Gaming OC 24GB używana", "description": "", "price": 2200}, "market": {"key": "gpu:rtx-3090:24", "p25_pln": 3000, "median_pln": 3200, "p75_pln": 3400, "n_sold_effective": 15, "n_effective": 20}, "expect": {"max_tier": 3}}
+{"id": "g-econ-3090-fair-0", "why": "3090 at market", "listing": {"title": "RTX 3090 Gigabyte Gaming OC 24GB używana", "description": "", "price": 3100}, "market": {"key": "gpu:rtx-3090:24", "p25_pln": 3000, "median_pln": 3200, "p75_pln": 3400, "n_sold_effective": 15, "n_effective": 20}, "expect": {"min_tier": 4}}
+{"id": "g-econ-3090-fair-1", "why": "3090 at market", "listing": {"title": "RTX 3090 Gigabyte Gaming OC 24GB używana", "description": "", "price": 3300}, "market": {"key": "gpu:rtx-3090:24", "p25_pln": 3000, "median_pln": 3200, "p75_pln": 3400, "n_sold_effective": 15, "n_effective": 20}, "expect": {"min_tier": 4}}

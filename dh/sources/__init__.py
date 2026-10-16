@@ -64,6 +64,8 @@ def registry(cfg=None, root: Path | None = None) -> dict[str, Adapter]:
             entry = conf.get(name)
         if isinstance(entry, dict) and entry.get("enabled") is False:
             continue
+        if isinstance(entry, dict) and name == "mailbox" and entry.get("image_hosts"):
+            ad.image_hosts = {k: tuple(v) for k, v in entry["image_hosts"].items()}
         if isinstance(entry, dict) and name.startswith("bazos") and "pages" in entry:
             ad.pages = int(entry["pages"])
         out[name] = ad

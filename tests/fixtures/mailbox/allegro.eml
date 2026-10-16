@@ -1,3 +1,4 @@
+Authentication-Results: mx.example.invalid; dkim=pass header.d=allegro.pl header.s=sel; spf=pass smtp.mailfrom=bounce@allegro.pl; dmarc=pass
 From: Allegro <powiadomienia@allegro.pl>
 To: dh@example.invalid
 Subject: Nowe oferty dla Twojego zapisanego wyszukiwania: rtx 4090

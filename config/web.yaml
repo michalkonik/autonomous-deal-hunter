@@ -1,0 +1,5 @@
+# Local web page (dh/web/app.py), served by `dh start` (dh/runtime.py).
+host: 0.0.0.0
+port: 8711
+# allowed_hosts: Host names accepted on POST (default: this machine's hostname, its LAN IPs, localhost).
+# Add mDNS / Tailscale names in config/local/web.yaml, e.g. allowed_hosts: [rig.local, 100.64.0.5]

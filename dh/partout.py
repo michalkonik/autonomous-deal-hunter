@@ -7,11 +7,13 @@
    kinds the rules did not find. Without an LLM client only the rules run.
 2. Each component is valued with `valuation.estimate` (any condition, the part-out exit channel). Components without a
    comparable (CPUs have no comparable feed yet) add nothing and are listed as `unvalued:<key>` in the notes.
-3. Sum of per-part P25 / median / P75, minus the parting cost (12 %), minus the outbound shipping of every part but
-   the most expensive one (data/shipping.yaml outbound_pln by category: the net engine already charges one leg).
+3. Sum of per-part P25 / median / P75, minus the parting cost (12 %), minus the outbound shipping of every valued part
+   except the largest single leg (data/shipping.yaml outbound_pln by category; the net engine already charges one leg).
    The weakest part sets n_effective / n_sold / n_sold_effective, so confidence reflects the thinnest evidence.
-The result's notes carry `partout`, `part:<key>` per valued part and `parts:<n>`. `parts_of(est)` and `effort_hint(est)`
-read them back: effort is heavy from `heavy_parts` (3) valued parts.
+The result's notes carry `partout`, `part:<key>` per valued part, `unvalued:<key>` per detected part without a comparable,
+`parts:<detected>` and `valued:<n>`. `parts_of(est)` lists ALL detected parts (valued or not), `parts_detail(est)` adds the
+valued flag, and `effort_hint(est)` is heavy from `heavy_parts` (3) DETECTED parts: a part we cannot price is still a part to
+dismantle, ship and sell.
 """
 from __future__ import annotations
 
@@ -164,7 +166,7 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
         return None
     p25, p75 = max(p25, Decimal(0)), max(p75, med)
     dts = [e.days_to_sell for _, e in valued if e.days_to_sell is not None]
-    notes = ["partout", f"parts:{len(valued)}", f"extra_legs_pln:{q2(extra)}"]
+    notes = ["partout", f"parts:{len(valued) + len(unvalued)}", f"valued:{len(valued)}", f"extra_legs_pln:{q2(extra)}"]
     notes += [f"part:{c.key}" for c, _ in valued] + [f"unvalued:{c.key}" for c, _ in unvalued]
     notes += sorted({n for _, e in valued for n in e.notes})
     return valuation.ExitEstimate(
@@ -176,11 +178,18 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
         n_sold_effective=min(e.n_sold_effective for _, e in valued), notes=notes)
 
 
+def parts_detail(est: valuation.ExitEstimate | None) -> list[tuple[str, bool]]:
+    """(key, valued) for every detected part of a part-out estimate, valued ones first."""
+    notes = est.notes if est else []
+    return [(n[5:], True) for n in notes if n.startswith("part:")] + \
+           [(n[9:], False) for n in notes if n.startswith("unvalued:")]
+
+
 def parts_of(est: valuation.ExitEstimate | None) -> list[str]:
-    """Keys of the valued parts of a part-out estimate (feed them to `bundle_items` before `tiering.effort_class`)."""
-    return [n[5:] for n in (est.notes if est else []) if n.startswith("part:")]
+    """Keys of ALL detected parts, valued or not (feed them to `bundle_items` before `tiering.effort_class`)."""
+    return [k for k, _ in parts_detail(est)]
 
 
 def effort_hint(est: valuation.ExitEstimate | None) -> str | None:
-    """"heavy" from `heavy_parts` valued parts, else None (leave the effort to tiering.effort_class)."""
+    """"heavy" from `heavy_parts` detected parts, else None (leave the effort to tiering.effort_class)."""
     return "heavy" if est is not None and len(parts_of(est)) >= int(_params()["heavy_parts"]) else None

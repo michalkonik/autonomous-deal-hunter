@@ -6,8 +6,18 @@ detail page is ever fetched (only the e-mail data plus the link); Kleinanzeigen 
 robots.txt) is enriched through the polite Fetcher when one is passed. Failure to enrich never drops the listing.
 
 Credentials: `bw-secret dh-mail#imap` = JSON {"host","port","user","password","folder"}. Missing or malformed
--> the source is disabled and ONE health event is recorded. Mails are fetched with BODY.PEEK and flagged \\Seen only
-after they were parsed; mails from unknown senders are left untouched.
+-> the source is disabled and ONE health event is recorded.
+
+Trust: a mail is accepted only when the From domain is a known platform domain AND the receiving server's (topmost)
+Authentication-Results header shows dkim=pass for a domain of that platform (or spf=pass with a matching envelope
+domain). Otherwise it is skipped with the health event "unauthenticated_alert". Photos from mails are kept only when they
+are https URLs on the platform's image hosts (`IMAGE_HOSTS`, overridable with `adapters.mailbox.image_hosts`).
+
+Delivery contract (at-least-once): `poll()` fetches with BODY.PEEK and returns the listings; the mails are flagged \\Seen
+only when the caller calls `await mailbox.commit()` AFTER it persisted those listings. A crash in between re-delivers the
+mails next poll (upserts are idempotent). A known, authenticated mail that parses to zero offers raises the health event
+"alert_parse_empty" and is never committed (it stays unseen for inspection). Saved .eml files are removed by
+`mailbox.purge()` after 90 days.
 
 The alert formats here are built from each platform's typical structure (see tests/fixtures/mailbox/README.md,
 SYNTHETIC): re-check them against real mails once they exist.
@@ -21,6 +31,7 @@ import imaplib
 import json
 import logging
 import re
+import time
 from datetime import timezone
 from decimal import Decimal
 from email import policy
@@ -33,7 +44,7 @@ from urllib.parse import urlsplit
 from selectolax.lexbor import LexborHTMLParser
 
 from ..models import Listing
-from .base import Adapter, AdapterError, Query, filter_query, norm, now_utc, price_of
+from .base import Adapter, AdapterError, Query, filter_query, make_listing, norm, now_utc, price_of
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +53,48 @@ _AMOUNT = r"(?:\d{1,3}(?:[.\s\xa0 ]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?
 _CCY = r"(?:zł|zl|PLN|€|EUR|Kč|CZK|Ft|HUF|£|GBP|\$|USD)"
 _PRICE_AFTER = re.compile(rf"({_AMOUNT})\s*({_CCY})(?![A-Za-zł])", re.I)
 _PRICE_BEFORE = re.compile(rf"({_CCY})\s*({_AMOUNT})", re.I)
+
+
+#: image hosts (suffix match) a mail's photos may come from; https only
+IMAGE_HOSTS = {
+    "allegro": ("allegroimg.com",),
+    "olx": ("olxcdn.com",),
+    "kleinanzeigen": ("kleinanzeigen.de", "classistatic.de"),
+    "ebay": ("ebayimg.com",),
+}
+EML_RETENTION_DAYS = 90
+
+
+def host_allowed(url: str, hosts: tuple[str, ...]) -> bool:
+    s = urlsplit(url or "")
+    h = (s.hostname or "").lower()
+    return s.scheme == "https" and any(h == d or h.endswith("." + d) for d in hosts)
+
+
+_METHOD = re.compile(r"^\s*(dkim|spf|dmarc)\s*=\s*pass\b(.*)$", re.I | re.S)
+#: the ONE property per method that proves the platform sent the mail (header.i, smtp.helo etc. prove nothing)
+_PROOF = {"dkim": re.compile(r"header\.d\s*=\s*\"?([\w.-]+)", re.I),
+          "spf": re.compile(r"smtp\.mailfrom\s*=\s*\"?(?:[\w.+%=-]*@)?([\w.-]+)", re.I),
+          "dmarc": re.compile(r"header\.from\s*=\s*\"?([\w.-]+)", re.I)}
+
+
+def authenticated(msg, pf_name: str) -> bool:
+    """dkim=pass (header.d / header.i) or spf=pass (smtp.mailfrom) for a domain of the platform, taken from the
+    topmost Authentication-Results header (the one the receiving server added; lower ones may come from the sender).
+    Each `;`-separated result clause is judged on its own, by its method's proof property only: dkim -> header.d, spf ->
+    smtp.mailfrom (a HELO-only pass does not count), dmarc -> header.from. A platform domain in any other property does not count."""
+    hdrs = msg.get_all("Authentication-Results") or []
+    if not hdrs:
+        return False
+    domains = PLATFORMS[pf_name].domains
+    for clause in str(hdrs[0]).split(";")[1:]:  # the first token is the authserv-id
+        m = _METHOD.match(clause)
+        if not m:
+            continue
+        pm = _PROOF[m.group(1).lower()].search(m.group(2))
+        if pm and any(pm.group(1).lower() == x or pm.group(1).lower().endswith("." + x) for x in domains):
+            return True
+    return False
 
 
 class Platform:
@@ -106,15 +159,15 @@ def _container_text(a, title: str, sid_of: Callable[[str], str | None]) -> tuple
     return best.text(separator=" "), best
 
 
-def parse_message(msg: EmailMessage, pf_name: str) -> list[Listing]:
-    """Pure: one alert e-mail -> listings (price > 0, deduplicated by id)."""
+def parse_message(msg: EmailMessage, pf_name: str, image_hosts: dict | None = None) -> list[Listing]:
+    """Pure: one alert e-mail -> listings (price > 0, deduplicated by id). Photos only from the platform's image hosts."""
     pf = PLATFORMS[pf_name]
+    hosts = (image_hosts or IMAGE_HOSTS).get(pf_name, ())
     try:
         posted = parsedate_to_datetime(msg["Date"]).astimezone(timezone.utc) if msg["Date"] else None
     except (TypeError, ValueError):
         posted = None
     tree = LexborHTMLParser(_html_of(msg) or "<html></html>")
-    ad = _Maker()
 
     def clean(href: str) -> str:
         s = urlsplit(href.replace("&amp;", "&"))
@@ -158,36 +211,39 @@ def parse_message(msg: EmailMessage, pf_name: str) -> list[Listing]:
             country = pf.country
         img, probe = None, node
         for _ in range(3):  # the picture may sit in a sibling cell: widen while no other offer comes in
-            img = next((i.attributes.get("src") for i in probe.css("img") if i.attributes.get("src")), None)
+            img = next((i.attributes.get("src") for i in probe.css("img")
+                        if host_allowed(i.attributes.get("src") or "", hosts)), None)
             par = probe.parent
             if img or par is None or par.tag in ("body", "html", "-undef") or \
                     ({sid_of(x.attributes.get("href") or "") for x in par.css("a[href]")} - {None, sid}):
                 break
             probe = par
-        out.append(ad.make(source=src, source_id=sid, url=url, title=title, price=sf[0], currency=sf[1],
+        out.append(make_listing(source=src, source_id=sid, url=url, title=title, price=sf[0], currency=sf[1],
                            country=country, photos=[img] if img else [], posted_at=posted))
     return out
 
 
-class _Maker(Adapter):
-    name = "mailbox"
-
-
 class Mailbox(Adapter):
-    """Source "mailbox": `poll()` returns the listings of all unseen alert mails; `search()` is `poll()` with the
-    query's price bounds (the query text is irrelevant: the saved searches on the platforms define it)."""
+    """Source "mailbox": `poll()` returns the listings of all unseen, authenticated alert mails; after the caller persisted
+    them it calls `commit()`. `search()` is `poll()` with the query's price bounds (the query text is irrelevant: the saved
+    searches on the platforms define it)."""
     name = "mailbox"
     domain = "imap"
     via_mailbox = True
 
     def __init__(self, secret_fn: Callable[[str], str | None] | None = None, snapshot_dir: Path | str | None = None,
-                 imap_factory: Callable[[str, int], object] | None = None, store=None):
+                 imap_factory: Callable[[str, int], object] | None = None, store=None,
+                 image_hosts: dict | None = None):
         self._secret_fn = secret_fn
         self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else None
         self._factory = imap_factory or (lambda host, port: imaplib.IMAP4_SSL(host, port, timeout=30))
         self.store = store
+        self.image_hosts = dict(image_hosts) if image_hosts else None
         self._creds: dict | None | bool = False
         self._health_done = False
+        self._pending: list[bytes] = []  # IMAP UIDs delivered by the last poll, flagged \\Seen by commit()
+        self._flagged: set[tuple[str, str]] = set()  # (kind, message id) already reported: no health spam per poll
+        self._ka = None  # one Kleinanzeigen adapter for detail enrichment
 
     # ---------------------------------------------------------------- credentials
     def _resolve(self) -> dict | None:
@@ -216,51 +272,50 @@ class Mailbox(Adapter):
         if store is not None:
             store.add_health(self.name, kind, detail)
 
-    # ---------------------------------------------------------------- IMAP (blocking, run in a thread)
-    def _fetch_unseen(self, c: dict) -> list[tuple[bytes, Callable[[], None]]]:
-        """[(raw message, mark_seen callable)] for every UNSEEN mail of the folder."""
-        imap = self._factory(c["host"], c["port"])
-        try:
-            imap.login(c["user"], c["password"])
-            typ, _ = imap.select(c["folder"])
-            if typ != "OK":
-                raise AdapterError(f"mailbox: cannot select folder {c['folder']!r}")
-            typ, data = imap.search(None, "UNSEEN")
-            ids = data[0].split() if typ == "OK" and data and data[0] else []
-            out = []
-            for i in ids:
-                typ, parts = imap.fetch(i, "(BODY.PEEK[])")
-                if typ != "OK" or not parts:
-                    continue
-                raw = next((p[1] for p in parts if isinstance(p, tuple)), None)
-                if raw:
-                    out.append((raw, i))
-            # parse and mark outside the connection loop would need the connection: do both here
-            return self._handle(imap, out)
-        finally:
-            try:
-                imap.logout()
-            except Exception:  # noqa: BLE001 - best effort close
-                pass
+    def _report_once(self, mid: str, kind: str, detail: str, fetcher=None) -> None:
+        if (kind, mid) not in self._flagged:
+            self._flagged.add((kind, mid))
+            self._health(kind, detail, fetcher)
 
-    def _handle(self, imap, raws) -> list:
-        results = []
-        for raw, i in raws:
-            msg = email.message_from_bytes(raw, policy=policy.default)
-            pf = platform_of(msg["From"] or "")
-            if pf is None:
-                continue  # not an alert we know: leave it unseen and untouched
-            try:
-                ls = parse_message(msg, pf)
-            except Exception as e:  # noqa: BLE001 - one bad mail must not block the rest
-                log.warning("mailbox: cannot parse a %s mail: %s", pf, e)
-                continue
-            path = self._save_eml(raw)
-            for l in ls:
-                l.raw_path = path
-            imap.store(i, "+FLAGS", "\\Seen")
-            results.append((pf, ls))
-        return results
+    # ---------------------------------------------------------------- IMAP (blocking, run in a thread)
+    def _connect(self, c: dict):
+        imap = self._factory(c["host"], c["port"])
+        imap.login(c["user"], c["password"])
+        typ, _ = imap.select(c["folder"])
+        if typ != "OK":
+            raise AdapterError(f"mailbox: cannot select folder {c['folder']!r}")
+        return imap
+
+    @staticmethod
+    def _close(imap) -> None:
+        try:
+            imap.logout()
+        except Exception:  # noqa: BLE001 - best effort close
+            pass
+
+    def _fetch_unseen(self, c: dict) -> list[tuple[bytes, bytes]]:
+        """[(uid, raw message)] for every UNSEEN mail of the folder. Nothing is flagged here (BODY.PEEK)."""
+        imap = self._connect(c)
+        try:
+            typ, data = imap.uid("SEARCH", None, "UNSEEN")
+            uids = data[0].split() if typ == "OK" and data and data[0] else []
+            out = []
+            for u in uids:
+                typ, parts = imap.uid("FETCH", u, "(BODY.PEEK[])")
+                raw = next((p[1] for p in (parts or []) if isinstance(p, tuple)), None) if typ == "OK" else None
+                if raw:
+                    out.append((u, raw))
+            return out
+        finally:
+            self._close(imap)
+
+    def _mark_seen(self, c: dict, uids: list[bytes]) -> None:
+        imap = self._connect(c)
+        try:
+            for u in uids:
+                imap.uid("STORE", u, "+FLAGS", "\\Seen")
+        finally:
+            self._close(imap)
 
     def _save_eml(self, raw: bytes) -> str | None:
         if self.snapshot_dir is None:
@@ -272,34 +327,88 @@ class Mailbox(Adapter):
             p.write_bytes(raw)
         return str(p)
 
+    def purge(self, older_than_days: int = EML_RETENTION_DAYS, now: float | None = None) -> int:
+        """Delete saved .eml files older than `older_than_days` (by modification time); returns how many."""
+        if self.snapshot_dir is None:
+            return 0
+        d = self.snapshot_dir / "mail"
+        if not d.is_dir():
+            return 0
+        cutoff = (now if now is not None else time.time()) - older_than_days * 86400
+        n = 0
+        for f in d.glob("*.eml"):
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+                n += 1
+        return n
+
     # ---------------------------------------------------------------- public
     async def poll(self, fetcher=None) -> list[Listing]:
+        """Listings of the unseen alert mails. Call `await commit()` after persisting them (at-least-once delivery)."""
         c = self._resolve()
         if c is None:
             if not self._health_done:
                 self._health_done = True
                 self._health("no_credentials", f"alert mailbox disabled: no credentials (bw-secret {SECRET_REF})", fetcher)
             return []
+        self._pending = []
         try:
-            groups = await asyncio.to_thread(self._fetch_unseen, c)
+            mails = await asyncio.to_thread(self._fetch_unseen, c)
         except AdapterError:
             raise
         except (imaplib.IMAP4.error, OSError) as e:
             raise AdapterError(f"mailbox: IMAP error: {type(e).__name__}") from e
         found: dict[tuple[str, str], Listing] = {}
-        for pf, ls in groups:
+        for uid, raw in mails:
+            msg = email.message_from_bytes(raw, policy=policy.default)
+            mid = str(msg["Message-ID"] or hashlib.sha256(raw).hexdigest()[:16])
+            pf = platform_of(msg["From"] or "")
+            if pf is None:
+                continue  # not an alert we know: leave it unseen and untouched
+            if not authenticated(msg, pf):
+                self._report_once(mid, "unauthenticated_alert",
+                                  f"mail {mid[:60]} claims to be from {pf} but has no dkim/spf pass for it: skipped", fetcher)
+                continue
+            try:
+                ls = parse_message(msg, pf, self.image_hosts)
+            except Exception as e:  # noqa: BLE001 - one bad mail must not block the rest
+                log.warning("mailbox: cannot parse a %s mail: %s", pf, e)
+                self._report_once(mid, "alert_parse_empty", f"{pf} mail {mid[:60]}: parse error {type(e).__name__}", fetcher)
+                continue
+            if not ls:
+                self._report_once(mid, "alert_parse_empty",
+                                  f"{pf} mail {mid[:60]} parsed to no offers: left unseen (format changed?)", fetcher)
+                continue
+            path = self._save_eml(raw)
             for l in ls:
+                l.raw_path = path
                 if fetcher is not None and pf not in NO_FETCH:
                     l = await self._enrich(l, fetcher)
                 found.setdefault((l.source, l.source_id), l)
+            self._pending.append(uid)
         return list(found.values())
+
+    async def commit(self) -> int:
+        """Flag the mails of the last `poll()` as \\Seen. Call after the listings were persisted; returns how many."""
+        c = self._resolve()
+        uids, self._pending = self._pending, []
+        if c is None or not uids:
+            return 0
+        try:
+            await asyncio.to_thread(self._mark_seen, c, uids)
+        except (imaplib.IMAP4.error, OSError) as e:
+            self._pending = uids  # still undelivered: the next commit retries (and a re-poll re-delivers)
+            raise AdapterError(f"mailbox: IMAP error while committing: {type(e).__name__}") from e
+        return len(uids)
 
     async def _enrich(self, l: Listing, fetcher) -> Listing:
         if l.source != "kleinanzeigen":
             return l
-        from .kleinanzeigen import Kleinanzeigen
+        if self._ka is None:
+            from .kleinanzeigen import Kleinanzeigen
+            self._ka = Kleinanzeigen()
         try:
-            full = await Kleinanzeigen().detail(l, fetcher)
+            full = await self._ka.detail(l, fetcher)
         except AdapterError as e:
             log.info("mailbox: no detail for %s: %s", l.url, e)
             return l

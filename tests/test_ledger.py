@@ -372,6 +372,21 @@ def test_active_asks(store):
     assert ledger.active_asks(store, KEY, "used", h(9 + 24 * 4)) == []  # not seen for 4 days
 
 
+def test_bundles_and_uncertain_matches_are_never_comparables(store):
+    """Live round 2026-10-29: a 29 440 PLN sim-racing PC "... PC RTX 4080 Super" (rules key at certainty 0.5 with
+    bundle_items) became the only active ask of the GPU key and produced a fake +$3 197 deal."""
+    base = _market(store)
+    sweep(store, h(4), base[:3])
+    extract_all(store)
+    pc, lot = lid(store, base[0].source_id), lid(store, base[1].source_id)
+    store.save_extraction(pc, Extraction(key=KEY, category="gpu", certainty=0.5, condition="used",
+                                         bundle_items=["system"]))
+    store.save_extraction(lot, Extraction(key=KEY, category="gpu", certainty=0.95, condition="used",
+                                          bundle_items=["ram"]))
+    rows = ledger.active_asks(store, KEY, "used", h(5))
+    assert [r.listing_id for r in rows] == [lid(store, base[2].source_id), lid(store, base[3].source_id)]
+
+
 def test_watched_hours(store):
     sweep(store, h(0), [lst("a", "3000")])
     sweep(store, h(2), [lst("a", "3000")])

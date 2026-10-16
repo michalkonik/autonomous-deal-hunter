@@ -1,3 +1,4 @@
+Authentication-Results: mx.example.invalid; dkim=pass header.d=kleinanzeigen.de header.s=sel; spf=pass smtp.mailfrom=bounce@kleinanzeigen.de; dmarc=pass
 From: Kleinanzeigen <noreply@kleinanzeigen.de>
 To: dh@example.invalid
 Subject: Neue Anzeigen für Ihre Suche "rtx 4090"

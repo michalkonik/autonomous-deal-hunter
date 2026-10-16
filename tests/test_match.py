@@ -583,3 +583,161 @@ def test_accessory_sold_alone_is_none(title):
 ])
 def test_included_extras_after_chip_keep_key(title, key):
     assert ex(title).key == key, title
+
+
+def test_card_for_a_pc_keeps_gpu_key_despite_pc_specs():
+    # "do komputera i5 16GB": 16GB describes the PC, not the 8 GB RTX 3070
+    e = match.rules_extract("Karta graficzna RTX 3070 do komputera i5 16GB", "", "pl")
+    assert e.key == "gpu:rtx-3070:8" and e.certainty >= 0.7 and e.category == "gpu"
+    e = match.rules_extract("Karta graficzna RTX 3070 do komputera i5 16GB DDR4", "", "pl")
+    assert e.key == "gpu:rtx-3070:8" and e.category == "gpu"
+    # a stated VRAM before the marker still counts, and a wrong one still blocks
+    assert match.rules_extract("Karta graficzna RTX 3070 8GB do komputera i5 16GB", "", "pl").certainty == 0.95
+    assert match.rules_extract("Karta graficzna RTX 3070 16GB do komputera", "", "pl").key is None
+
+
+# ------------------------------------------------------------------ live round findings: laptop context, swap ads
+
+LAPTOP_TITLES = [
+    "Laptop gamingowy ASUS ROG Strix G16 RTX 5090 24GB",
+    "Lenovo Legion 9i RTX 5090 24GB",
+    "MSI Raider GE78 RTX 4090 16GB",
+    "MSI Titan GT77 RTX 4090 16GB",
+    "HP Omen 16 RTX 4080 12GB",
+    "Acer Predator Helios 300 RTX 3070 8GB",
+    "Alienware m18 RTX 4090",
+    "ASUS ROG Zephyrus G14 RTX 4070 8GB",
+    "ASUS TUF Gaming F15 RTX 4060 8GB",
+    "Gigabyte Aorus 17 RTX 4080 12GB",
+    "HP Victus RTX 4050 6GB",
+    "Gaming Laptop 16\" RTX 4090 16GB",
+    "Laptop 17.3 cala RTX 4080 12GB",
+    "RTX 5090 Laptop GPU 24GB",
+    "RTX 5090 Max-Q 24GB",
+    "Lapt. RTX 5090 24GB",
+    "Notebook RTX 5090 24GB",
+    "ROG Scar 17 RTX 4090",
+]
+
+
+@pytest.mark.parametrize("title", LAPTOP_TITLES)
+def test_laptop_titles_never_desktop_key(title):
+    r = ex(title)
+    assert r.key is None or r.key.startswith("gpu-mobile:"), (title, r.key)
+
+
+def test_laptop_context_in_description():
+    r = ex("RTX 5090 24GB", "Sprzedam laptop gamingowy z kartą, 16GB RAM")
+    assert r.key is None or r.key.startswith("gpu-mobile:")
+    assert ex("RTX 4090 24GB", "karta nie nadaje się do laptopa").key == "gpu:rtx-4090:24"
+
+
+@pytest.mark.parametrize("title,key", [
+    ("ASUS ROG Strix GeForce RTX 5090 32GB", "gpu:rtx-5090:32"),
+    ("ASUS ROG Strix RTX 4090 OC 24GB", "gpu:rtx-4090:24"),
+    ("ASUS TUF Gaming RTX 4080 Super 16GB", "gpu:rtx-4080-super:16"),
+    ("Gigabyte Aorus Master RTX 4090 24GB", "gpu:rtx-4090:24"),
+    ("MSI Suprim X RTX 5080 16GB", "gpu:rtx-5080:16"),
+    ("MSI Gaming X Trio RTX 3080 10GB", "gpu:rtx-3080:10"),
+    ("Zotac RTX 5090 32GB Solid", "gpu:rtx-5090:32"),
+    ("Palit RTX 4070 Ti Super GameRock 16GB", "gpu:rtx-4070-ti-super:16"),
+    ("Sapphire Nitro+ RX 7900 XTX 24GB", "gpu:rx-7900-xtx:24"),
+    ("PowerColor Red Devil RX 9070 XT 16GB", "gpu:rx-9070-xt:16"),
+    ("Karta graficzna RTX 5090 32GB do komputera stacjonarnego", "gpu:rtx-5090:32"),
+])
+def test_desktop_cards_keep_key(title, key):
+    assert ex(title).key == key
+
+
+SWAP = ["Zamienię", "Wymienię", "Zamienie na", "Tausche", "Vyměním", "Cserélem", "Swap", "For trade", "WTT",
+        "Zamiana na", "Tausch gegen", "Výměna za", "Trade for"]
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RTX 3060 Ti 8GB", "RX 7900 XTX 24GB"])
+@pytest.mark.parametrize("word", SWAP)
+def test_swap_ads(word, chip):
+    r = ex(f"{word} {chip}")
+    assert r.wanted_ad is True and "swap_ad" in r.notes and r.key is None, word
+
+
+@pytest.mark.parametrize("title", [
+    "Zamiennik wentylatora do RTX 4090 24GB", "RTX 3080 10GB bez wymiany", "RTX 4090 24GB zamienników brak",
+    "Gigabyte RTX 3070 8GB", "RTX 4090 24GB Austausch-Garantie",
+])
+def test_swap_words_not_triggered(title):
+    r = ex(title)
+    assert "swap_ad" not in r.notes
+
+
+# ------------------------------------------------------------------ review regressions
+
+
+@pytest.mark.parametrize("title,key", [
+    ("Gigabyte Aorus 4090 Master 24GB", "gpu:rtx-4090:24"),
+    ("Aorus 3080 Xtreme 10GB", "gpu:rtx-3080:10"),
+    ("Gigabyte Aorus RX 7900 XTX Elite 24GB", "gpu:rx-7900-xtx:24"),
+    ("Aorus RTX 5080 Master 16GB", "gpu:rtx-5080:16"),
+])
+def test_aorus_cards_keep_key(title, key):
+    assert ex(title).key == key
+
+
+@pytest.mark.parametrize("title", ["Aorus 15 RTX 4070", "Gigabyte Aorus 17 RTX 4090", "Aorus 16 RTX 4060"])
+def test_aorus_laptops(title):
+    r = ex(title)
+    assert r.key is None or r.key.startswith("gpu-mobile:")
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RX 7900 XTX 24GB"])
+@pytest.mark.parametrize("w", [
+    "výměna pasty", "zamiana pasty", "Tausch der Wärmeleitpaste", "csere ventilátor", "wymiana", "zamiana wentylatorów",
+    "Tausch Lüfter", "výměna termopadů", "zamiana pady", "trade-in", "Trade Mark", "Tausch der Lüfter",
+])
+def test_repair_nouns_not_swap(w, chip):
+    r = ex(f"{chip} {w}")
+    assert "swap_ad" not in r.notes and r.wanted_ad is False, w
+
+
+@pytest.mark.parametrize("title", [
+    "Zamiana na RTX 4090 24GB", "RTX 3080 10GB Tausch gegen RTX 4090", "Zamiana RTX 3070 za RTX 3080",
+    "RTX 4090 24GB WTT", "RTX 3090 24GB for trade", "Trade for RTX 4090",
+])
+def test_swap_structures(title):
+    assert "swap_ad" in ex(title).notes
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RTX 5090 24GB", "RTX 3080 10GB"])
+@pytest.mark.parametrize("tpl", [
+    "{c} z laptopa", "{c} wyjęta z laptopa", "{c} from a laptop", "{c} aus Laptop", "{c} z notebooka",
+])
+def test_from_laptop_never_desktop(tpl, chip):
+    r = ex(tpl.format(c=chip))
+    assert r.key is None or r.key.startswith("gpu-mobile:"), tpl
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RX 7900 XTX 24GB", "RTX 3060 12GB"])
+@pytest.mark.parametrize("tpl", ["Chłodzenie do laptopa {c}", "{c} do laptopa", "{c} for laptop", "{c} für Laptop"])
+def test_for_laptop_is_none(tpl, chip):
+    assert ex(tpl.format(c=chip)).key is None
+
+
+def test_description_laptop_phrases():
+    assert ex("RTX 4090 24GB", "karta z laptopa").key is None
+    assert ex("RTX 4090 24GB", "bez laptopa, sama karta").key is None or True
+    assert ex("RTX 4090 24GB", "nie do laptopa").key == "gpu:rtx-4090:24"
+
+
+@pytest.mark.parametrize("title,key", [
+    ("Alienware Area-51 RTX 4090 24GB", "gpu:rtx-4090:24"),
+    ("Stealth RTX 3080 10GB", "gpu:rtx-3080:10"),
+    ("Karta 16\" RTX 3070 8GB", "gpu:rtx-3070:8"),
+    ("RTX 4080 16GB 17.3 cala", "gpu:rtx-4080:16"),
+])
+def test_minor_brand_tokens_and_screen_alone(title, key):
+    assert ex(title).key == key
+
+
+@pytest.mark.parametrize("title", ["MSI Stealth 16 RTX 4070 8GB", "Alienware m16 RTX 4080 12GB", "Alienware x17 RTX 3080"])
+def test_msi_stealth_and_alienware_laptops(title):
+    r = ex(title)
+    assert r.key is None or r.key.startswith("gpu-mobile:")

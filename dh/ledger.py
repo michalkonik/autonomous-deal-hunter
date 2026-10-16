@@ -30,7 +30,8 @@ age → not counted), and last price ≤ median ask of the same key in the same 
 disappearance (one ask per listing; at least `min_asks` asks). Kind `probably_sold`, weight from
 config/valuation.yaml (0.5).
 Condition: the matcher leaves most classified titles at `unknown`; `unknown` is valued as `used`
-(`condition_filter`). Box-only, for-parts and wanted ads are never comparables.
+(`condition_filter`). Box-only, for-parts and wanted ads, bundles (whole PCs, lots) and matches with certainty
+< 0.7 are never comparables (`_SALEABLE`).
 
 Observations: one row on first sighting and one on every price change (first price + every cut), not one per sweep.
 """
@@ -301,8 +302,13 @@ def _continuous(t0: datetime, end: datetime, beats: list[datetime], max_gap: tim
 # ------------------------------------------------------------------ comps
 
 
+# A comparable is one unit of exactly the key: never a box, a part-out, a wanted ad, a bundle (a whole PC with
+# that GPU, a GPU + RAM lot: bundle_items non-empty) or an uncertain match (certainty below COMP_MIN_CERTAINTY).
+COMP_MIN_CERTAINTY = 0.7
 _SALEABLE = ("coalesce(e.box_only,0)=0 and coalesce(e.for_parts,0)=0 and coalesce(e.wanted_ad,0)=0 "
-             "and coalesce(e.condition,'') != 'for_parts'")
+             "and coalesce(e.condition,'') != 'for_parts' "
+             "and coalesce(e.bundle_items,'[]') in ('[]','') "
+             f"and coalesce(e.certainty,0) >= {COMP_MIN_CERTAINTY}")
 USED_LIKE = ("used", "unknown")  # a classified ad with no stated condition is valued as used
 
 

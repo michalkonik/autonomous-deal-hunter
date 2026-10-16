@@ -1,3 +1,4 @@
+Authentication-Results: mx.example.invalid; dkim=pass header.d=ebay.de header.s=sel; spf=pass smtp.mailfrom=bounce@ebay.de; dmarc=pass
 From: eBay <ebay@ebay.de>
 To: dh@example.invalid
 Subject: Neue Artikel für Ihre gespeicherte Suche: rtx 4090

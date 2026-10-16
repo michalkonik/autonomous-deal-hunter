@@ -85,13 +85,30 @@ def test_scope_missing_disables_with_one_health_event(store):
     assert health(store) == [("ebay_insights", "not_granted", "Marketplace Insights not granted")]
 
 
-def test_search_403_means_not_granted_once(store):
+def test_bad_credentials_is_its_own_health_kind(store):
+    rec = Rec(token=(401, json.dumps({"error": "invalid_client", "error_description": "client authentication failed"})))
+    ad = ei.EbayInsights(secret_fn=KEYS.get, client=client(rec), store=store)
+    assert run(ad.sold_comps(KEY)) == [] and not ad.enabled
+    assert [k for _, k, _ in health(store)] == ["bad_credentials"]
+    rec2 = Rec(token=(400, json.dumps({"error": "invalid_client"})))
+    s2 = ei.EbayInsights(secret_fn=KEYS.get, client=client(rec2), store=store)
+    assert run(s2.sold_comps(KEY)) == []
+    assert [k for _, k, _ in health(store)] == ["bad_credentials", "bad_credentials"]
+
+
+def test_search_refusal_is_not_a_scope_signal(store):
     rec = Rec(sales=(403, '{"errors":[{"errorId":1100}]}'))
     ad = ei.EbayInsights(secret_fn=KEYS.get, client=client(rec), store=store)
-    assert run(ad.sold_comps(KEY)) == []
-    assert run(ad.sold_comps(KEY)) == []
-    assert len(rec.calls) == 2 and not ad.enabled
-    assert [k for _, k, _ in health(store)].count("not_granted") == 1
+    with pytest.raises(AdapterError):
+        run(ad.sold_comps(KEY))
+    assert ad.enabled and "not_granted" not in [k for _, k, _ in health(store)]
+
+
+def test_search_401_drops_token_and_raises(store):
+    ad = ei.EbayInsights(secret_fn=KEYS.get, client=client(Rec(sales=(401, "{}"))), store=store)
+    with pytest.raises(AdapterError):
+        run(ad.sold_comps(KEY))
+    assert ad._token is None and ad.enabled
 
 
 def test_no_keys_disabled(store):

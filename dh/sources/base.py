@@ -244,6 +244,24 @@ def abs_url(base: str, href: str) -> str:
     return base.rstrip("/") + "/" + href.lstrip("/")
 
 
+def finish_listing(l: Listing) -> Listing:
+    """Redact contact data from free text before it is stored; remember that we did."""
+    l.title, t = redact(l.title)
+    l.description, d = redact(l.description)
+    l.contact_in_text = l.contact_in_text or t or d
+    return l
+
+
+def make_listing(**kw) -> Listing:
+    """Build a redacted Listing with the usual defaults; `source`, `country` and `currency` are required keywords
+    (adapters whose source varies per item, like the alert mailbox, use this instead of `Adapter.make`)."""
+    base = dict(description="", city=None, lat=None, lon=None, seller_hash=None, seller_age_days=None,
+                seller_ratings=None, seller_score=None, ships=None, pickup_only=False, is_business=None, photos=[],
+                posted_at=None, seen_at=now_utc())
+    base.update(kw)
+    return finish_listing(Listing(**base))
+
+
 class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
     name: str = ""
     domain: str = ""
@@ -307,11 +325,7 @@ class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
         return self.finish(self._parse_detail(listing, html))
 
     def finish(self, l: Listing) -> Listing:
-        """Redact contact data from free text before it is stored; remember that we did."""
-        l.title, t = redact(l.title)
-        l.description, d = redact(l.description)
-        l.contact_in_text = l.contact_in_text or t or d
-        return l
+        return finish_listing(l)
 
     async def detail(self, listing: Listing, fetcher) -> Listing:
         res = await self._get(fetcher, listing.url)
@@ -356,9 +370,4 @@ class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
         return True, price
 
     def make(self, **kw) -> Listing:
-        base = dict(source=self.name, country=self.country, currency=self.currency, description="", city=None,
-                    lat=None, lon=None, seller_hash=None, seller_age_days=None, seller_ratings=None,
-                    seller_score=None, ships=None, pickup_only=False, is_business=None, photos=[],
-                    posted_at=None, seen_at=now_utc())
-        base.update(kw)
-        return self.finish(Listing(**base))
+        return make_listing(**{"source": self.name, "country": self.country, "currency": self.currency, **kw})

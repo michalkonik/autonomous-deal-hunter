@@ -113,18 +113,31 @@ async def test_value_sums_parts_less_parting_and_extra_legs(store):
     # (2000 + 400 + 300) * 0.88 = 2376, minus the legs of the two cheaper parts (15 + 15)
     assert est.p25_pln == est.median_pln == est.p75_pln == Decimal("2346.00")
     assert est.key == "pc:bundle" and est.channel == "allegro" and est.condition is None
-    assert partout.parts_of(est) == ["gpu:rtx-4070:12", "ram:ddr5:32:1x32", "ssd:nvme:1tb"]
-    assert "unvalued:cpu:ryzen-7-5800x" in est.notes and "partout" in est.notes
+    # all DETECTED parts, valued first; the CPU has no comparable but still counts
+    assert partout.parts_of(est) == ["gpu:rtx-4070:12", "ram:ddr5:32:1x32", "ssd:nvme:1tb", "cpu:ryzen-7-5800x"]
+    assert partout.parts_detail(est) == [("gpu:rtx-4070:12", True), ("ram:ddr5:32:1x32", True),
+                                         ("ssd:nvme:1tb", True), ("cpu:ryzen-7-5800x", False)]
+    assert "unvalued:cpu:ryzen-7-5800x" in est.notes and "partout" in est.notes and "valued:3" in est.notes
     assert est.n_sold == 4 and est.n_effective == 4.0 and len(est.comps) == 12
-    assert partout.effort_hint(est) == "heavy"  # 3 valued parts
+    assert partout.effort_hint(est) == "heavy"
 
 
 async def test_two_parts_not_heavy_and_weakest_part_sets_evidence(store):
+    t = "Gaming PC RTX 4070 12GB 32GB DDR5"
     seed(store, "gpu:rtx-4070:12", "2000", n=6)
     seed(store, "ram:ddr5:32:1x32", "400", n=2)
-    est = await partout.value(lst(), rules_extract(TITLE, "", "pl"), store, DAY)
-    assert est.n_effective == 2.0 and partout.effort_hint(est) is None
+    est = await partout.value(lst(t), rules_extract(t, "", "pl"), store, DAY)
+    assert est.n_effective == 2.0 and partout.effort_hint(est) is None and len(partout.parts_of(est)) == 2
     assert est.median_pln == Decimal("2112.00") - Decimal("15")  # 2400 * 0.88 - one extra leg
+
+
+async def test_gpu_cpu_ram_is_heavy_even_with_the_cpu_unvalued(store):
+    t = "Gaming PC Ryzen 5 5600 RTX 4070 12GB 32GB DDR5"
+    seed(store, "gpu:rtx-4070:12", "2000")
+    seed(store, "ram:ddr5:32:1x32", "400")
+    est = await partout.value(lst(t), rules_extract(t, "", "pl"), store, DAY)
+    assert len(partout.parts_of(est)) == 3 and partout.effort_hint(est) == "heavy"
+    assert "valued:2" in est.notes and "parts:3" in est.notes
 
 
 async def test_none_without_comps_or_for_other_categories(store):
@@ -139,3 +152,45 @@ async def test_old_comps_are_ignored(store):
     for k, p in (("gpu:rtx-4070:12", "2000"), ("ssd:nvme:1tb", "300")):
         store.add_comp(k, "used", "allegro", Decimal(p), NOW - timedelta(days=60), "owner_sale", f"{k}:old")
     assert await partout.value(lst(), rules_extract(TITLE, "", "pl"), store, DAY) is None
+
+
+@pytest.mark.parametrize("title", ["Karta graficzna GeForce RTX 3060 12GB do gier PC", "RTX 4070 Gaming stacjonarna karta",
+                                   "RTX 3060 12GB Gaming Desktop GPU", "MSI RTX 4090 Gaming X Trio", "RTX 4080 Gaming PC"])
+def test_gpu_titles_keep_gpu_keys(title):
+    e = rules_extract(title, "", "pl")
+    assert e.category == "gpu" and e.key.startswith("gpu:")
+
+
+def test_pc_needs_noun_and_parts_or_opening_phrase():
+    for t in ("Komputer Ryzen 5 5600 RTX 3060 16GB", "Zestaw komputerowy i5-12400F 16GB DDR4", "Számítógép Ryzen 5 RTX 3060",
+              "Gaming PC RTX 3060"):
+        assert rules_extract(t, "", "pl").key == "pc:bundle", t
+    assert rules_extract("Zasilacz do Gaming PC 650W", "", "pl").key != "pc:bundle"
+    assert "psu" in rules_extract("Gaming PC Ryzen 5 5600 zasilacz 650W", "", "pl").bundle_items
+
+
+# ------------------------------------------------------------------ dedupe
+def test_dedupe_two_pcs_same_seller_not_duplicates_same_pc_is(tmp_path):
+    from datetime import timedelta
+    from dealfix import NOW as DNOW, make_deal
+    from dh import dedupe
+    st = Store(tmp_path / "d.db")
+
+    def pc(sid, title, price="4000", days=0):
+        d, _, _ = make_deal(st, price=price, seller="h1", sid=sid, key="pc:bundle",
+                            created=DNOW + timedelta(days=days))
+        st.conn.execute("update listings set title=? where id=?", (title, d.listing_ref))
+        st.conn.commit()
+        return d
+    a = pc("1", "Gaming PC Ryzen 7 5800X RTX 4070 12GB 32GB DDR5")
+    other = pc("2", "Gaming PC i5-12400F RTX 3060 12GB 16GB DDR4", price="4100", days=1)
+    relisted = pc("3", "Komputer gamingowy Ryzen 7 5800X RTX 4070 12GB 32GB DDR5 - OBNIZKA", price="3900", days=2)
+    assert dedupe.is_duplicate(st, a) is True, "its relisting is in the store"
+    assert dedupe.is_duplicate(st, other) is False, "different machine, same seller, similar price"
+    assert dedupe.is_duplicate(st, relisted) is True, "same machine relisted"
+    # components stored in the deal evidence win over the title
+    import json
+    ev = json.loads(relisted.evidence_json)
+    ev["components"] = ["gpu:rtx-3060:12"]
+    relisted.evidence_json = json.dumps(ev)
+    assert dedupe.is_duplicate(st, relisted) is False

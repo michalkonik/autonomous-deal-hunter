@@ -17,10 +17,15 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import replace
 from functools import lru_cache
+from pathlib import Path
 
 from . import taxonomy
 from .models import Extraction
+from .playbook_io import load_items
+
+_ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------------------- normalisation
 
@@ -138,9 +143,41 @@ _RAM_EVIDENCE = re.compile(r"(?<![a-z])ddr[\s-]?[345](?![0-9])|\d\s*(?:gb|go)\s*
 _SSD_EVIDENCE = re.compile(r"(?<![a-z])(?:ssd|nvme)(?![a-z])")
 
 _MOBILE_MARKER = re.compile(
-    r"(?<![a-z])(?:laptop\w*|notebook\w*|mobile|mobilni|max-?q|ntb|hordozhato\w*)(?![a-z])|"
-    r"(?<![a-z])(?:zephyrus|legion|helios|razer blade|raider|stealth|katana|cyborg|alienware m\d+|nitro 5|victus|loq)"
-    r"(?![a-z])")
+    r"(?<![a-z])(?:laptop\w*|lapt|notebook\w*|mobile|mobilni|max-?q|ntb|hordozhato\w*)(?![a-z])|"
+    # brand series that only exist as laptops ("ROG Strix" and "Legion Tower" alone are desktop products)
+    r"(?<![a-z])(?:zephyrus|helios|triton|razer blade|raider|katana|cyborg|victus|loq|nitro 5|"
+    r"strix[\s-]*(?:g\d{2,3}|scar\w*|flow)|rog[\s-]*(?:flow|scar)\w*|scar[\s-]*\d*|"
+    r"legion[\s-]*(?:slim|pro|\d)\w*|omen[\s-]*(?:1[5-7]|max|transcend)(?![\da-z])|omen by hp|"
+    r"predator[\s-]*(?:helios|triton|neo)|alienware[\s-]*[mx]\d+|"
+    r"msi[\s-]*(?:titan|vector|sword|stealth|raider|katana|cyborg|pulse|crosshair)|titan[\s-]*gt\d*|"
+    r"tuf[\s-]*(?:gaming[\s-]*)?[fa]\d{2}|tuf dash|aorus[\s-]*1[3-8](?!\d))(?![a-z])")
+# (a screen size alone is not laptop context: it needs one of the words/series above)
+# "do laptopa" / "for laptop" in a description means the card is for a laptop slot or a desktop: not laptop context
+_NOT_LAPTOP_PHRASE = re.compile(r"(?:nie\s+)?(?:do|for|fur|pro|not for|nie dla)\s+(?:laptop\w*|notebook\w*)")
+# in a TITLE "do laptopa"/"for laptop" = a part made for laptops (accessory rule): never a card key
+_FOR_LAPTOP = re.compile(r"(?<!nie )(?<![a-z])(?:do|for|fur|pro)\s+(?:laptop\w*|notebook\w*)")
+
+_SWAP_VERB = re.compile(
+    r"(?<![a-z])(?:zamienie|wymienie|tausche|vymenim|cserelem|swap|for trade|trade for|wtt)(?![a-z])")
+_SWAP_NOUN = re.compile(r"(?<![a-z])(?:zamiana|tausch|vymena|csere)(?![a-z])")
+_SWAP_PREP = {"na", "gegen", "za", "for", "fur"}
+_REPAIR = re.compile(r"past|pad|termopad|wentyl|fan|luft|lufter|ventil|warmeleit|thermal|chlodz|olej|oil")
+_PRODUCT = re.compile(r"rtx|rx|gtx|arc|geforce|radeon|nvidia|amd|karta|card|gpu|ssd|ram|ddr|nvme|\d{4}")
+
+
+def _swap_ad(t: str) -> bool:
+    """A swap verb, or a swap noun followed by na/gegen/za/for and a product within 4 tokens. "výměna pasty",
+    "Tausch der Wärmeleitpaste", "csere ventilátor" (repair nouns) and "trade-in" are not swap ads."""
+    if _SWAP_VERB.search(t) or re.search(r"(?<![a-z])zamienie\s+na(?![a-z])", t):
+        return True
+    for m in _SWAP_NOUN.finditer(t):
+        toks = t[m.end():].split()[:8]
+        if toks and _REPAIR.search(toks[0]) or (len(toks) > 1 and toks[0] in ("der", "des", "of") and _REPAIR.search(toks[1])):
+            continue
+        for i, tok in enumerate(toks[:4]):
+            if tok.strip(",;:.") in _SWAP_PREP and any(_PRODUCT.search(x) for x in toks[i + 1: i + 5]):
+                return True
+    return False
 
 # ---------------------------------------------------------------------------------------- not a product
 
@@ -189,7 +226,7 @@ _PREFIX = {
 }
 # after the model: no further suffix word may follow (so "4070" does not match "4070 Ti")
 _EXT = r"(?![\s-]*(?:ti|super|xtx|xt|gre|d)(?![a-z0-9]))"
-_GPU_CONTEXT = re.compile(r"pcie|sxm|hbm|(?<![a-z])(?:karta|karte|card|kartya)(?![a-z])|geforce|radeon|nvidia|tesla|quadro|(?<![a-z])amd(?![a-z])|(?<![a-z])gpu(?![a-z])|"
+_GPU_CONTEXT = re.compile(r"aorus|(?<![a-z])strix|suprim|pcie|sxm|hbm|(?<![a-z])(?:karta|karte|card|kartya)(?![a-z])|geforce|radeon|nvidia|tesla|quadro|(?<![a-z])amd(?![a-z])|(?<![a-z])gpu(?![a-z])|"
                           r"graphic|grafi[ck]|(?<![a-z])vga(?![a-z])|vram|(?<!l)gddr|videok|video\s?card")
 
 # comparison words directly before a chip (up to 2 words in between) or right after it
@@ -263,6 +300,11 @@ _NOT_VRAM_AFTER = re.compile(r"^\s*(?:ddr\d?|ram|ssd|hdd|nvme|dysk|pamiec)")
 _NOT_VRAM_BEFORE = re.compile(r"(?:ram|ddr\d?|ssd|nvme|hdd)\s*[:\-]?\s*$")
 
 
+# "for a PC" / "do komputera": whatever follows describes the computer the card fits, not the card
+_COMPAT_TAIL = re.compile(r"(?<![a-z])(?:do|for|fur|pro|na)\s+(?:komputer\w*|pc|computer|rechner|pocitac\w*|"
+                          r"szamitogep\w*|desktop\w*)(?![a-z0-9])")
+
+
 def _vram_candidates(t: str) -> list[int]:
     out = []
     for m in _GB.finditer(t):
@@ -272,13 +314,15 @@ def _vram_candidates(t: str) -> list[int]:
     return out
 
 
-def _gpu(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
+def _gpu(t: str, bundle: list[str], laptop_ctx: bool = False) -> tuple[str, str, float] | None:
     """(key, category, certainty), or None when no chip is named. A named but unresolvable chip returns key None."""
     if _VERSUS.search(t):
         return ("", "", 0.0) if (_gpu_hits(t, "gpu") or _gpu_hits(t, "gpu-mobile")) else None
     desktop, mobile = _gpu_hits(t, "gpu"), _gpu_hits(t, "gpu-mobile")
-    is_mobile = _MOBILE_MARKER.search(t) is not None or any(h[3] for h in mobile)
+    is_mobile = laptop_ctx or _MOBILE_MARKER.search(t) is not None or any(h[3] for h in mobile)
     cat, hits = ("gpu-mobile", mobile) if is_mobile else ("gpu", desktop)
+    if (desktop or mobile) and _FOR_LAPTOP.search(t):
+        return ("", "", 0.0)
     if not hits and not (desktop or mobile):
         return None
     kept = []
@@ -298,7 +342,7 @@ def _gpu(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
     if len(ids) != 1:
         return ("", "", 0.0)
     ent = kept[0]
-    cands = _vram_candidates(t)
+    cands = _vram_candidates(_COMPAT_TAIL.split(t, 1)[0])  # "... do komputera i5 16GB": the PC's specs, not VRAM
     valid = {v for v in cands if v in ent["vram"]}
     invalid = [v for v in cands if v not in ent["vram"]]
     if len(valid) > 1:
@@ -433,14 +477,16 @@ def _ssd(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
 
 # ---------------------------------------------------------------------------------------- whole PCs
 
-_PC_NOUN = r"(?:komputer\w*|pc|computer|rechner|pocitac\w*|desktop|stacjonarn\w*)"
-_PC_GAMING = r"(?:gamingow\w*|gaming|gamer|herni|do\s+gier|fur\s+gamer|zocker)"
+_PC_GAMING = r"(?:gamingow\w*|gaming|gamer|herni|zocker)"
+_PC_NOUN = r"(?:komputer|pc|computer|rechner|pocitac|szamitogep)"
 _PC_TITLE = re.compile(
     r"(?<!do\s)(?<!for\s)(?<!fur\s)(?<!pro\s)(?<!na\s)(?<![a-z0-9])"
-    r"(?:" + _PC_NOUN + r"[\s-]+" + _PC_GAMING + r"|" + _PC_GAMING + r"[\s-]*" + _PC_NOUN + r")(?![a-z0-9])")
+    r"(?:" + _PC_NOUN + r"[\s-]+" + _PC_GAMING + r"|" + _PC_GAMING + r"[\s-]*" + _PC_NOUN +
+    r"|zestaw\s+komputerow\w*|komputer|szamitogep)(?![a-z0-9])")
 _PC_ACCESSORY = re.compile(
     r"(?<![a-z])(?:case|gehause|obudow\w*|skrzyn\w*|chassis|tower|stolik|biurko|desk|fotel|krzeslo|chair|mysz|maus|"
-    r"mouse|klawiatur\w*|keyboard|monitor|zasilacz\w*|netzteil|kabel\w*|cooler|chlodzeni\w*|naklejk\w*)(?![a-z])")
+    r"mouse|klawiatur\w*|keyboard|monitor|kabel\w*|cooler|chlodzeni\w*|naklejk\w*)(?![a-z])")
+_PSU = re.compile(r"(?<![a-z])(?:psu|zasilacz\w*|netzteil)(?![a-z])")
 
 
 def _pc_parts(t: str) -> list[str]:
@@ -453,15 +499,24 @@ def _pc_parts(t: str) -> list[str]:
         parts.append("ram")
     if _SSD_EVIDENCE.search(t):
         parts.append("ssd")
+    if _PSU.search(t):
+        parts.append("psu")
     return parts
 
 
 def _pc(t: str) -> tuple[str, str, float, list[str]] | None:
-    """`pc:bundle` for a whole gaming PC title (certainty 0.5, the bundle cap); bundle_items = detected parts.
-    The key carries no price comparables of its own: `dh.partout` values the parts."""
-    if not _PC_TITLE.search(t) or _PC_ACCESSORY.search(t) or _VERSUS.search(t):
+    """`pc:bundle` for a whole-PC title, certainty 0.5 (the bundle cap); bundle_items = detected parts.
+    Needs a PC noun in a whole-product sense (not "do komputera", not "Desktop GPU") AND either a non-GPU part (CPU, RAM,
+    SSD, PSU) or the title opening with the PC phrase. A GPU title that merely mentions a PC keeps its GPU key.
+    The key carries no comparables of its own: `dh.partout` values the parts."""
+    m = _PC_TITLE.search(t)
+    if not m or _PC_ACCESSORY.search(t) or _VERSUS.search(t):
         return None
-    return "pc:bundle", "pc", 0.5, _pc_parts(t) or ["system"]
+    parts = _pc_parts(t)
+    opens = t[:m.start()].strip() == ""
+    if not opens and not [p for p in parts if p != "gpu"]:
+        return None
+    return "pc:bundle", "pc", 0.5, parts or ["system"]
 
 
 # ---------------------------------------------------------------------------------------- public API
@@ -501,11 +556,58 @@ def _condition(title_n: str, for_parts: bool) -> str:
     return "unknown"
 
 
-def rules_extract(title: str, description: str, lang: str) -> Extraction:
-    """Extract a canonical product key and flags from a listing. See the module docstring for the rules."""
+# ---------------------------------------------------------------------------------------- playbook aliases
+
+_ALIAS_CACHE: dict[Path, tuple[int, list[tuple[str, re.Pattern, str]]]] = {}
+
+
+def _aliases(root: Path | None) -> list[tuple[str, re.Pattern, str]]:
+    """(id, pattern, replacement) of the playbook's alias items (kind alias, target match, value 'from => to'),
+    cached per items.yaml mtime. A malformed alias is skipped (the improvement gates never let one in)."""
+    p = Path(root if root is not None else _ROOT) / "playbook" / "items.yaml"
+    mtime = p.stat().st_mtime_ns if p.is_file() else -1
+    hit = _ALIAS_CACHE.get(p)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    out = []
+    for it in load_items(p.parent.parent) if mtime != -1 else []:
+        if it["kind"] != "alias" or it["target"] != "match" or str(it["value"]).count("=>") != 1:
+            continue
+        a, b = (" ".join(x.lower().split()) for x in str(it["value"]).split("=>"))
+        if a and b and a != b:
+            rx = re.compile(r"(?<![a-z0-9])" + r"\s+".join(re.escape(w) for w in a.split()) + r"(?![a-z0-9])", re.I)
+            out.append((it["id"], rx, b))
+    _ALIAS_CACHE[p] = (mtime, out)
+    return out
+
+
+def apply_aliases(title: str, root: Path | None = None) -> tuple[str, list[str]]:
+    """The title with every playbook alias rewritten (whole words, case-insensitive), and the alias ids used."""
+    used = []
+    for iid, rx, repl in _aliases(root):
+        new = rx.sub(repl, title or "")
+        if new != title:
+            used.append(iid)
+            title = new
+    return title, used
+
+
+def rules_extract(title: str, description: str, lang: str, *, root: Path | None = None) -> Extraction:
+    """Extract a canonical product key and flags from a listing. See the module docstring for the rules.
+
+    Playbook alias items (`root`/playbook/items.yaml, default the repository) rewrite the title first; the ids of
+    the aliases used are added to `notes` as `alias:<id>`."""
+    title, used = apply_aliases(title, root)
+    ex = _rules_extract(title, description, lang)
+    return replace(ex, notes=[*ex.notes, *(f"alias:{i}" for i in used)]) if used else ex
+
+
+def _rules_extract(title: str, description: str, lang: str) -> Extraction:
     t = norm(title)
     full = t + " \n " + norm(description)
     wanted, box_only, for_parts, defects = _flags(t, full, title)
+    swap = _swap_ad(t)  # exchange ads are hard-excluded like wanted ads (notes carry "swap_ad")
+    wanted = wanted or swap
     condition = _condition(t, for_parts)
 
     gpu_bundle: list[str] = []  # other products named in a GPU title: it is a PC/bundle, not a card
@@ -524,11 +626,12 @@ def rules_extract(title: str, description: str, lang: str) -> Extraction:
         if pc:
             return Extraction(key=pc[0], category=pc[1], certainty=pc[2], condition=condition, defects=defects,
                               box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=pc[3],
-                              method="rules")
+                              method="rules", notes=["swap_ad"] if swap else [])
 
     result: tuple[str, str, float] | None = None
     if not (wanted or box_only or _MERCH.search(t)):
-        result = _gpu(t, gpu_bundle)
+        laptop_ctx = _MOBILE_MARKER.search(_NOT_LAPTOP_PHRASE.sub(" ", norm(description))) is not None
+        result = _gpu(t, gpu_bundle, laptop_ctx)
         if result is None:
             result = _ram(t, other_bundle) or _ssd(t, other_bundle)
             if result and result[0]:
@@ -539,4 +642,5 @@ def rules_extract(title: str, description: str, lang: str) -> Extraction:
     items = gpu_bundle if (key and cat in taxonomy.GPU_CATEGORIES) else other_bundle
     return Extraction(
         key=key, category=cat, certainty=cert, condition=condition, defects=defects,
-        box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=sorted(set(items)), method="rules")
+        box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=sorted(set(items)), method="rules",
+        notes=["swap_ad"] if swap else [])

@@ -2,12 +2,12 @@
 the scope `https://api.ebay.com/oauth/api_scope/buy.marketplace.insights`.
 
 `EbayInsights.sold_comps(key)` returns `ebay_sold` CompRows (ingest with `valuation.ingest_comps`). Without keys, or
-when eBay does not grant the scope (the token request answers 400 invalid_scope, or the search answers 403/401),
-the source disables itself for the session and records ONE health event ("Marketplace Insights not granted").
+when eBay does not grant the scope (the token request answers 400 invalid_scope), the source disables itself for the session and records ONE
+health event ("Marketplace Insights not granted", kind not_granted). Wrong keys (invalid_client / 401 on the token
+request) disable it with kind bad_credentials. Refusals (403/429) of the search are not a scope signal.
 
 It shares the per-host ApiClient of dh.sources.ebay (`api_client_for("api.ebay.com")`): common pacing and backoff.
-A refused (403) search counts once as a refusal on that shared client; the insights source then stays disabled, so
-it can never pile up further refusals against the Browse adapter.
+A refused search counts on that shared client like any other refusal.
 """
 from __future__ import annotations
 
@@ -81,8 +81,12 @@ class EbayInsights:
         if status == 200 and j.get("access_token"):
             self._token = (j["access_token"], time.time() + float(j.get("expires_in", 7200)))
             return self._token[0]
-        if status in (400, 401, 403) or j.get("error") in ("invalid_scope", "invalid_client"):
+        err = j.get("error")
+        if err == "invalid_scope":  # the keys are fine, eBay has not granted the insights scope
             self._disable("not_granted", NOT_GRANTED)
+            return None
+        if err == "invalid_client" or status == 401:  # wrong keys: a different problem, a different health kind
+            self._disable("bad_credentials", "eBay rejected the client credentials (invalid_client): Marketplace Insights disabled")
             return None
         raise AdapterError(f"ebay_insights: token request failed (status {status})")
 
@@ -95,18 +99,13 @@ class EbayInsights:
         if tok is None:
             return []
         q = urlencode({"q": ebay.query_for_key(key), "limit": self.limit})
-        try:
-            status, text = await self.client.call("GET", f"{SALES_URL}?{q}", {
-                "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
-        except AdapterError as e:
-            if "refused (403)" in str(e):
-                self._disable("not_granted", NOT_GRANTED, fetcher)
-                return []
-            raise
-        if status in (401, 403):
+        # A refusal (403/429) is raised by the shared ApiClient, which backs off for everyone: not treated as "scope
+        # missing" (the token request is the scope gate). It propagates as AdapterError.
+        status, text = await self.client.call("GET", f"{SALES_URL}?{q}", {
+            "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
+        if status == 401:
             self._token = None
-            self._disable("not_granted", NOT_GRANTED, fetcher)
-            return []
+            raise AdapterError("ebay_insights: token rejected")
         if status != 200:
             raise AdapterError(f"ebay_insights: search status {status}")
         return parse_sales(text, key, self)

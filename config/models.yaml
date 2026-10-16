@@ -7,3 +7,5 @@ paid_api: {enabled: false}
 min_free_ram_gb: 12
 timeouts: {connect_s: 5, read_s: 60}
 breaker: {failures: 3, cooldown_s: 120}
+worker: {parallel: 4}   # LLM worker slots used by the round scheduler (gemma pool serves 4 in parallel)
+llama_swap_url: http://localhost:8080   # llama-swap control API (/running, /unload) for dh start/stop

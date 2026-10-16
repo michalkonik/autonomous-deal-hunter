@@ -1,0 +1,15 @@
+# Round scheduler (dh/scheduler.py). Owner-tunable; not part of the frozen layer.
+round_interval_s: 600          # start-to-start pacing of rounds while `dh start` runs
+budget: 60                     # searches per round chosen by the bandit (sentinel and feed arms come on top)
+budget_max: 120                # the budget grows by budget_boost after a round where the LLM queue never waited
+budget_boost: 1.5
+max_searches_per_source: 12    # per source per round (sources run in parallel, each paced per domain)
+max_llm_items: 200             # listings sent to the worker LLM per round; the rest wait for the next round
+alive_confirm_per_source: 5    # newly disappeared listings re-checked with alive() per source per round
+reeval_hours: 24               # an unchanged listing is re-valued at most this often (comps move)
+round_timeout_s: 1500          # a round is cut (and its unfinished work dropped) after this
+ebay_comp_keys: 10             # keys per round whose eBay active asks are ingested as comps (only with eBay keys)
+price_range: [0.15, 3.0]       # cheap filter: a keyed price outside this x the key's median known price is dropped
+min_prices_for_range: 3        # ...only when at least this many prices of the key are known
+feed_sources: [pepper_pl, hotukdeals, retail]   # one query-less sweep per round; never ledger-swept
+min_estimate_comps: 3             # an exit estimate needs at least this many comparables (one stray ask is no price)

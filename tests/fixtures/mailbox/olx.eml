@@ -1,3 +1,4 @@
+Authentication-Results: mx.example.invalid; dkim=pass header.d=olx.pl header.s=sel; spf=pass smtp.mailfrom=bounce@olx.pl; dmarc=pass
 From: OLX.pl <obserwowane@olx.pl>
 To: dh@example.invalid
 Subject: 2 nowe ogłoszenia: rtx 4090

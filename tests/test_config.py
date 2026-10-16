@@ -60,9 +60,10 @@ def test_frozen_detects_new_frozen_file(root):
 
 def test_cli_lists_subcommands(capsys):
     for c in COMMANDS:
-        assert build_parser().parse_args([c]).command == c
+        argv = [c, "1"] if c in ("show", "verify") else [c]
+        assert build_parser().parse_args(argv).command == c
     from dh.cli import main
-    assert main(["status"]) == 0
+    assert main(["replay"]) == 0  # later milestone: still a stub
     assert "not implemented" in capsys.readouterr().out
 
 

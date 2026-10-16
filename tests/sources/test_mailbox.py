@@ -29,6 +29,8 @@ def parse(name: str):
 
 
 class FakeImap:
+    """UID-based fake: `seen` collects the UIDs flagged \\Seen (by STORE)."""
+
     def __init__(self, mails: dict[bytes, bytes]):
         self.mails, self.seen, self.ops = mails, [], []
 
@@ -40,18 +42,18 @@ class FakeImap:
         self.ops.append(("select", folder))
         return "OK", [b"1"]
 
-    def search(self, charset, crit):
-        assert crit == "UNSEEN"
-        return "OK", [b" ".join(sorted(self.mails))]
-
-    def fetch(self, i, what):
-        assert "PEEK" in what  # fetching must not set \Seen by itself
-        return "OK", [(b"1 (BODY[] {1}", self.mails[i]), b")"]
-
-    def store(self, i, op, flag):
-        assert (op, flag) == ("+FLAGS", "\\Seen")
-        self.seen.append(i)
-        return "OK", []
+    def uid(self, cmd, *a):
+        if cmd == "SEARCH":
+            assert a == (None, "UNSEEN")
+            return "OK", [b" ".join(sorted(u for u in self.mails if u not in self.seen))]
+        if cmd == "FETCH":
+            assert "PEEK" in a[1]  # fetching must not set \\Seen by itself
+            return "OK", [(b"1 (BODY[] {1}", self.mails[a[0]]), b")"]
+        if cmd == "STORE":
+            assert a[1:] == ("+FLAGS", "\\Seen")
+            self.seen.append(a[0])
+            return "OK", []
+        raise AssertionError(cmd)
 
     def logout(self):
         return "BYE", []
@@ -119,7 +121,10 @@ def test_poll_marks_seen_saves_eml_and_skips_unknown(tmp_path):
     box, imap = make_box(tmp_path, mails)
     ls = run(box.poll())
     assert len(ls) == 4 and {l.source for l in ls} == {"allegro", "olx"}
+    assert imap.seen == [], "poll alone flags nothing: delivery is acknowledged by commit()"
+    assert run(box.commit()) == 2
     assert sorted(imap.seen) == [b"1", b"2"], "unknown sender stays unseen"
+    assert run(box.commit()) == 0
     for l in ls:
         assert l.raw_path and l.raw_path.endswith(".eml") and (tmp_path / "snap" / "mail").exists()
         assert open(l.raw_path, "rb").read() in (mails[b"1"], mails[b"2"])
@@ -173,3 +178,123 @@ def test_search_applies_price_bounds_and_alive_unsupported(tmp_path):
 
 def test_registry_has_mailbox_disabled_by_default():
     assert "mailbox" not in registry()
+
+
+# ------------------------------------------------------------------ review round 1
+def test_spoofed_from_and_missing_auth_are_skipped_with_health(tmp_path, store):
+    good = eml("olx.eml")
+    no_auth = b"\n".join(l for l in good.split(b"\n") if not l.startswith(b"Authentication-Results"))
+    spoof = good.replace(b"dkim=pass header.d=olx.pl", b"dkim=pass header.d=olx.pl.evil.example") \
+                .replace(b"smtp.mailfrom=bounce@olx.pl", b"smtp.mailfrom=bounce@evil.example")
+    dkim_fail = good.replace(b"dkim=pass", b"dkim=fail").replace(b"spf=pass", b"spf=none")
+    other_dom = good.replace(b"header.d=olx.pl", b"header.d=allegro.pl").replace(b"smtp.mailfrom=bounce@olx.pl", b"smtp.mailfrom=bounce@allegro.pl")
+    mails = {b"1": no_auth, b"2": spoof, b"3": dkim_fail, b"4": other_dom}
+    mails = {u: m.replace(b"olx-1@olx.pl", b"olx-%s@olx.pl" % u) for u, m in mails.items()}
+    box, imap = make_box(tmp_path, mails, store=store)
+    assert run(box.poll()) == [] and run(box.commit()) == 0
+    kinds = [r[0] for r in store.conn.execute("select kind from health")]
+    assert kinds.count("unauthenticated_alert") == 4 and imap.seen == []
+    run(box.poll())  # the same mails again: no health spam
+    assert [r[0] for r in store.conn.execute("select kind from health")].count("unauthenticated_alert") == 4
+
+
+def test_spf_pass_alone_with_matching_envelope_is_accepted(tmp_path):
+    raw = eml("olx.eml").replace(b"dkim=pass header.d=olx.pl header.s=sel; ", b"")
+    box, _ = make_box(tmp_path, {b"1": raw})
+    assert len(run(box.poll())) == 2
+
+
+def test_only_topmost_auth_header_counts(tmp_path):
+    good = eml("olx.eml")
+    forged = b"Authentication-Results: x; dkim=pass header.d=olx.pl\n"
+    bad_top = good.replace(b"dkim=pass", b"dkim=fail").replace(b"spf=pass", b"spf=fail")
+    box, _ = make_box(tmp_path, {b"1": bad_top + b""})
+    assert run(box.poll()) == []
+    # a sender-forged header BELOW the receiving server's failing one does not rescue the mail
+    raw = bad_top.replace(b"From:", forged + b"From:", 1)
+    box2, _ = make_box(tmp_path, {b"1": raw})
+    assert run(box2.poll()) == []
+
+
+def test_photos_only_from_platform_image_hosts(tmp_path):
+    raw = eml("allegro.eml")
+    ok = run(make_box(tmp_path, {b"1": raw})[0].poll())
+    assert [l.photos for l in ok if l.source_id == "12345678901"] == [["https://a.allegroimg.com/s180/aa.jpg"]]
+    evil = raw.replace(b"https://a.allegroimg.com/s180/aa.jpg", b"https://tracker.evil.example/p.gif?u=1")
+    assert [l.photos for l in run(make_box(tmp_path, {b"1": evil})[0].poll())] == [[], []]
+    http = raw.replace(b"https://a.allegroimg.com", b"http://a.allegroimg.com")
+    assert all(l.photos == [] for l in run(make_box(tmp_path, {b"1": http})[0].poll()))
+    lookalike = raw.replace(b"https://a.allegroimg.com", b"https://allegroimg.com.evil.example")
+    assert all(l.photos == [] for l in run(make_box(tmp_path, {b"1": lookalike})[0].poll()))
+
+
+def test_parse_empty_mail_is_reported_and_left_unseen(tmp_path, store):
+    empty = eml("olx.eml").split(b"<html>")[0] + b"<html><body><p>Willkommen! Bestaetigen Sie Ihre Suche.</p></body></html>\n"
+    box, imap = make_box(tmp_path, {b"1": empty, b"2": eml("allegro.eml")}, store=store)
+    ls = run(box.poll())
+    assert len(ls) == 2 and run(box.commit()) == 1 and imap.seen == [b"2"]
+    assert [r[0] for r in store.conn.execute("select kind from health")] == ["alert_parse_empty"]
+    run(box.poll())
+    assert [r[0] for r in store.conn.execute("select kind from health")] == ["alert_parse_empty"]  # reported once
+
+
+def test_crash_before_commit_redelivers(tmp_path):
+    box, imap = make_box(tmp_path, {b"1": eml("allegro.eml")})
+    assert len(run(box.poll())) == 2
+    box2 = mb.Mailbox(secret_fn=lambda r: CREDS, imap_factory=lambda h, p: imap)  # "restart": nothing was committed
+    assert len(run(box2.poll())) == 2
+    run(box2.commit())
+    assert run(box2.poll()) == []
+
+
+def test_eml_purge_after_90_days(tmp_path):
+    import os
+    box, _ = make_box(tmp_path, {b"1": eml("allegro.eml"), b"2": eml("olx.eml")})
+    run(box.poll())
+    files = sorted((tmp_path / "snap" / "mail").glob("*.eml"))
+    assert len(files) == 2
+    old = files[0].stat().st_mtime - 91 * 86400
+    os.utime(files[0], (old, old))
+    assert box.purge(90) == 1 and len(list((tmp_path / "snap" / "mail").glob("*.eml"))) == 1
+    assert box.purge(90) == 0
+
+
+def test_registry_image_hosts_override():
+    from dh.config import Config
+    reg = registry(Config({"sources": {"adapters": {"mailbox": {"enabled": True, "image_hosts": {"olx": ["cdn.example"]}}}}}))
+    assert reg["mailbox"].image_hosts == {"olx": ("cdn.example",)}
+
+
+# ------------------------------------------------------------------ review round 2: per-clause Authentication-Results
+def _auth(clauses: str):
+    msg = email.message_from_bytes(b"From: Allegro <a@allegro.pl>\nAuthentication-Results: mx.example.invalid; " +
+                                   clauses.encode() + b"\n\nx", policy=policy.default)
+    return mb.authenticated(msg, "allegro")
+
+
+@pytest.mark.parametrize("clauses", [
+    "dkim=pass header.d=allegro.pl header.s=s1",
+    "dkim=pass header.d=mail.allegro.pl",
+    "spf=pass smtp.mailfrom=bounce@allegro.pl",
+    "spf=pass smtp.mailfrom=bounce@mail.allegro.pl smtp.helo=mx.other.example",
+    "dkim=fail header.d=allegro.pl; dkim=pass header.d=allegro.pl",
+    "dmarc=pass header.from=allegro.pl",
+])
+def test_auth_valid_cases(clauses):
+    assert _auth(clauses) is True
+
+
+@pytest.mark.parametrize("clauses", [
+    "dkim=pass header.d=evil.com header.i=@allegro.pl",       # header.i names the platform, the signing domain does not
+    "spf=pass smtp.helo=allegro.pl",                          # HELO-only SPF proves nothing
+    "spf=pass smtp.mailfrom=bounce@evil.com smtp.helo=allegro.pl",
+    "dkim=pass header.d=allegro.pl.evil.example",
+    "dkim=pass header.d=notallegro.pl",
+    "dkim=fail header.d=allegro.pl; spf=softfail smtp.mailfrom=a@allegro.pl",
+    "dkim=pass header.d=evil.com; dmarc=fail header.from=allegro.pl",
+    "dmarc=pass header.from=evil.com",
+    "dkim=pass header.b=allegro.pl",
+    "",
+])
+def test_auth_rejected_cases(clauses):
+    assert _auth(clauses) is False
