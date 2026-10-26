@@ -194,3 +194,23 @@ def test_warm_models_one_request_per_role_model_never_raises():
     out = asyncio.run(runtime.warm_models(cfg(), post=post))
     assert sorted(seen) == sorted(ROLES)  # advisor = senior: one request per distinct model
     assert out[ROLES[0]] == "ok" and out[ROLES[1]].startswith("OSError")
+
+
+def test_start_refuses_while_a_foreground_round_runs(tmp_path):
+    import os
+    (tmp_path / "var" / "run").mkdir(parents=True)
+    runtime.round_pid_path(tmp_path).write_text(str(os.getpid()))  # a live pid
+    sysrun, out = Sys(), io.StringIO()
+    rc = runtime.start(cfg(), tmp_path, run=sysrun, http_get=Swap([]), meminfo=meminfo(tmp_path, 30), out=out)
+    assert rc == 1 and "foreground `dh round`" in out.getvalue()
+    assert not any(c[0] == "systemd-run" for c in sysrun.calls)
+    runtime.round_pid_path(tmp_path).write_text("999999999")  # stale pid file: ignored
+    assert runtime.round_running(tmp_path) is None
+
+
+def test_context_checks_llama_swap_for_foreign_models(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime, "llama_running", lambda c, http_get=None: ["qwen3.6-35b-a3b", ROLES[0]])
+    st = Store(tmp_path / "t.db")
+    ctx = runtime.build_context(cfg(), tmp_path, st, fetcher=None)
+    assert asyncio.run(ctx.llm_check()) == ["qwen3.6-35b-a3b"]
+    asyncio.run(ctx.llm.aclose())

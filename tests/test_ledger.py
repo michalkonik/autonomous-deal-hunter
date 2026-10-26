@@ -397,6 +397,23 @@ def test_watched_hours(store):
     assert ledger.watched_hours(store, "kleinanzeigen") == 0.0
 
 
+def test_watched_hours_is_the_union_of_windows_across_sources(store):
+    """Three sources watched over the same two hours are two watched hours, not six (status, books, web and the
+    improvement loop's clock all show the same number)."""
+    from dh.improve import monitor
+    t0 = h(0)
+    for src in ("olx", "bazos", "kleinanzeigen"):
+        w = ledger.open_window(store, src, t0)
+        store.close_window(w, t0 + timedelta(hours=2))
+    w = ledger.open_window(store, "olx", t0 + timedelta(hours=5))
+    store.close_window(w, t0 + timedelta(hours=6))
+    assert ledger.watched_hours(store) == pytest.approx(3.0)
+    assert ledger.watched_hours(store, "olx") == pytest.approx(3.0)
+    assert ledger.watched_hours(store, "bazos") == pytest.approx(2.0)
+    assert ledger.watched_hours(store, until=t0 + timedelta(hours=1)) == pytest.approx(1.0)
+    assert monitor.watched_hours(store) == ledger.watched_hours(store)
+
+
 def test_unknown_condition_is_valued_as_used(store):
     base = _market(store)
     new = lst("new", "3100")

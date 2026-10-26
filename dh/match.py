@@ -86,6 +86,10 @@ _BOX_CONNECTORS = {"+", "&", "/", "z", "mit", "with", "s", "i", "a", "and", "und
                    "ve", "ohne", "bez", "without", "plus", "inkl", "incl"}
 
 _NEGATED_DEFECT = re.compile(
+    # "no core issues", "no VRAM errors", "ohne Chip Fehler": the stripped-die words are not about a missing die
+    r"(?:no|bez|ohne|without)\s+(?:die|core|gpu(?:-?\s?chip)?|vram|chip|rdzenia|chipu|pamieci|jadra|cipu)"
+    r"(?:\s+\S+)?\s+(?:issues?|errors?|problems?|artifacts?|artefakt\w*|fehler\w*|probleme\w*|problem\w*|"
+    r"bled\w*|chyb\w*|hibak|hiba\w*)(?![a-z])|"
     r"nie\s?uszkodzon\w*|"
     r"bez\s+(?:zadnych\s+)?(?:uszkodzen|defektow|wad|artefaktow|usterek)\w*|"
     r"brak\s+(?:uszkodzen|defektow|artefaktow|wad|usterek)\w*|"
@@ -111,6 +115,11 @@ _DEFECTS = {
                              r"no video|no post|nincs kep|nem ad kepet"),
     "artifacts": re.compile(r"artefakt|artifact"),
     "for_parts": re.compile(r"na czesci|na czesc|for parts|ersatzteil|na dily|pro dily|alkatresz"),
+    # stripped board: the GPU die / memory is gone, only the PCB is sold
+    "stripped_die": re.compile(
+        r"bez\s+(?:rdzenia|chipu|gpu|pamieci|jadra|cipu)(?![a-z])|tylko\s+pcb|sama\s+plytka|"
+        r"(?<![a-z])no\s+(?:die|core|gpu(?:\s+chip)?|vram)(?![a-z])|pcb\s+only|missing\s+(?:gpu\s+)?die|"
+        r"ohne\s+(?:gpu-?\s?)?chip|nur\s+platine|chip\s+nelkul"),
 }
 
 _LIKE_NEW = re.compile(r"jak nowa|jak nowy|jak nowe|like[\s-]new|wie neu|neuwertig|stan idealny|idealny stan|"
@@ -226,7 +235,13 @@ _PREFIX = {
 }
 # after the model: no further suffix word may follow (so "4070" does not match "4070 Ti")
 _EXT = r"(?![\s-]*(?:ti|super|xtx|xt|gre|d)(?![a-z0-9]))"
-_GPU_CONTEXT = re.compile(r"aorus|(?<![a-z])strix|suprim|pcie|sxm|hbm|(?<![a-z])(?:karta|karte|card|kartya)(?![a-z])|geforce|radeon|nvidia|tesla|quadro|(?<![a-z])amd(?![a-z])|(?<![a-z])gpu(?![a-z])|"
+# Card-line brand words are GPU context only when no non-GPU product word (board, mouse, monitor, keyboard) is present.
+_BRAND_CTX = re.compile(r"aorus|(?<![a-z])strix|suprim")
+_NONGPU_PRODUCT = re.compile(
+    r"motherboard|plyta glowna|mainboard|(?<![a-z])mouse|(?<![a-z])mysz\w*|monitor|keyboard|klawiatur\w*|headset|"
+    r"mousepad|(?<![a-z0-9])[zbxh]\d{3}[a-z]?(?![a-z0-9])|(?<![a-z0-9])z\d{3}-[a-z]|(?<![a-z])xg\d{2}|"
+    r"(?<![a-z0-9])k\d{1,2}(?![a-z0-9])")
+_GPU_CONTEXT = re.compile(r"pcie|sxm|hbm|(?<![a-z])(?:karta|karte|card|kartya)(?![a-z])|geforce|radeon|nvidia|tesla|quadro|(?<![a-z])amd(?![a-z])|(?<![a-z])gpu(?![a-z])|"
                           r"graphic|grafi[ck]|(?<![a-z])vga(?![a-z])|vram|(?<!l)gddr|videok|video\s?card")
 
 # comparison words directly before a chip (up to 2 words in between) or right after it
@@ -269,7 +284,9 @@ def _compiled_gpu(category: str):
 
 def _gpu_hits(t: str, category: str) -> list[tuple[dict, int, int, bool]]:
     """(entry, start, end, glued_m) for each entry that matches, bare-match rules applied."""
-    ctx = _GPU_CONTEXT.search(t) is not None
+    ctx = _GPU_CONTEXT.search(t) is not None or (
+        _BRAND_CTX.search(t) is not None and _NONGPU_PRODUCT.search(t) is None)
+    nongpu_brand = _BRAND_CTX.search(t) is not None and _NONGPU_PRODUCT.search(t) is not None
     cpu = _CPU.search(t) is not None
     hits = []
     for e, rx, needs_ctx in _compiled_gpu(category):
@@ -277,6 +294,8 @@ def _gpu_hits(t: str, category: str) -> list[tuple[dict, int, int, bool]]:
             gd = m.groupdict()
             has_pfx = gd.get("pfx") is not None
             if not has_pfx:
+                if nongpu_brand and _GPU_CONTEXT.search(t) is None:
+                    continue  # "Aorus Elite B550 3080": a board/peripheral, the brand is the only GPU hint
                 if needs_ctx and not ctx:
                     continue
                 if cpu and (needs_ctx or e["id"].split("-")[0] in _PREFIX):
@@ -595,11 +614,19 @@ def apply_aliases(title: str, root: Path | None = None) -> tuple[str, list[str]]
 def rules_extract(title: str, description: str, lang: str, *, root: Path | None = None) -> Extraction:
     """Extract a canonical product key and flags from a listing. See the module docstring for the rules.
 
-    Playbook alias items (`root`/playbook/items.yaml, default the repository) rewrite the title first; the ids of
-    the aliases used are added to `notes` as `alias:<id>`."""
-    title, used = apply_aliases(title, root)
-    ex = _rules_extract(title, description, lang)
-    return replace(ex, notes=[*ex.notes, *(f"alias:{i}" for i in used)]) if used else ex
+    Playbook alias items (`root`/playbook/items.yaml, default the repository) rewrite the title for KEY matching
+    only; the ids used are added to `notes` as `alias:<id>`. Bait flags (wanted, box only, for parts), defects and
+    condition always come from the title the seller wrote, so an alias can neither un-bait nor bait a listing."""
+    aliased, used = apply_aliases(title, root)
+    orig = _rules_extract(title, description, lang)
+    if not used:
+        return orig
+    notes = [*orig.notes, *(f"alias:{i}" for i in used)]
+    if orig.wanted_ad or orig.box_only or orig.for_parts:
+        return replace(orig, notes=notes)
+    ex = _rules_extract(aliased, description, lang)
+    return replace(ex, wanted_ad=orig.wanted_ad, box_only=orig.box_only, for_parts=orig.for_parts,
+                   defects=orig.defects, condition=orig.condition, notes=notes)
 
 
 def _rules_extract(title: str, description: str, lang: str) -> Extraction:

@@ -1,9 +1,9 @@
 """Shadow mode (spec §9.3 step 3.5; research §4.2): the challenger scores the SAME candidate stream as the champion,
 every round, and never acts. Only disagreements matter, and only once a verified outcome labels them.
 
-- `score_round` judges the round's evaluated listings with both playbooks (offline judge; for a prompt challenger
-  the challenger's extraction comes from the live model, within a small budget) and stores every disagreement in
-  `shadow_results` (metric 'disagreement'), plus one 'round' row with the number of listings scored.
+- `score_round` judges the round's evaluated listings with both playbooks (offline judge, the same current cached
+  LLM output on both sides) and stores every disagreement in `shadow_results` (metric 'disagreement'), plus one
+  'round' row with the number of listings scored. Prompt changes never come here (owner review only).
 - Labels are TRUTHS, never winners, and come only from verified outcomes (spec §9.5):
   * the owner's marks on the deal of that listing (Bought / Sold -> 'deal'; Skipped for a wrongness -> 'not_deal');
   * the owner's adjudication of a disagreement (`label`, from the digest);
@@ -21,17 +21,14 @@ from datetime import datetime, timedelta, timezone
 
 from evals.labels import is_false_positive, is_true_positive
 
-from .. import extract as extractmod
-from ..match import rules_extract
 from ..verify import load_listing
 from . import gates
-from .playbook import Playbook, eval_root
+from .playbook import Playbook
 from .replay import Judge, Outcome, cached_extraction, verified_listings
 
 COLUMNS = ("round_id integer", "listing_id integer", "kind text", "champion text", "challenger text",
            "truth text", "label_source text", "labelled_at text", "winner text")
 UNSOLD_DAYS = 7
-LLM_BUDGET_PER_ROUND = 20
 
 
 @dataclass
@@ -67,17 +64,15 @@ def kind_of(a: Outcome, b: Outcome) -> str | None:
 
 
 async def score_round(champion: Playbook, challenger: Playbook, round_candidates: list[int], *, store,
-                      proposal_id: int, round_id: int | None = None, cfg=None, now: datetime | None = None,
-                      llm=None, llm_budget: int = LLM_BUDGET_PER_ROUND) -> list[Disagreement]:
+                      proposal_id: int, round_id: int | None = None, cfg=None,
+                      now: datetime | None = None) -> list[Disagreement]:
     """Score the round's candidates (listing ids) with both playbooks; store and return the disagreements.
-    `llm` (a dh.llm.Client) is used only when the challenger changes a prompt."""
+    Judgment changes only (alias, scam keyword): both sides use the same current cached LLM output. A prompt change
+    never reaches shadow (owner review only, gates.evaluate -> 'owner_review')."""
     migrate(store)
     now = now or datetime.now(timezone.utc)
     jc = Judge(champion, store, cfg=cfg, now=now)
     jh = Judge(challenger, store, cfg=cfg, now=now)
-    prompt_change = llm is not None and any(
-        (a := champion.get(i.id)) is not None and a.kind == "prompt" and a.value != i.value for i in challenger.items)
-    root = eval_root(challenger)
     verified = verified_listings(store)
     out: list[Disagreement] = []
     scored = 0
@@ -86,16 +81,10 @@ async def score_round(champion: Playbook, challenger: Playbook, round_candidates
         if l is None:
             continue
         scored += 1
-        cached = cached_extraction(store, lid)
+        cached = cached_extraction(store, lid, l.title)
         v = 0.0 if lid in verified else None
         a = await jc.judge(l, lid=lid, cached=cached, verified_age_s=v)
-        ch_cached = cached
-        if prompt_change and llm_budget > 0:
-            rules = rules_extract(l.title, l.description, (l.country or "pl").lower(), root=root)
-            if rules.certainty < extractmod.RULES_CERTAIN and not (rules.box_only or rules.wanted_ad):
-                llm_budget -= 1
-                ch_cached = await extractmod.extract(l, rules, llm, root)
-        b = await jh.judge(l, lid=lid, cached=ch_cached, verified_age_s=v)
+        b = await jh.judge(l, lid=lid, cached=cached, verified_age_s=v)
         k = kind_of(a, b)
         if k is None:
             continue

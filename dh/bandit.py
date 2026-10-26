@@ -6,7 +6,9 @@ where `reward` is the discounted sum of value units and `fetches` the discounted
 multiplies both by `gamma` once per round, so old evidence fades (the market moves). The prior (1, 10) means
 0.1 value units ($10 of expected net) per fetch: optimistic enough that a new arm is tried.
 
-Allocation (`choose`): new arms (fewer than `new_pulls` updates) first get their guaranteed pulls; the rest of the
+Selection used by the scheduler (`select`, I5 ruling): multiple-play Thompson, one search per arm per round: new arms
+first, then the top draws, with ceil(floor x k) uniformly random exploration slots. Proportional allocation
+(`choose`): new arms (fewer than `new_pulls` updates) first get their guaranteed pulls; the rest of the
 budget is shared by one Thompson draw per arm, mixed with a floor so every arm keeps at least `floor`/len of it:
     share_i = floor/len + (1 - floor) * draw_i / sum(draws)
 Integer allocation is systematic sampling on the cumulative shares (unbiased: E[alloc_i] = budget x share_i).
@@ -128,6 +130,36 @@ class Bandit:
         while k < rest:  # float residue: give it to the largest share
             out.append(max(arms, key=lambda x: sh[x]))
             k += 1
+        return out
+
+    def select(self, arms: list[str], k: int, rng: random.Random) -> list[str]:
+        """Multiple-play Thompson selection (I5 ruling) for a scheduler that runs each arm at most once per round.
+
+        Every arm is ordered (all of them are returned; the caller takes the first k it can use):
+        1. new arms (fewer than `new_pulls` updates), in random order: their guaranteed trial pulls;
+        2. the arms with the highest Thompson draws, filling k minus the exploration slots;
+        3. ceil(floor x k) exploration slots: arms not chosen above, uniformly at random;
+        4. the rest by draw (fallback when the caller skips arms, e.g. a per-source cap).
+        """
+        arms = list(dict.fromkeys(arms))
+        if not arms:
+            return []
+        k = max(0, min(int(k), len(arms)))
+        st = self._all(arms)
+        a0, b0 = self.prior
+        new = [a for a in arms if st[a]["pulls"] < self.new_pulls]
+        rng.shuffle(new)
+        draws = {a: rng.gammavariate(a0 + st[a]["reward"], 1.0 / (b0 + st[a]["fetches"])) for a in arms}
+        explore = math.ceil(self.floor * k) if k else 0
+        out = new[:k]
+        by_draw = sorted((a for a in arms if a not in set(out)), key=lambda a: draws[a], reverse=True)
+        n_top = max(0, k - len(out) - explore)
+        out += by_draw[:n_top]
+        rest = [a for a in arms if a not in set(out)]
+        n_exp = max(0, k - len(out))
+        out += rng.sample(rest, min(n_exp, len(rest)))
+        chosen = set(out)
+        out += [a for a in by_draw if a not in chosen]
         return out
 
     def order(self, arms: list[str], rng: random.Random) -> list[str]:

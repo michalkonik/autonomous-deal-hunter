@@ -124,7 +124,8 @@ def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[f
     e_pln = energy_pln(seconds, gpu_watts, tariff(cfg), b)
     tokens = int(llm.get("prompt_tokens", 0)) + int(llm.get("completion_tokens", 0))
     paid = Decimal("0.00")  # paid APIs are off (models.paid_api.enabled: false); nothing else spends money yet
-    store.add_cost(round_id, "energy", e_pln, round(kwh, 6))
+    # amount kept to 6 dp (a short round costs fractions of a grosz: q2 per row would sum to 0); summaries round
+    store.add_cost(round_id, "energy", Decimal(str(round(kwh * tariff(cfg), 6))), round(kwh, 6))
     store.add_cost(round_id, "llm", Decimal("0.00"), tokens)
     store.add_cost(round_id, "fetch", Decimal("0.00"), int(fetches))
     store.add_cost(round_id, "paid_api", paid, 0)
@@ -132,8 +133,9 @@ def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[f
             "llm_tokens": tokens, "llm_calls": int(llm.get("calls", 0)), "fetches": int(fetches), "paid_api_pln": paid}
 
 
-def summary(store, since: str | None = None) -> dict:
-    """Totals by cost kind (all time, or rounds started at/after the ISO timestamp `since`)."""
+def summary(store, since: str | None = None, cfg=None) -> dict:
+    """Totals by cost kind (all time, or rounds started at/after the ISO timestamp `since`). With `cfg`, energy is
+    priced at summary time from the stored kWh x the current tariff."""
     sql = "select c.kind, c.amount_pln, c.units from costs c"
     args: list = []
     if since:
@@ -145,6 +147,8 @@ def summary(store, since: str | None = None) -> dict:
         k["pln"] += Decimal(r["amount_pln"])
         k["units"] += float(r["units"] or 0)
         k["rows"] += 1
+    if cfg is not None and "energy" in by:
+        by["energy"]["pln"] = Decimal(str(by["energy"]["units"])) * Decimal(str(tariff(cfg)))
     rsql = "select count(*) from rounds" + (" where started_at >= ?" if since else "")
     rounds = store.conn.execute(rsql, args).fetchone()[0]
     total = sum((v["pln"] for v in by.values()), Decimal(0))

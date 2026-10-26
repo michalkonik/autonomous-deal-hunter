@@ -17,8 +17,12 @@ dev = ["pytest", "pytest-asyncio"]
 [project.scripts]
 dh = "dh.cli:main"
 
-[tool.setuptools]
-packages = ["dh", "dh.sources"]
+[tool.setuptools.packages.find]
+include = ["dh*", "evals*"]
+
+[tool.setuptools.package-data]
+"dh.web" = ["templates/*"]
+evals = ["*.jsonl"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

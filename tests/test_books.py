@@ -40,11 +40,18 @@ def test_record_round_and_summary(tmp_path):
     rows = {r["kind"]: r for r in st.conn.execute("select * from costs where round_id=?", (rid,))}
     assert set(rows) == {"energy", "llm", "fetch", "paid_api"}
     assert Decimal(rows["energy"]["amount_pln"]) == Decimal("0.44")
+    # a short round is not rounded away per row: 94 s at 120 W base = 0.003133 kWh x 1.10 = 0.003447 PLN
+    rid2 = st.log_round(datetime(2026, 10, 29, 13, tzinfo=timezone.utc))
+    books.record_round(st, rid2, cfg, seconds=94, gpu_watts=[], llm={}, fetches=1)
+    e2 = st.conn.execute("select amount_pln from costs where round_id=? and kind='energy'", (rid2,)).fetchone()[0]
+    assert Decimal(e2) == Decimal("0.003447")
     assert rows["llm"]["units"] == 1200 and rows["fetch"]["units"] == 42
     assert Decimal(rows["paid_api"]["amount_pln"]) == 0
-    s = books.summary(st)
-    assert s["total_pln"] == "0.44" and s["rounds"] == 1
-    assert s["by_kind"]["energy"]["units"] == pytest.approx(0.4)
+    s = books.summary(st, cfg=cfg)
+    assert s["total_pln"] == "0.44" and s["rounds"] == 2  # 0.44 + 0.0034 rounds to 0.44 only in the total
+    assert s["by_kind"]["energy"]["units"] == pytest.approx(0.403133)
+    hi = Config({"books": {"tariff_pln_kwh": 2.20}})
+    assert books.summary(st, cfg=hi)["by_kind"]["energy"]["pln"] == "0.89"  # priced at summary time
     assert s["by_kind"]["llm"]["units"] == 1200
 
 

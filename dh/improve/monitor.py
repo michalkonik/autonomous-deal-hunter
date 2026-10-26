@@ -1,8 +1,7 @@
 """Watched-hours clock and the per-round counts the CUSUMs watch (spec §9.2, §9.4).
 
-Watched hours = the UNION of the ledger's observation windows (dh start .. dh stop, per source). Summing the
-windows per source (ledger.watched_hours) counts one hour once per source; every stop rule here uses the union, so
-"48 watched hours" is 48 hours the agent was really running.
+Watched hours = the UNION of the ledger's observation windows (dh start .. dh stop, per source): ledger.watched_hours,
+which every stop rule here and every status page use, so "48 watched hours" is 48 hours the agent was really running.
 
 Per round the controller records two counts in `improve_rounds`:
 - champion_n: deals (tier 1-4, near-misses included for a denser signal) the live round saved from listings that
@@ -12,11 +11,12 @@ Per round the controller records two counts in `improve_rounds`:
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .. import ledger
-from .playbook import Playbook
+from .playbook import Playbook, prompt_sha
 
 ROUNDS_SQL = """create table if not exists improve_rounds (
   round_id integer primary key, watched_h real not null, version integer, champion_n integer not null,
@@ -28,42 +28,44 @@ def _t(s: str | None) -> datetime | None:
 
 
 def watched_hours(store, until: datetime | None = None) -> float:
-    """Union of all observation windows (open windows end at their last observation), in hours."""
-    ledger.migrate(store)
-    spans = []
-    for w in store.conn.execute("select opened_at, closed_at, last_obs_at from windows"):
-        a = _t(w["opened_at"])
-        b = _t(w["closed_at"]) or _t(w["last_obs_at"]) or a
-        if until is not None:
-            b = min(b, until)
-        if b > a:
-            spans.append((a, b))
-    spans.sort()
-    total, cur_a, cur_b = 0.0, None, None
-    for a, b in spans:
-        if cur_b is None or a > cur_b:
-            if cur_b is not None:
-                total += (cur_b - cur_a).total_seconds()
-            cur_a, cur_b = a, b
-        else:
-            cur_b = max(cur_b, b)
-    if cur_b is not None:
-        total += (cur_b - cur_a).total_seconds()
-    return total / 3600
+    """Union of all observation windows (open windows end at their last observation), in hours. The same number
+    `dh status`, the books and the web page show (ledger.watched_hours)."""
+    return ledger.watched_hours(store, until=until)
+
+
+ROUNDS_COLUMNS = ("deals_n integer not null default 0", "health text")
 
 
 def migrate(store) -> None:
     store.ensure_table(ROUNDS_SQL)
+    have = {r["name"] for r in store.conn.execute("pragma table_info(improve_rounds)")}
+    for col in ROUNDS_COLUMNS:
+        if col.split()[0] not in have:
+            store.ensure_table(f"alter table improve_rounds add column {col}")
 
 
 def record(store, round_id: int, watched_h: float, version: int | None, champion_n: int, sentinel_n: int,
-           candidates: int = 0) -> None:
+           candidates: int = 0, *, deals_n: int | None = None, health: dict | None = None) -> None:
+    """One row per round: champion_n (tier 1-4, the CUSUM's dense signal), deals_n (tier 1-3, the MDE's outcome),
+    sentinel_n, and the round's new health events per 'source|kind'."""
     migrate(store)
     store.conn.execute("insert or replace into improve_rounds (round_id, watched_h, version, champion_n, sentinel_n, "
-                       "candidates, at) values (?,?,?,?,?,?,?)",
+                       "candidates, at, deals_n, health) values (?,?,?,?,?,?,?,?,?)",
                        (round_id, float(watched_h), version, int(champion_n), int(sentinel_n), int(candidates),
-                        datetime.now(timezone.utc).isoformat()))
+                        datetime.now(timezone.utc).isoformat(), int(champion_n if deals_n is None else deals_n),
+                        json.dumps(health or {})))
     store.conn.commit()
+
+
+def health_between(store, lo_wh: float, hi_wh: float) -> dict[str, int]:
+    """Health events per 'source|kind' over the recorded rounds with lo_wh < watched_h <= hi_wh."""
+    migrate(store)
+    out: dict[str, int] = {}
+    for r in store.conn.execute("select health from improve_rounds where watched_h > ? and watched_h <= ?",
+                                (lo_wh, hi_wh)):
+        for k, v in json.loads(r["health"] or "{}").items():
+            out[k] = out.get(k, 0) + int(v)
+    return out
 
 
 def counts(store, *, version: int | None = None, last: int = 200, before_round: int | None = None) -> tuple[list[int], list[int]]:
@@ -123,24 +125,36 @@ def arms_of(store, lids: list[int]) -> dict[int, set[str]]:
 
 
 async def round_counts(store, round_id: int, sentinel_pb: Playbook, sources: list[str], *, cfg=None,
-                       now: datetime | None = None) -> tuple[int, int, list[int]]:
-    """(champion_n, sentinel_n, evaluated listing ids) for one finished round (see module doc)."""
+                       now: datetime | None = None) -> tuple[int, int, int, list[int]]:
+    """(champion_n, sentinel_n, deals_n, evaluated listing ids) for one finished round (see module doc);
+    deals_n = tier 1-3 deals the round saved (all arms)."""
     from .replay import judge_listings
     w = round_window(store, round_id)
     if w is None:
-        return 0, 0, []
+        return 0, 0, 0, []
     lids = evaluated_in_round(store, round_id)
     sent_arms = sentinel_arm_ids(sentinel_pb, sources)
     arms = arms_of(store, lids)
     sent = [lid for lid in lids if arms[lid] & sent_arms]
     champ_lids = {lid for lid in lids if arms[lid] - sent_arms}
-    champion_n = 0
+    champion_n = deals_n = 0
     for r in store.conn.execute("select listing_ref, tier from deals where created_at >= ? and created_at <= ?", w):
         if r["tier"] in (1, 2, 3, 4) and r["listing_ref"] in champ_lids:
             champion_n += 1
-    outs = await judge_listings(sentinel_pb, store, sent, now=now or _t(w[1]), cfg=cfg) if sent else {}
+        deals_n += int(r["tier"] in (1, 2, 3))
+    outs = await judge_listings(sentinel_pb, store, sent, now=now or _t(w[1]), cfg=cfg,
+                                prompt_sha=prompt_sha(sentinel_pb)) if sent else {}
     sentinel_n = sum(1 for o in outs.values() if o.tier in (1, 2, 3, 4))
-    return champion_n, sentinel_n, lids
+    return champion_n, sentinel_n, deals_n, lids
+
+
+def sentinel_sources(pb: Playbook) -> set[str]:
+    """Sources the sentinel queries search (their health is the control for probation's health check)."""
+    out: set[str] = set()
+    for it in pb.items:
+        if it.kind == "query" and it.sentinel:
+            out |= {x.strip() for x in it.target.lower().split(",") if x.strip() and x.strip() not in ("all", "*")}
+    return out
 
 
 def default_sources(cfg=None) -> list[str]:

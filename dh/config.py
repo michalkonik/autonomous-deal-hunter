@@ -14,6 +14,8 @@ FROZEN_PATHS = [
     "dh/customs.py",
     "data/fees.yaml",
     "data/shipping.yaml",
+    "data/taxonomy",
+    "data",  # the whole data layer (fees, shipping, taxonomy and anything added later) is frozen
     "dh/tiering.py",
     "dh/improve/gates.py",
     "evals",

@@ -160,7 +160,7 @@ def test_watched_hours_is_the_union_of_windows(store):
     w = ledger.open_window(store, "olx", t0 + timedelta(hours=5))
     store.close_window(w, t0 + timedelta(hours=6))
     assert monitor.watched_hours(store) == pytest.approx(3.0)
-    assert ledger.watched_hours(store) == pytest.approx(7.0)  # the per-source sum the scoreboard shows
+    assert ledger.watched_hours(store) == pytest.approx(3.0)  # the scoreboard shows the same union
 
 
 # ------------------------------------------------------------------ shadow
@@ -182,21 +182,29 @@ def test_score_round_finds_and_stores_disagreements(store):
 
 
 def test_labels_come_only_from_verified_outcomes(store):
-    ids = archive(store)  # 'deal' was bought, 'fp' skipped as a scam
+    from decimal import Decimal
+
+    from dh.models import Deal
+    archive(store)
+    ids = {}
+    # at 2520 PLN the champion calls both a tier-2 deal; the challenger's extra keyword drops both to tier 4
+    for name, status, note in (("bought", "bought", "great"), ("scam", "skipped", "scam: fake listing")):
+        l = listing(name, "RTX 3090 Gigabyte Gaming OC 24GB używana", "2520", seen=NOW - timedelta(hours=2))
+        ids[name] = store.upsert_listing(l)
+        did = store.save_deal(Deal(id=None, listing_ref=ids[name], key=KEY_3090, tier=2, star=False, effort="easy",
+                                   confidence="medium", cons_net_pln=Decimal(200), exp_net_pln=Decimal(300),
+                                   cons_net_usd=Decimal(52), exp_net_usd=Decimal(77), capital_usd=Decimal(650),
+                                   breakdown_json="{}", evidence_json="{}", reasons=[], created_at=NOW))
+        store.add_mark(did, status, None, note, "web")
     pb = seed_playbook()
-    # a scam keyword that hits both descriptions: the challenger drops both deals
-    ch = pb.apply(pb.make_delta("add", Item("scam_kw.sprzedaz", "scam_kw", "risk", "szybka sprzedaz")))
-    store.conn.execute("update listings set description='Stan bardzo dobry, szybka sprzedaż.' where id=?", (ids["deal"],))
-    store.conn.commit()
+    ch = pb.apply(pb.make_delta("add", Item("scam_kw.gigabyte_oc", "scam_kw", "risk", "gaming oc 24gb uzywana")))
     ds = run(shadow.score_round(pb, ch, list(ids.values()), store=store, proposal_id=2, round_id=1, now=NOW))
-    assert {d.listing_id for d in ds} <= {ids["deal"], ids["fp"]}
-    assert shadow.auto_label(store, 2, NOW) == len(ds)
+    assert {d.listing_id for d in ds} == set(ids.values())  # both are real disagreements
+    assert shadow.auto_label(store, 2, NOW) == 2
     w = {r["listing_id"]: r["winner"] for r in store.conn.execute(
         "select listing_id, winner from shadow_results where proposal_id=2 and metric='disagreement'")}
-    if ids["deal"] in w:
-        assert w[ids["deal"]] == "champion"  # the owner bought it: dropping it was wrong
-    if ids["fp"] in w:
-        assert w[ids["fp"]] == "challenger"  # the owner skipped it as a scam: dropping it was right
+    assert w[ids["bought"]] == "champion"  # the owner bought it: dropping it was wrong
+    assert w[ids["scam"]] == "challenger"  # the owner skipped it as a scam: dropping it was right
 
 
 def test_unsold_for_a_week_is_not_a_deal(store):
@@ -263,8 +271,8 @@ def test_round_counts_split_champion_and_sentinel(store):
                          cons_net_usd=Decimal(100), exp_net_usd=Decimal(125), capital_usd=Decimal(520),
                          breakdown_json="{}", evidence_json="{}", reasons=[], created_at=at))
     store.conn.commit()
-    c, s, lids = run(monitor.round_counts(store, rid, seed_playbook(), [], now=NOW))
-    assert (c, s) == (1, 1)  # the live deal from a champion arm; the sentinel arm's listing judged by the pinned playbook
+    c, s, d, lids = run(monitor.round_counts(store, rid, seed_playbook(), [], now=NOW))
+    assert (c, s, d) == (1, 1, 1)  # the live deal from a champion arm; the sentinel arm's listing judged by the pinned playbook
     assert sorted(lids) == sorted(ids.values())
     assert monitor.sentinel_arm_ids(seed_playbook(), []) >= {"kleinanzeigen:rtx 3090", "hardverapro:rtx 4090"}
     monitor.record(store, rid, 1.5, 1, c, s, len(lids))

@@ -9,11 +9,15 @@ from __future__ import annotations
 import re
 
 # a Skipped reason that says the DEAL was wrong (not that the owner had no time); PL / EN / DE wording
-FP_REASON = re.compile(
-    r"scam|oszust|fake|podr[oó]b|fa[lł]szyw|box|pud[eł]|karton|ovp|wrong|z[lł]y model|z[lł]a karta|nie ten|"
-    r"inny model|mismatch|bad match|niezgodn|broken|uszkodz|defekt|for parts|na cz[eę][sś]ci|wanted|kupi|bait|"
-    r"not a deal|false|nieprawd|accessor|akcesori|stripped|bez rdzenia|no die|price wrong|overvalued|zawy[zż]on",
-    re.I)
+_WORDS = (  # stems match at a word start; short words must stand alone ("box" never inside "xbox")
+    r"scam\w*", r"oszust\w*", r"fake", r"podr[oó]b\w*", r"fa[lł]szyw\w*", r"box", r"box only", r"pud[eł]+k\w*",
+    r"karton\w*", r"ovp", r"wrong", r"z[lł]y model", r"z[lł]a karta", r"nie ten", r"inny model", r"mismatch",
+    r"bad match", r"niezgodn\w*", r"broken", r"uszkodz\w*", r"defekt\w*", r"for parts", r"na cz[eę][sś]ci",
+    r"wanted", r"wanted ad", r"kupi[eę]", r"ogłoszenie kupna", r"bait", r"not a deal", r"false", r"nieprawd\w*",
+    r"accessor\w*", r"akcesori\w*", r"stripped", r"bez rdzenia", r"no die", r"price wrong", r"overvalued",
+    r"zawy[zż]on\w*")
+# a Skipped reason that says the DEAL was wrong (not that the owner had no time); PL / EN / DE wording
+FP_REASON = re.compile(r"(?<!\w)(?:" + "|".join(_WORDS) + r")(?!\w)", re.I)
 
 
 def is_false_positive(status: str | None, note: str | None) -> bool:

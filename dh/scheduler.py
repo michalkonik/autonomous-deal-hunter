@@ -34,6 +34,7 @@ the bandit updated per arm and discounted.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -41,6 +42,7 @@ import logging
 import math
 import random
 import re
+import sqlite3
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -56,7 +58,7 @@ from .bandit import Bandit, value_units
 from .config import Config, assert_frozen_unchanged
 from .match import rules_extract
 from .models import Deal, Extraction, Listing
-from .money import FxError, q2
+from .money import q2
 from .playbook_io import load_items
 from .sources.base import KIND_PATTERNS, AdapterError, Query
 
@@ -67,8 +69,10 @@ DEFAULTS = {
     "max_llm_items": 200, "alive_confirm_per_source": 5, "reeval_hours": 24, "round_timeout_s": 1500,
     "ebay_comp_keys": 10, "ebay_insights_keys": 10, "maintenance_hours": 24, "retention_days": 90,
     "price_range": [0.15, 3.0], "min_prices_for_range": 3, "min_estimate_comps": 3,
-    "feed_sources": ["pepper_pl", "hotukdeals", "retail"],
+    "feed_sources": ["pepper_pl", "hotukdeals", "retail"], "requeue_hours": 48, "requeue_max": 500,
+    "timeout_grace_s": 60,
 }
+SWEEP_TIMEOUT_S = 300  # default of sources.sweep_timeout_s
 CATEGORY_FOR_ECONOMICS = {"gpu": "gpu", "gpu-mobile": "gpu", "ram": "ram", "ram-sodimm": "ram", "ssd": "ssd", "pc": "pc"}
 PC_KEY = "pc:bundle"
 KRAKOW = (50.0647, 19.9450)
@@ -79,6 +83,19 @@ EVAL_SQL = """create table if not exists evaluations (
   listing_id integer primary key, price text, title_hash text, at text, tier integer, note text)"""
 MARK_COMPS_SQL = "create table if not exists mark_comps (mark_id integer primary key)"
 MAINT_SQL = "create table if not exists maintenance (task text primary key, at text not null)"
+PUSHES_SQL = "create table if not exists deal_pushes (deal_id integer primary key, at text not null)"
+DEAL_INDEX_SQL = "create unique index if not exists idx_deals_listing on deals(listing_ref)"
+REQUEUE_NOTES = ("deferred", "llm_pending")
+
+
+def ensure_deal_index(store) -> bool:
+    """One deal per listing (the scheduler updates it on re-evaluation). False when old duplicates prevent it."""
+    try:
+        store.ensure_table(DEAL_INDEX_SQL)
+        return True
+    except sqlite3.IntegrityError:
+        store.add_health("scheduler", "deal_index", "duplicate deals per listing exist: unique index not created")
+        return False
 
 
 def is_mail_source(ad) -> bool:
@@ -245,6 +262,12 @@ class RoundStats:
     comps_ingested: int = 0
     owner_sale_comps: int = 0
     insights_calls: int = 0
+    updated: int = 0
+    requeued: int = 0
+    price_changed: int = 0
+    llm_mode: str = "on"
+    foreign_models: list = field(default_factory=list)
+    sweep_timeouts: list = field(default_factory=list)
     mail_listings: int = 0
     mail_committed: int = 0
     partout: int = 0
@@ -286,6 +309,8 @@ class RoundContext:
     items: list[dict] | None = None
     insights: Any = None  # dh.sources.ebay_insights.EbayInsights (session-wide: it disables itself once) or None
     photo_check: Callable[..., Awaitable[list[str]]] = photos.check
+    #: async () -> models llama-swap runs outside the configured roles ([] = fine); None = no check (tests, no-llm)
+    llm_check: Callable[[], Awaitable[list[str]]] | None = None
     stop: asyncio.Event | None = None
     frozen_digest: dict | None = None
     budget: int | None = None
@@ -363,6 +388,11 @@ class _Round:
         self.insight_keys: set[str] = set()
         self.partout_cache: dict[int, Any] = {}
         self.tasks: list[asyncio.Task] = []
+        self.sweeps: list[asyncio.Task] = []
+        self.created: list[asyncio.Task] = []  # every evaluation task of the round (cleanup on cancel)
+        self.inflight: set[int] = set()  # listing ids queued this round: one evaluation per listing per round
+        self.save_lock = asyncio.Lock()  # final dedupe re-check + save/update, with no await in between
+        self.mail_arms: list[Arm] = []
         self.task_sem = asyncio.Semaphore(64)
         self.shipping = economics.load_shipping()
         self.repo_web_url = str((ctx.cfg.get("publish").to_dict() if ctx.cfg.get("publish") is not None else {})
@@ -370,6 +400,8 @@ class _Round:
         self.store.ensure_table(EVAL_SQL)
         self.store.ensure_table(MARK_COMPS_SQL)
         self.store.ensure_table(MAINT_SQL)
+        self.store.ensure_table(PUSHES_SQL)
+        ensure_deal_index(self.store)
 
     # ------------------------------------------------------------ helpers
     def _stopped(self) -> bool:
@@ -380,7 +412,7 @@ class _Round:
             try:
                 self.to_pln_rates[ccy] = await self.fx.rate(ccy, self.today)
                 await self.fx.rate(ccy, self.today - timedelta(days=1))  # pins a dated row valuation can read
-            except (FxError, Exception) as e:  # noqa: BLE001 - a missing rate only disables bounds for that ccy
+            except Exception as e:  # noqa: BLE001 - a missing rate only disables bounds for that ccy
                 self.stats.errors.append(f"fx {ccy}: {type(e).__name__}: {e}"[:200])
 
     async def _price_pln(self, l: Listing) -> Decimal | None:
@@ -419,8 +451,8 @@ class _Round:
         r = self.store.conn.execute("select price, at, note from evaluations where listing_id=?", (lid,)).fetchone()
         if r is None or Decimal(r["price"]) != l.price:
             return True
-        if r["note"] == "llm_pending" and self.llm is not None:
-            return True  # valued on the rules alone while the LLM was off or down: ask it now
+        if r["note"] == "deferred" or (r["note"] == "llm_pending" and self.llm is not None):
+            return True  # waited for an LLM slot, or valued on the rules alone while the LLM was off: do it now
         return datetime.fromisoformat(r["at"]) < self.ctx.now() - timedelta(hours=float(self.sc["reeval_hours"]))
 
     def _mark_eval(self, lid: int, l: Listing, tier: int | None = None, note: str = "") -> None:
@@ -463,14 +495,20 @@ class _Round:
         cap = int(self.sc["max_searches_per_source"])
         chosen = list(fixed)
         by_id = {a.id: a for a in free}
-        for aid in self.ctx.bandit.order(list(by_id), self.ctx.rng):
-            if len(chosen) >= budget + len(fixed):
+        # Multiple-play Thompson (I5 ruling): each arm runs at most once per round, so the round takes the k = budget
+        # arms with the highest draws, after the new arms' guaranteed pulls and with ceil(floor x k) uniformly random
+        # exploration slots. Arms skipped by the per-source cap are replaced from the rest of the draw order.
+        ranked = self.ctx.bandit.select(list(by_id), budget, self.ctx.rng)
+        taken = 0
+        for aid in ranked:
+            if taken >= budget:
                 break
             a = by_id[aid]
             if per_src[a.source] >= cap:
                 continue
             per_src[a.source] += 1
             chosen.append(a)
+            taken += 1
         self.stats.arms = len(chosen)
         self.stats.sentinel_arms = sum(a.sentinel for a in chosen)
         self.stats.feed_arms = sum(a.feed for a in chosen)
@@ -514,7 +552,7 @@ class _Round:
                                               (source, l.source_id)).fetchone()
                 if row is None or not self._needs_eval(row["id"], l):
                     continue
-                self.tasks.append(asyncio.create_task(self._guarded(l, row["id"], arm, ad)))
+                self._queue(l, row["id"], arm, ad)
         await self._confirm_disappeared(ad, source, newly)
 
     async def _run_mail(self, name: str, ad) -> Arm:
@@ -523,6 +561,7 @@ class _Round:
         (olx, allegro, kleinanzeigen...): each is a sighting without an arm, so it can never make other listings
         disappear. They are never detail-fetched, and `alive` raises, so they stay unverified (<= medium)."""
         arm = Arm(ledger.arm_id(name, ""), name, Query(text="", arm_id=ledger.arm_id(name, "")), f"mail:{name}", feed=True)
+        self.mail_arms.append(arm)
         s = self.stats.sources.setdefault(name, {"searches": 0, "ok": 0, "failed": 0, "listings": 0})
         s["searches"] += 1
         self.arm_fetches[arm.id] += 1
@@ -553,8 +592,39 @@ class _Round:
             row = self.store.conn.execute("select id from listings where source=? and source_id=?",
                                           (l.source, l.source_id)).fetchone()
             if row is not None and self._needs_eval(row["id"], l):
-                self.tasks.append(asyncio.create_task(self._guarded(l, row["id"], arm, ad)))
+                self._queue(l, row["id"], arm, ad)
         return arm
+
+    def _queue(self, l: Listing, lid: int, arm: Arm, ad) -> None:
+        if lid in self.inflight:
+            return  # another arm already returned it this round (Critical 1: one deal, one push)
+        self.inflight.add(lid)
+        t = asyncio.create_task(self._guarded(l, lid, arm, ad))
+        self.tasks.append(t)
+        self.created.append(t)
+
+    def _requeue(self) -> None:
+        """Listings persisted in the last `requeue_hours` whose evaluation never happened or was put off (an acked
+        mail, a round cut short, an LLM slot budget, the LLM off): evaluated now, even if no search returns them."""
+        notes = ("deferred",) + (("llm_pending",) if self.llm is not None else ())
+        since = (self.ctx.now() - timedelta(hours=float(self.sc["requeue_hours"]))).isoformat()
+        rows = self.store.conn.execute(
+            f"""select l.id from listings l left join evaluations e on e.listing_id=l.id
+                where l.last_seen_at >= ? and cast(l.price as real) > 0
+                and (e.listing_id is null or e.note in ({",".join("?" * len(notes))}))
+                order by l.last_seen_at desc limit ?""", (since, *notes, int(self.sc["requeue_max"]))).fetchall()
+        mail = next((a for a in self.ctx.adapters.values() if is_mail_source(a)), None)
+        for r in rows:
+            l = verify.load_listing(self.store, r["id"])
+            if l is None:
+                continue
+            ad = self.ctx.adapters.get(l.source) or mail  # platform listings from alert mails: the mailbox adapter
+            if ad is None:
+                continue
+            arm = Arm(f"requeue:{l.source}", l.source, Query(text=""), "requeue")
+            before = len(self.inflight)
+            self._queue(l, r["id"], arm, ad)
+            self.stats.requeued += len(self.inflight) - before
 
     def _maintenance(self) -> None:
         """Daily: photo hashes, raw snapshots and saved alert mails older than the retention (90 days) are deleted."""
@@ -643,13 +713,11 @@ class _Round:
             elif self.llm is not None:
                 if self.llm_budget <= 0:
                     self.stats.llm_deferred += 1
-                    return  # not marked evaluated: next round
+                    self._mark_eval(lid, l, note="deferred")  # re-queued at the next round's start
+                    return
                 self.llm_budget -= 1
                 self.stats.llm_items += 1
-                self.waiting += 1
-                self.stats.llm_max_wait = max(self.stats.llm_max_wait, max(0, self.waiting - self.parallel))
-                async with self.sem:
-                    self.waiting -= 1
+                async with self._llm_slot():
                     ex = await extract.extract(l, rules, self.llm, self.root)
                 if "llm_unavailable" in ex.notes:
                     pending = True
@@ -708,6 +776,23 @@ class _Round:
         except Exception as e:  # noqa: BLE001 - a comps feed failure never stops valuation
             self.stats.errors.append(f"insights {key}: {type(e).__name__}: {e}"[:200])
 
+    @contextlib.asynccontextmanager
+    async def _llm_slot(self):
+        """One worker slot. `llm_max_wait` = the most items ever waiting for a slot (0 = the queue never backed up)."""
+        must_wait = self.sem.locked()
+        if must_wait:
+            self.waiting += 1
+            self.stats.llm_max_wait = max(self.stats.llm_max_wait, self.waiting)
+        try:
+            async with self.sem:
+                if must_wait:
+                    self.waiting -= 1
+                    must_wait = False
+                yield
+        finally:
+            if must_wait:
+                self.waiting -= 1
+
     async def _partout(self, l: Listing, lid: int, ex: Extraction):
         """Part-out exit estimate of a whole PC (cached per listing for the round). Uses the worker LLM for the parts
         the rules miss, within the round's LLM item budget and worker slots."""
@@ -719,7 +804,7 @@ class _Round:
             self.stats.llm_items += 1
             client = self.llm
         if client is not None:
-            async with self.sem:
+            async with self._llm_slot():
                 est = await partout.value(l, ex, self.store, self.ctx.now(), client, params=self.params,
                                           channels=self.channels)
         else:
@@ -820,12 +905,8 @@ class _Round:
             if a is not None:
                 self.stats.drop("below_floor")
             return None
-        buy_pln = await self._price_pln(l) or Decimal(0)
-        pre_ev = {"buy_pln": str(q2(buy_pln))}
-        if a.ex.key == PC_KEY:
-            pre_ev["components"] = partout.parts_of(a.est)
-        if dedupe.is_duplicate(self.store, dataclasses.replace(self._deal(a), evidence_json=json.dumps(pre_ev))):
-            self.stats.duplicates += 1
+        if self._cross_duplicate(a, await self._price_pln(l) or Decimal(0)):
+            self.stats.duplicates += 1  # the same item on another listing / platform: no detail fetch, no deal
             return a.tier.tier
         verified = False
         if a.tier.tier <= 3:
@@ -863,38 +944,101 @@ class _Round:
                 if alive is False:
                     self.stats.drop("gone")
                     return None
-                if alive and now_price is not None and now_price == l.price:
-                    verified = True
+                if alive and now_price is not None and now_price > 0:
+                    changed = now_price != l.price
+                    if changed:  # live price differs: the deal is re-valued at the price that is on offer now
+                        self.stats.price_changed += 1
+                        l = dataclasses.replace(l, price=now_price, seen_at=self.ctx.now())
+                        ledger.observe(self.store, l.source, [l], self.ctx.now())  # sighting, no arm
+                        price_pln = await self._price_pln(l)
+                    verified = True  # alive, and the price just read is the one the deal is valued at
                     a2 = await self._appraise(l, lid, ex, price_pln, verified_age_s=0.0, stock_photo=stock)
-                    if a2 is not None and a2.tier.tier is not None:
+                    if a2 is None or a2.tier.tier is None:
+                        if changed:
+                            self.stats.drop("price_changed_below_floor")
+                            return None
+                    else:
                         a = a2
         return await self._save(a, arm, verified)
 
+    def _evidence_probe(self, a: Appraisal, buy_pln: Decimal) -> str:
+        ev = {"buy_pln": str(q2(buy_pln))}
+        if a.ex.key == PC_KEY:
+            ev["components"] = partout.parts_of(a.est)
+        return json.dumps(ev)
+
+    def _existing_deal_id(self, lid: int) -> int | None:
+        r = self.store.conn.execute("select id from deals where listing_ref=? order by id limit 1", (lid,)).fetchone()
+        return r["id"] if r else None
+
+    def _cross_duplicate(self, a: Appraisal, buy_pln: Decimal) -> bool:
+        """Dedupe against OTHER listings only: the same listing's own deal is updated, not duplicated."""
+        probe = dataclasses.replace(self._deal(a), id=self._existing_deal_id(a.lid),
+                                    evidence_json=self._evidence_probe(a, buy_pln))
+        return dedupe.is_duplicate(self.store, probe)
+
+    def _update_deal(self, deal_id: int, d: Deal) -> None:
+        self.store.conn.execute(
+            """update deals set key=?, tier=?, star=?, effort=?, confidence=?, cons_net_pln=?, exp_net_pln=?,
+               cons_net_usd=?, exp_net_usd=?, capital_usd=?, breakdown_json=?, evidence_json=?, reasons=?,
+               verified_at=null where id=?""",
+            (d.key, d.tier, int(d.star), d.effort, d.confidence, str(d.cons_net_pln), str(d.exp_net_pln),
+             str(d.cons_net_usd), str(d.exp_net_usd), str(d.capital_usd), d.breakdown_json, d.evidence_json,
+             json.dumps(d.reasons), deal_id))
+        self.store.conn.commit()
+
+    def _pushed(self, deal_id: int) -> bool:
+        return self.store.conn.execute("select 1 from deal_pushes where deal_id=?", (deal_id,)).fetchone() is not None
+
     async def _save(self, a: Appraisal, arm: Arm, verified: bool) -> int:
+        """Save a new deal or update this listing's deal (re-tier). Everything awaited happens before the lock; the
+        final duplicate re-check, the insert/update, the card and the push reservation happen under it with no await,
+        so two concurrent evaluations can never produce two deals or two pushes."""
         l, tier = a.listing, a.tier.tier
         rate, rdate = await self.fx.rate_with_date(l.currency, self.today)
+        buy_pln = await self._price_pln(l) or Decimal(0)
         shots: dict = {}
-        if tier == 1:
+        old = self._existing_deal_id(a.lid)
+        if tier == 1 and not (old is not None and self._pushed(old)):
             p = Path(self.ctx.shots_root) / self.today.isoformat() / f"{a.lid}-discovery.png"
             if await self.ctx.screenshot(l.url, p, self.ctx.fetcher):
                 shots["discovery"] = str(p)
-        ev = cards.build_evidence(a.inp, l, a.est, a.risk, fx_rate=rate, fx_date=rdate,
-                                  buy_pln=await self._price_pln(l) or Decimal(0), screenshots=shots)
+        ev = cards.build_evidence(a.inp, l, a.est, a.risk, fx_rate=rate, fx_date=rdate, buy_pln=buy_pln,
+                                  screenshots=shots)
         if a.ex.key == PC_KEY:  # dedupe tells two PCs of one seller apart by their parts
             ev = json.dumps({**json.loads(ev), "components": partout.parts_of(a.est)})
-        deal = self._deal(a, ev)
-        deal.id = self.store.save_deal(deal)
-        if verified:
-            verify.record_verification(self.store, deal.id, True)
-        deal = self.store.get_deal(deal.id)
-        path = cards.write(deal, self.ctx.cards_root, cards.render(deal, l, a.est, a.net, a.risk, self.root))
+        push = False
+        async with self.save_lock:
+            deal = self._deal(a, ev)
+            old = self._existing_deal_id(a.lid)
+            if old is None:
+                if dedupe.is_duplicate(self.store, deal):
+                    self.stats.duplicates += 1
+                    return tier
+                try:
+                    deal.id = self.store.save_deal(deal)
+                except sqlite3.IntegrityError:  # unique listing_ref: another writer saved it first
+                    old = self._existing_deal_id(a.lid)
+            if old is not None:
+                deal.id = old
+                self._update_deal(old, deal)
+                self.stats.updated += 1
+            if verified:
+                verify.record_verification(self.store, deal.id, True)
+            deal = self.store.get_deal(deal.id)
+            path = cards.write(deal, self.ctx.cards_root, cards.render(deal, l, a.est, a.net, a.risk, self.root))
+            if tier == 1 and not self.ctx.dry and not self._pushed(deal.id):
+                self.store.conn.execute("insert into deal_pushes (deal_id, at) values (?,?)",
+                                        (deal.id, self.ctx.now().isoformat()))
+                self.store.conn.commit()
+                push = True  # reserved: at most one push per deal, even across rounds
         self.stats.deals_by_tier[tier] = self.stats.deals_by_tier.get(tier, 0) + 1
         self.stats.deals.append({"id": deal.id, "tier": tier, "star": deal.star, "key": deal.key,
                                  "cons_net_usd": str(deal.cons_net_usd), "exp_net_usd": str(deal.exp_net_usd),
                                  "confidence": deal.confidence, "effort": deal.effort, "channel": a.channel,
-                                 "source": l.source, "url": l.url, "verified": verified})
+                                 "source": l.source, "url": l.url, "verified": verified, "updated": old is not None})
         self.arm_value[arm.id].append((tier, float(deal.exp_net_usd)))
-        if tier == 1 and not self.ctx.dry:
+        if push:
             day = deal.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
             card_url = f"{self.repo_web_url}/blob/log/deals/{day}/{path.name}" if self.repo_web_url else ""
             await self.ctx.push(deal, card_url, store=self.store, cfg=self.cfg, root=self.root, listing_url=l.url,
@@ -946,6 +1090,56 @@ class _Round:
         self.ctx.budget = nxt
 
     # ------------------------------------------------------------ main
+    async def _llm_guard(self) -> None:
+        """A model outside the configured roles is loaded (another workload): this round runs on the rules alone and
+        LLM-needing listings are marked llm_pending, so the round never makes llama-swap evict that model."""
+        if self.llm is None:
+            self.stats.llm_mode = "off"
+            return
+        if self.ctx.llm_check is None:
+            return
+        try:
+            foreign = list(await self.ctx.llm_check())
+        except Exception as e:  # noqa: BLE001 - cannot tell: be safe, no LLM this round
+            foreign = [f"check failed: {type(e).__name__}"]
+        if foreign:
+            self.llm = None
+            self.stats.llm_mode = "foreign_model"
+            self.stats.foreign_models = foreign
+            self.store.add_health("scheduler", "foreign_model", "rules-only round; llama-swap runs " + ", ".join(foreign))
+
+    async def _sweep(self, source: str, arms: list[Arm] | None, mail_ad=None) -> None:
+        """One source's sweep under its own deadline (sources.sweep_timeout_s): a stuck source is cut alone."""
+        src = self.cfg.get("sources")
+        limit = float((src.to_dict() if src is not None else {}).get("sweep_timeout_s", SWEEP_TIMEOUT_S))
+        coro = self._run_mail(source, mail_ad) if mail_ad is not None else self._run_source(source, arms)
+        try:
+            await asyncio.wait_for(coro, limit)
+        except asyncio.TimeoutError:
+            self.stats.sweep_timeouts.append(source)
+            self.store.add_health(source, "sweep_timeout", f"sweep cut after {limit:.0f}s")
+
+    async def _drain(self, deadline: float, grace: float) -> None:
+        """Wait for the evaluation tasks until the round deadline; past it, started work gets `grace` seconds more,
+        then whatever is left is cancelled."""
+        hard: float | None = None
+        while self.tasks:
+            pending, self.tasks = self.tasks, []
+            now = time.monotonic()
+            if now >= deadline and hard is None:
+                hard = now + grace
+                self.stats.errors.append(f"round timeout: {len(pending)} evaluation(s) get {grace:.0f}s grace")
+            limit = (hard if hard is not None else deadline) - now
+            _, left = await asyncio.wait(pending, timeout=max(0.0, limit))
+            if left:
+                if hard is not None and time.monotonic() >= hard:
+                    for t in left:
+                        t.cancel()
+                    await asyncio.gather(*left, return_exceptions=True)
+                    self.stats.errors.append(f"round timeout: {len(left)} evaluation(s) cancelled")
+                    return
+                self.tasks = list(left) + self.tasks
+
     async def run(self) -> RoundStats:
         ctx, st = self.ctx, self.stats
         if ctx.frozen_digest is not None:
@@ -957,29 +1151,30 @@ class _Round:
         sampler = books.GpuSampler(float((self.cfg.get("books").to_dict() if self.cfg.get("books") is not None
                                           else {}).get("gpu_sample_s", 15)), ctx.gpu_sample)
         sampler.start()
+        arms: list[Arm] = []
         try:
             self._maintenance()
+            await self._llm_guard()
             await self._warm_rates()
             arms = self._plan()
+            self._requeue()  # before the sweeps: what they return again is not queued twice
             by_src: dict[str, list[Arm]] = defaultdict(list)
             for a in arms:
                 by_src[a.source].append(a)
-            sweeps = [asyncio.create_task(self._run_source(s, a)) for s, a in by_src.items()]
-            mail = [asyncio.create_task(self._run_mail(n, ad)) for n, ad in self.ctx.adapters.items()
-                    if is_mail_source(ad)]
-            sweeps += mail
-            timeout = float(self.sc["round_timeout_s"])
-            try:
-                await asyncio.wait_for(asyncio.gather(*sweeps), timeout)
-                arms += [t.result() for t in mail]
-                while self.tasks:  # evaluation tasks may still be running (LLM, detail, verify)
-                    pending, self.tasks = self.tasks, []
-                    await asyncio.wait_for(asyncio.gather(*pending), max(1.0, timeout - (time.monotonic() - t0)))
-            except asyncio.TimeoutError:
-                st.errors.append(f"round timeout after {timeout:.0f}s")
-                for t in [*sweeps, *self.tasks]:
+            deadline = t0 + float(self.sc["round_timeout_s"])
+            self.sweeps = [asyncio.create_task(self._sweep(s_, a_)) for s_, a_ in by_src.items()]
+            self.sweeps += [asyncio.create_task(self._sweep(n, None, ad)) for n, ad in self.ctx.adapters.items()
+                            if is_mail_source(ad)]
+            cut: set = set()
+            if self.sweeps:
+                _, cut = await asyncio.wait(self.sweeps, timeout=max(0.0, deadline - time.monotonic()))
+            if cut:  # outer guard: unfinished sweeps stop; evaluations already queued still get their chance
+                st.errors.append(f"round timeout: {len(cut)} sweep(s) cut")
+                for t in cut:
                     t.cancel()
-                await asyncio.gather(*sweeps, *self.tasks, return_exceptions=True)
+                await asyncio.gather(*cut, return_exceptions=True)
+            arms += self.mail_arms
+            await self._drain(deadline, float(self.sc["timeout_grace_s"]))
             if not ctx.dry:
                 try:
                     st.pushes_retried = await notify.retry_pending(self.store, self.cfg, self.root)
@@ -987,6 +1182,16 @@ class _Round:
                     st.errors.append(f"retry_pending: {e}"[:200])
             await self._ebay_comps()
             self._owner_sales()
+        except BaseException:
+            # cancelled (SIGTERM) or failed: stop every child task and wait for it, so nothing touches the store,
+            # fetcher or LLM client after the caller closes them; no bookkeeping is written for a broken round
+            children = [*self.sweeps, *self.created]
+            for t in children:
+                if not t.done():
+                    t.cancel()
+            await asyncio.gather(*children, return_exceptions=True)
+            self.tasks = []
+            raise
         finally:
             watts = await sampler.stop()
         st.seconds = round(time.monotonic() - t0, 1)

@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import signal
 import sys
 from datetime import datetime, timezone
@@ -103,6 +104,12 @@ async def _round(args) -> int:
         for r in reasons:
             print(f"  - {r}")
         return 1
+    if runtime.round_running(root) is not None:
+        print("refused: another foreground `dh round` is running")
+        return 1
+    pid_file = runtime.round_pid_path(root)
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    pid_file.write_text(str(os.getpid()))  # `dh start` refuses while this exists and the process lives
     store = _store(root, must_exist=False)
     ledger.close_all_windows(store, datetime.now(timezone.utc))  # recovery
     fetcher = Fetcher(cfg, store, root / "var")
@@ -150,6 +157,8 @@ async def _round(args) -> int:
             await ctx.llm.aclose()
             runtime.release_models(cfg, before)
         store.close()
+        with contextlib.suppress(OSError):
+            pid_file.unlink()
     return rc
 
 
@@ -252,13 +261,13 @@ def cmd_verify(args) -> int:
 
 def cmd_books(args) -> int:
     from . import books, ledger
-    root, _ = _ctx()
+    root, cfg = _ctx()
     store = _store(root)
     if store is None:
         return 1
     try:
         today = datetime.now(timezone.utc).date().isoformat()
-        out = {"all_time": books.summary(store), "today": books.summary(store, since=today),
+        out = {"all_time": books.summary(store, cfg=cfg), "today": books.summary(store, since=today, cfg=cfg),
                "watched_hours": round(ledger.watched_hours(store), 2),
                "deals": {str(r["tier"]): r["n"] for r in store.conn.execute(
                    "select tier, count(*) n from deals group by tier order by tier")},

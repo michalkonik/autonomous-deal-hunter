@@ -63,6 +63,25 @@ def state_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "state.json"
 
 
+def round_pid_path(root: Path) -> Path:
+    return Path(root) / "var" / "run" / "round.pid"
+
+
+def round_running(root: Path) -> int | None:
+    """pid of a foreground `dh round` that is still alive, else None (a stale pid file is ignored)."""
+    try:
+        pid = int(round_pid_path(root).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+    return pid
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -208,6 +227,11 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     if is_active(run):
         print(f"deal-hunter is already running (systemctl --user status {UNIT})", file=out)
         return 0
+    rp = round_running(root)
+    if rp is not None:
+        print(f"dh start refused: a foreground `dh round` is running (pid {rp}); let it finish or stop it first",
+              file=out)
+        return 1
     reasons, running, warnings = preflight(cfg, http_get=http_get, meminfo=meminfo)
     for w in warnings:
         print(f"warning: {w}", file=out)
@@ -385,6 +409,11 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     if not no_llm:
         from .llm import Client
         ctx.llm = Client(cfg, on_usage=ctx.on_usage)
+
+        async def foreign_models() -> list[str]:
+            running = await asyncio.to_thread(llama_running, cfg)
+            return [] if running is None else [m for m in running if m not in role_models(cfg)]
+        ctx.llm_check = foreign_models
     return ctx
 
 

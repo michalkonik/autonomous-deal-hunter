@@ -395,15 +395,30 @@ def active_asks(store: Store, key: str, condition: str | None, now: datetime, *,
 
 
 def watched_hours(store: Store, source: str | None = None, until: datetime | None = None) -> float:
-    """Total observed time (scoreboard, §15a.1). Open windows count up to their last observation."""
+    """Observed time in hours: the UNION of the observation windows (one hour watched on three sources at once is
+    one hour, not three), optionally of one `source`, and up to `until`. Open windows count up to their last
+    observation. The status, books and web pages and the improvement loop's clock (improve.monitor) all use this."""
     migrate(store)
-    sql, args = "select * from windows", []
+    sql, args = "select opened_at, closed_at, last_obs_at from windows", []
     if source is not None:
         sql, args = sql + " where source=?", [source]
-    total = 0.0
+    spans = []
     for w in store.conn.execute(sql, args).fetchall():
-        end = _t(w["closed_at"]) or _t(w["last_obs_at"]) or _t(w["opened_at"])
+        a = _t(w["opened_at"])
+        b = _t(w["closed_at"]) or _t(w["last_obs_at"]) or a
         if until is not None:
-            end = min(end, until)
-        total += max(0.0, (end - _t(w["opened_at"])).total_seconds() / 3600)
-    return total
+            b = min(b, until)
+        if b > a:
+            spans.append((a, b))
+    spans.sort()
+    total, cur_a, cur_b = 0.0, None, None
+    for a, b in spans:
+        if cur_b is None or a > cur_b:
+            if cur_b is not None:
+                total += (cur_b - cur_a).total_seconds()
+            cur_a, cur_b = a, b
+        else:
+            cur_b = max(cur_b, b)
+    if cur_b is not None:
+        total += (cur_b - cur_a).total_seconds()
+    return total / 3600

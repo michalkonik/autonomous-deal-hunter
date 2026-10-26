@@ -26,6 +26,7 @@ import json
 import os
 import re
 import tempfile
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -56,11 +57,30 @@ CORE = ("id", "kind", "target", "provenance", "helpful", "harmful", "sentinel")
 EXTRA_KEYS = frozenset({"min_pln", "max_pln", "category", "note"})
 
 VERSIONS_COLUMNS = ("status text", "parent integer", "delta text", "diff text", "sha text", "proposal_id integer",
-                    "decided_at text")
+                    "decided_at text", "note text")
+# Human edits made to playbook/items.yaml at install time, before any version existed. They did not go through the
+# loop, so the first baseline says so (every later human edit is detected and stored as an "owner edit" baseline).
+INSTALL_NOTE = ("baseline at install, with two owner-approved manual edits: prompt.extract trimmed from 1667 to "
+                "1500 chars to fit the prompt cap (manual trim at install; same rules, tighter wording); the broad "
+                "scam keyword 'pudelko po' replaced by the narrow phrases 'sprzedam/samo/tylko pudelko po' (an "
+                "original box sold WITH the card is normal; golden case g-box-included-pl-verified)")
 COUNTERS_SQL = """create table if not exists playbook_counters (
   item_id text primary key, helpful integer not null default 0, harmful integer not null default 0)"""
 # a version's life: shadow -> promoted | rejected; promoted -> failed_in_prod (rolled back)
-STATUSES = ("baseline", "candidate", "shadow", "promoted", "rejected", "failed_in_prod")
+STATUSES = ("baseline", "candidate", "shadow", "promoted", "rejected", "failed_in_prod", "aborted")
+
+
+def prompt_sha(pb: "Playbook", item_id: str = "prompt.extract") -> str | None:
+    it = pb.get(item_id)
+    return None if it is None else hashlib.sha256(str(it.value).encode()).hexdigest()[:16]
+
+
+def door_of(kind: str) -> str:
+    """Which evaluation path proves a change of this item kind (research §4.2):
+    judgment = alias / scam keyword (offline gates, then shadow, then probation);
+    llm = prompt (gates cannot evaluate it without live LLM calls: owner review only, then probation);
+    arm = query / cadence (online only: the bandit's trial budget under probation)."""
+    return {"alias": "judgment", "scam_kw": "judgment", "prompt": "llm"}.get(kind, "arm")
 
 
 class PlaybookError(ValueError):
@@ -214,14 +234,7 @@ class Delta:
         return f"{self.op} {self.item.id} ({self.item.kind} -> {self.item.target}): {v!r}"
 
     def door(self) -> str:
-        """Which evaluation path proves this delta (research §4.2):
-        judgment = alias / scam keyword (offline gates, then shadow); llm = prompt (shadow with the live model);
-        arm = query / cadence (online only: the bandit's trial budget under probation)."""
-        if self.item.kind in ("alias", "scam_kw"):
-            return "judgment"
-        if self.item.kind == "prompt":
-            return "llm"
-        return "arm"
+        return door_of(self.item.kind)
 
 
 # --------------------------------------------------------------------------------------------- playbook
@@ -399,7 +412,7 @@ class Playbook:
 
     # ------------------------------------------------------------ store / files
     def save_version(self, store, *, status: str = "candidate", parent: int | None = None, delta: Delta | None = None,
-                     proposal_id: int | None = None) -> int:
+                     proposal_id: int | None = None, note: str | None = None, commit: bool = True) -> int:
         """Store a full snapshot (+ delta + diff against `parent`) and return the version id. The snapshot is
         validated first; nothing is written to disk (activation is separate, see `activate`)."""
         if status not in STATUSES:
@@ -410,11 +423,12 @@ class Playbook:
         diff = prev.diff(self, f"v{parent}", "new") if prev is not None else ""
         n = store.conn.execute("select count(*) from playbook_versions").fetchone()[0] + 1
         cur = store.conn.execute(
-            "insert into playbook_versions (version, content, status, parent, delta, diff, sha, proposal_id) "
-            "values (?,?,?,?,?,?,?,?)",
+            "insert into playbook_versions (version, content, status, parent, delta, diff, sha, proposal_id, note) "
+            "values (?,?,?,?,?,?,?,?,?)",
             (f"v{n}", self.to_yaml(), status, parent, json.dumps(delta.to_dict()) if delta else None, diff,
-             self.sha(), proposal_id))
-        store.conn.commit()
+             self.sha(), proposal_id, note))
+        if commit:
+            store.conn.commit()
         self.version = cur.lastrowid
         return cur.lastrowid
 
@@ -481,12 +495,19 @@ def _guarded_write(path: Path, text: str, *, allowed_root: Path) -> Path:
 # --------------------------------------------------------------------------------------------- versions table
 
 
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
 def migrate(store) -> None:
+    """Idempotent and done once per store object, so it never commits in the middle of a caller's transaction."""
+    if store in _MIGRATED:
+        return
     have = {r["name"] for r in store.conn.execute("pragma table_info(playbook_versions)")}
     for col in VERSIONS_COLUMNS:
         if col.split()[0] not in have:
             store.ensure_table(f"alter table playbook_versions add column {col}")
     store.ensure_table(COUNTERS_SQL)
+    _MIGRATED.add(store)
 
 
 def active_version(store) -> int | None:
@@ -497,27 +518,34 @@ def active_version(store) -> int | None:
     return None if r is None else int(r["id"])
 
 
-def ensure_baseline(store, root: Path = ROOT) -> int:
-    """The active version id; on first use the file is stored as version v1 with status 'baseline'."""
+def ensure_baseline(store, root: Path = ROOT, note: str = INSTALL_NOTE) -> int:
+    """The active version id; on first use the file is stored as version v1 with status 'baseline' and a note."""
     vid = active_version(store)
     if vid is not None:
         return vid
-    return Playbook.from_file(root).save_version(store, status="baseline")
+    return Playbook.from_file(root).save_version(store, status="baseline", note=note)
 
 
-def set_status(store, version: int, status: str) -> None:
+def set_status(store, version: int, status: str, *, commit: bool = True) -> None:
     if status not in STATUSES:
         raise PlaybookError(f"unknown version status {status!r}")
     migrate(store)
     store.conn.execute("update playbook_versions set status=?, decided_at=datetime('now') where id=?",
                        (status, version))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
+
+
+def version_sha(store, version: int) -> str | None:
+    migrate(store)
+    r = store.conn.execute("select sha from playbook_versions where id=?", (version,)).fetchone()
+    return None if r is None else r["sha"]
 
 
 def versions(store) -> list[dict]:
     migrate(store)
     return [dict(r) for r in store.conn.execute(
-        "select id, version, status, parent, delta, sha, proposal_id, created_at, decided_at "
+        "select id, version, status, parent, delta, sha, proposal_id, note, created_at, decided_at "
         "from playbook_versions order by id")]
 
 

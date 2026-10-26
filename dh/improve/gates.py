@@ -12,9 +12,10 @@ Gate cascade, cheapest first; the first failing stage rejects:
               (fixes). Reject if b >= c ("fix more than you break"); the exact McNemar p is reported.
 4. replay   - the last REPLAY_DAYS of stored listings: reject if the expected net of tier 1-3 falls more than 5%,
               if known false positives rise, or if a known true deal is lost.
-Doors (research §4.2): alias / scam_kw = judgment (all four stages, then shadow); prompt = llm (golden and replay
-use cached LLM output so they cannot see a prompt change: shadow with the live model decides); query / cadence = arm
-(offline replay cannot score a query nobody ran: probation with the CUSUM decides).
+Doors (research §4.2): alias / scam_kw = judgment (all four stages, then shadow); prompt = llm (update only; the
+offline stages use cached LLM output and cannot see a prompt change, so the loop never promotes one: it stops at
+"owner_review" and the owner applies it after a LIVE must-pass run); query / cadence = arm (offline replay cannot
+score a query nobody ran: probation with the CUSUM decides).
 
 Offline evaluation is deterministic (rules + cached LLM output + fixed FX), so pass^k is pass^1 here; the live-LLM
 variance is handled in shadow, where only labelled disagreements count.
@@ -35,7 +36,7 @@ from ..models import CompRef, Listing
 from ..store import Store
 from ..valuation import ExitEstimate
 from . import replay
-from .playbook import EDITABLE_PROMPT_TARGETS, Playbook
+from .playbook import EDITABLE_PROMPT_TARGETS, Playbook, door_of, eval_root
 
 ROOT = Path(__file__).resolve().parents[2]
 EVALS = ROOT / "evals"
@@ -90,18 +91,42 @@ class GateResult:
 # ------------------------------------------------------------------ exact statistics (no scipy)
 
 
+def _binom_logpmf(i: int, n: int, p: float) -> float:
+    return (math.lgamma(n + 1) - math.lgamma(i + 1) - math.lgamma(n - i + 1)
+            + i * math.log(p) + (n - i) * math.log1p(-p))
+
+
+def _logsumexp_prob(terms: list[float]) -> float:
+    if not terms:
+        return 0.0
+    m = max(terms)
+    return min(1.0, math.exp(m) * sum(math.exp(t - m) for t in terms))
+
+
 def binom_sf(k: int, n: int, p: float = 0.5) -> float:
-    """P(X >= k) for X ~ Binomial(n, p), exact."""
+    """P(X >= k) for X ~ Binomial(n, p), exact, in log space (no overflow for any n)."""
     if k <= 0:
         return 1.0
     if k > n:
         return 0.0
-    return min(1.0, sum(math.comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(k, n + 1)))
+    if p <= 0:
+        return 0.0
+    if p >= 1:
+        return 1.0
+    return _logsumexp_prob([_binom_logpmf(i, n, p) for i in range(k, n + 1)])
 
 
 def binom_cdf(k: int, n: int, p: float) -> float:
-    """P(X <= k) for X ~ Binomial(n, p), exact."""
-    return 1.0 - binom_sf(k + 1, n, p) if k < n else 1.0
+    """P(X <= k) for X ~ Binomial(n, p), exact, in log space."""
+    if k < 0:
+        return 0.0
+    if k >= n:
+        return 1.0
+    if p <= 0:
+        return 1.0
+    if p >= 1:
+        return 0.0
+    return _logsumexp_prob([_binom_logpmf(i, n, p) for i in range(0, k + 1)])
 
 
 def hypergeom_cdf(k: int, total: int, successes: int, draws: int) -> float:
@@ -112,8 +137,8 @@ def hypergeom_cdf(k: int, total: int, successes: int, draws: int) -> float:
     if k < lo:
         return 0.0
     den = lc(total, draws)
-    return min(1.0, sum(math.exp(lc(successes, x) + lc(total - successes, draws - x) - den)
-                        for x in range(lo, min(k, hi) + 1)))
+    return _logsumexp_prob([lc(successes, x) + lc(total - successes, draws - x) - den
+                            for x in range(lo, min(k, hi) + 1)])
 
 
 def poisson_cdf(k: int, mu: float) -> float:
@@ -130,7 +155,7 @@ def mcnemar_exact(b: int, c: int) -> float:
     n = b + c
     if n == 0:
         return 1.0
-    return min(1.0, 2 * (1 - binom_sf(min(b, c) + 1, n)))
+    return min(1.0, 2 * binom_cdf(min(b, c), n, 0.5))
 
 
 def shadow_verdict(wins: int, losses: int, rounds: int, watched_hours: float) -> tuple[str, dict]:
@@ -287,8 +312,10 @@ def expect_ok(o: replay.Outcome, expect: dict) -> tuple[bool, str]:
     return True, ""
 
 
-async def score_cases(pb: Playbook, cases: list[dict], *, cfg=None) -> list[CaseResult]:
-    """Judge every case with `pb` (fresh in-memory store, fixed FX and day, the case's own market)."""
+async def score_cases(pb: Playbook, cases: list[dict], *, cfg=None, llm=None) -> list[CaseResult]:
+    """Judge every case with `pb` (fresh in-memory store, fixed FX and day, the case's own market). With `llm`
+    (owner review of a prompt change) every case whose rules are not certain is extracted LIVE with pb's prompts;
+    without it the case's cached LLM output is used."""
     current: dict[str, Any] = {"fn": None}
     store = Store(":memory:")
     try:
@@ -297,13 +324,27 @@ async def score_cases(pb: Playbook, cases: list[dict], *, cfg=None) -> list[Case
         out = []
         for case in cases:
             current["fn"] = case_estimates(case)
-            o = await j.judge(case_listing(case), lid=0, cached=_case_llm(case),
-                              verified_age_s=0.0 if case.get("verified") else None)
+            listing = case_listing(case)
+            cached = _case_llm(case)
+            if llm is not None:
+                cached = await _live_extraction(pb, listing, llm) or cached
+            o = await j.judge(listing, lid=0, cached=cached, verified_age_s=0.0 if case.get("verified") else None)
             ok, why = expect_ok(o, case.get("expect") or {})
             out.append(CaseResult(str(case["id"]), ok, why, o))
         return out
     finally:
         store.close()
+
+
+async def _live_extraction(pb: Playbook, listing: Listing, llm):
+    from .. import extract as extractmod
+    from ..match import rules_extract
+    root = eval_root(pb)
+    rules = rules_extract(listing.title, listing.description, (listing.country or "pl").lower(), root=root)
+    if rules.certainty >= extractmod.RULES_CERTAIN or rules.box_only or rules.wanted_ad or rules.for_parts:
+        return None
+    ex = await extractmod.extract(listing, rules, llm, root)
+    return ex if ex.method == "llm" else None
 
 
 def _case_llm(case: dict):
@@ -329,10 +370,6 @@ def changed_items(champion: Playbook, challenger: Playbook) -> list[tuple[str, s
     return sorted(out)
 
 
-def door_of(kind: str) -> str:
-    return {"alias": "judgment", "scam_kw": "judgment", "prompt": "llm"}.get(kind, "arm")
-
-
 def _schema(champion: Playbook, challenger: Playbook) -> tuple[list[str], dict]:
     errs = list(challenger.errors())
     changed = changed_items(champion, challenger)
@@ -348,6 +385,8 @@ def _schema(champion: Playbook, challenger: Playbook) -> tuple[list[str], dict]:
         errs.append(f"{iid}: sentinel items are immutable")
     if it.kind == "prompt" and it.target not in EDITABLE_PROMPT_TARGETS:
         errs.append(f"{iid}: prompt {it.target} is not editable by the loop")
+    if it.kind == "prompt" and op != "update":
+        errs.append(f"{iid}: prompts are only updated (owner review), never added or removed")
     if it.kind in ("query", "cadence") and op == "remove":
         errs.append(f"{iid}: arms are retired by the bandit's cold pool, not removed by a delta")
     if new is not None and old is not None and new.kind != old.kind:
@@ -374,6 +413,9 @@ async def evaluate(champion: Playbook, challenger: Playbook, store, *, cfg=None,
     if fails or not res:
         return GateResult(False, "must_pass", detail)
 
+    if detail["door"] == "llm":  # ruling: gates cannot judge a prompt without live calls -> the owner decides
+        detail["golden"] = detail["replay"] = "not applicable offline (llm door)"
+        return GateResult(True, "owner_review", detail)
     if detail["door"] != "judgment":
         detail["golden"] = detail["replay"] = f"not applicable offline ({detail['door']} door)"
         return GateResult(True, "offline", detail)
@@ -411,8 +453,8 @@ async def evaluate(champion: Playbook, challenger: Playbook, store, *, cfg=None,
     return GateResult(True, "offline", detail)
 
 
-async def must_pass_ok(pb: Playbook, *, cfg=None) -> tuple[bool, list[str]]:
-    """Re-run of the must-pass set (promotion check and the daily probation re-check)."""
-    res = await score_cases(pb, load_cases(MUST_PASS), cfg=cfg)
+async def must_pass_ok(pb: Playbook, *, cfg=None, llm=None) -> tuple[bool, list[str]]:
+    """Re-run of the must-pass set (promotion check, daily probation re-check; with `llm`: live, for owner review)."""
+    res = await score_cases(pb, load_cases(MUST_PASS), cfg=cfg, llm=llm)
     bad = [r.id for r in res if not r.ok]
     return (not bad and bool(res)), bad

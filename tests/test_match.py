@@ -723,7 +723,8 @@ def test_for_laptop_is_none(tpl, chip):
 
 def test_description_laptop_phrases():
     assert ex("RTX 4090 24GB", "karta z laptopa").key is None
-    assert ex("RTX 4090 24GB", "bez laptopa, sama karta").key is None or True
+    # ruling: laptop words in the description (even "bez laptopa") are never a desktop key; 24 GB is no mobile 4090
+    assert ex("RTX 4090 24GB", "bez laptopa, sama karta").key is None
     assert ex("RTX 4090 24GB", "nie do laptopa").key == "gpu:rtx-4090:24"
 
 
@@ -741,3 +742,55 @@ def test_minor_brand_tokens_and_screen_alone(title, key):
 def test_msi_stealth_and_alienware_laptops(title):
     r = ex(title)
     assert r.key is None or r.key.startswith("gpu-mobile:")
+
+
+# ------------------------------------------------------------------ stripped die, brand context
+
+DIE = ["bez rdzenia", "bez chipu", "bez GPU", "tylko PCB", "sama płytka", "bez pamięci", "no die", "no core",
+       "no GPU chip", "PCB only", "missing die", "no VRAM", "ohne Chip", "ohne GPU-Chip", "nur Platine",
+       "bez jádra", "bez čipu", "chip nélkül"]
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RTX 3060 Ti 8GB", "RX 7900 XTX 24GB", "RTX 5080 16GB"])
+@pytest.mark.parametrize("w", DIE)
+def test_stripped_die_is_for_parts(w, chip):
+    r = ex(f"{chip} {w}")
+    assert r.for_parts is True and r.condition == "for_parts", w
+    assert "stripped_die" in r.defects
+
+
+@pytest.mark.parametrize("title", ["RTX 4090 24GB", "RTX 3060 Ti 8GB z rdzeniem", "RX 7900 XTX 24GB core clock 2500"])
+def test_normal_cards_not_stripped(title):
+    assert ex(title).for_parts is False
+
+
+@pytest.mark.parametrize("title", [
+    "ASUS ROG Strix Z790-E Gaming 4080 DDR5", "Aorus Elite B550 3080 motherboard", "MSI Suprim 4090 mouse pad",
+    "ROG Strix XG27 4090", "Aorus K1 4070", "Aorus Z790 4090 płyta główna", "ROG Strix B650 3080 Mainboard",
+    "Aorus X670 4080 Ti", "Strix monitor 4090", "Aorus klawiatura 3080", "Strix headset 4090",
+    "Suprim mysz 4070",
+])
+def test_brand_with_non_gpu_product_is_none(title):
+    assert ex(title).key is None, title
+
+
+@pytest.mark.parametrize("title,key", [
+    ("Aorus 4090 Master 24GB", "gpu:rtx-4090:24"),
+    ("ROG Strix 3080 10GB", "gpu:rtx-3080:10"),
+    ("MSI Suprim 4090 24GB", "gpu:rtx-4090:24"),
+    ("ASUS ROG Strix RTX 4080 Z790 test", "gpu:rtx-4080:16"),
+])
+def test_brand_context_still_works_for_cards(title, key):
+    assert ex(title).key == key
+
+
+@pytest.mark.parametrize("title", [
+    "RTX 4090 without box no core issues", "RTX 4090 no VRAM errors", "RTX 4090 ohne Chip Fehler",
+    "RTX 4080 no die issues at all", "RTX 3060 Ti no core problems", "RX 7900 XTX ohne GPU-Chip Probleme",
+    "RTX 5080 no VRAM artifacts", "RTX 4090 bez rdzenia błędów", "RTX 4090 bez chipu chyb",
+    # ruling: "bez rdzenia problemów" reads as "no core problems" (a working card), not a stripped board
+    "RTX 4090 bez rdzenia problemów",
+])
+def test_stripped_die_words_followed_by_issue_nouns_are_not_for_parts(title):
+    r = ex(title)
+    assert r.for_parts is False and "stripped_die" not in r.defects, title

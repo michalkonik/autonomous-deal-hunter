@@ -15,6 +15,7 @@ search results; it cannot score a query nobody ran (Li et al. 2011), so query an
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import random
 from dataclasses import dataclass, field
@@ -150,8 +151,8 @@ class Judge:
         lang = (listing.country or "pl").lower()
         rules = rules_extract(listing.title, listing.description, lang, root=self.root)
         notes = [n for n in rules.notes if n.startswith("alias:")]
-        if rules.wanted_ad or rules.box_only or rules.for_parts:
-            return Outcome(None, True, "bait", notes=notes)
+        if rules.wanted_ad or rules.box_only or rules.for_parts:  # as the scheduler: the rules' key is kept
+            return Outcome(rules.key, True, "bait", notes=notes)
         title = listing.title or ""
         if rules.key is None and (not scheduler._HW.search(title) or scheduler._SYSTEM_WORDS.search(title)):
             return Outcome(None, True, "no_key", notes=notes)
@@ -210,14 +211,60 @@ def _iso(t: datetime) -> str:
     return t.astimezone(timezone.utc).isoformat()
 
 
-def cached_extraction(store, lid: int) -> Extraction | None:
+def title_hash(title: str | None) -> str:
+    """The scheduler's evaluations.title_hash (dh.scheduler._Round._title_hash)."""
+    return hashlib.sha1((title or "").encode()).hexdigest()[:16]
+
+
+def cached_extraction(store, lid: int, title: str | None = None, prompt_sha: str | None = None) -> Extraction | None:
+    """The stored LLM extraction of a listing, or None when there is none, when the listing's title changed since
+    (evaluations.title_hash, the scheduler's own staleness rule), or, with `prompt_sha`, when it was produced
+    under another extraction prompt (the sentinel's pinned prompt must never see a newer prompt's output)."""
     r = store.conn.execute("select * from extractions where listing_id=? and method='llm'", (lid,)).fetchone()
     if r is None:
         return None
+    if title is not None or prompt_sha is not None:
+        try:
+            ev = store.conn.execute("select title_hash, at from evaluations where listing_id=?", (lid,)).fetchone()
+        except Exception:  # noqa: BLE001 - no evaluations table: nothing proves the cache is current
+            return None
+        if ev is None:
+            return None
+        if title is not None and ev["title_hash"] != title_hash(title):
+            return None
+        if prompt_sha is not None and prompt_sha_at(store, ev["at"]) != prompt_sha:
+            return None
     return Extraction(key=r["key"], category=r["category"], certainty=float(r["certainty"] or 0),
                       condition=r["condition"] or "unknown", defects=json.loads(r["defects"] or "[]"),
                       box_only=bool(r["box_only"]), for_parts=bool(r["for_parts"]), wanted_ad=bool(r["wanted_ad"]),
                       bundle_items=json.loads(r["bundle_items"] or "[]"), method="llm")
+
+
+EPOCHS_SQL = """create table if not exists improve_prompt_epochs (
+  id integer primary key, sha text not null, started_at text not null)"""
+
+
+def record_prompt_epoch(store, sha: str | None, at: datetime) -> None:
+    """Remember from when on an extraction prompt was active (one row per change)."""
+    if sha is None:
+        return
+    store.ensure_table(EPOCHS_SQL)
+    last = store.conn.execute("select sha from improve_prompt_epochs order by id desc limit 1").fetchone()
+    if last is None or last["sha"] != sha:
+        store.conn.execute("insert into improve_prompt_epochs (sha, started_at) values (?,?)", (sha, _iso(at)))
+        store.conn.commit()
+
+
+def prompt_sha_at(store, at: str | None) -> str | None:
+    """The extraction prompt active at `at` (ISO); before the first recorded epoch: the first epoch's prompt."""
+    store.ensure_table(EPOCHS_SQL)
+    if at is not None:
+        r = store.conn.execute("select sha from improve_prompt_epochs where started_at <= ? order by id desc limit 1",
+                               (at,)).fetchone()
+        if r is not None:
+            return r["sha"]
+    r = store.conn.execute("select sha from improve_prompt_epochs order by id limit 1").fetchone()
+    return None if r is None else r["sha"]
 
 
 def verified_listings(store) -> set[int]:
@@ -246,8 +293,9 @@ def window_listings(store, since: datetime, until: datetime, cap: int = REPLAY_C
 
 
 async def judge_listings(playbook: Playbook, store, lids: list[int], *, now: datetime, cfg=None,
-                         fx=None) -> dict[int, Outcome]:
-    """Offline outcomes for stored listings (cached LLM extractions, stored comps and FX, no network)."""
+                         fx=None, prompt_sha: str | None = None) -> dict[int, Outcome]:
+    """Offline outcomes for stored listings (cached LLM extractions that are still current, stored comps and FX,
+    no network). `prompt_sha`: use only cached extractions made under that extraction prompt."""
     j = Judge(playbook, store, cfg=cfg, fx=fx, now=now)
     verified = verified_listings(store)
     out: dict[int, Outcome] = {}
@@ -255,7 +303,7 @@ async def judge_listings(playbook: Playbook, store, lids: list[int], *, now: dat
         l = load_listing(store, lid)
         if l is None:
             continue
-        out[lid] = await j.judge(l, lid=lid, cached=cached_extraction(store, lid),
+        out[lid] = await j.judge(l, lid=lid, cached=cached_extraction(store, lid, l.title, prompt_sha),
                                  verified_age_s=0.0 if lid in verified else None)
     return out
 

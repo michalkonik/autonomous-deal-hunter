@@ -6,6 +6,7 @@ Runtime: the guarded writer refuses every frozen path (tests/improve/test_improv
 (dh.config.frozen_digest) covers gates.py and evals/.
 """
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -15,17 +16,32 @@ from dh.improve import playbook as pbm
 
 REPO = Path(__file__).resolve().parents[2]
 IMPROVE = sorted((REPO / "dh" / "improve").glob("*.py"))
-FROZEN = config.FROZEN_PATHS + config.LOCAL_FROZEN_PATHS + ["data/"]  # notes: data/* is frozen too
+FROZEN = config.FROZEN_PATHS + config.LOCAL_FROZEN_PATHS
+# a frozen path named as a path: a directory followed by "/" or the end of the string ("data, not ..." is prose)
+FROZEN_RX = [(fp, re.compile(r"(?<![\w.-])" + re.escape(fp) + (r"(?:/|$)" if (REPO / fp).is_dir() else r"(?![\w])")))
+             for fp in FROZEN]
 
 WRITE_METHODS = {"write_text", "write_bytes", "unlink", "rmdir", "touch", "chmod", "symlink_to", "hardlink_to",
-                 "rename", "mkdir"}
+                 "rename", "mkdir", "cleanup"}
 WRITE_FUNCS = {("os", "replace"), ("os", "rename"), ("os", "remove"), ("os", "unlink"), ("os", "makedirs"),
                ("os", "rmdir"), ("os", "system"), ("os", "popen"), ("os", "symlink"), ("os", "link"),
-               ("os", "truncate"), ("os", "chmod")}
+               ("os", "truncate"), ("os", "chmod"), ("os", "open"), ("os", "write"), ("os", "fdopen"),
+               ("os", "mkdir"), ("io", "open"), ("codecs", "open"),
+               ("tempfile", "mkstemp"), ("tempfile", "mkdtemp"), ("tempfile", "NamedTemporaryFile"),
+               ("tempfile", "TemporaryFile"), ("tempfile", "SpooledTemporaryFile"), ("tempfile", "TemporaryDirectory")}
 FORBIDDEN_IMPORTS = {"shutil", "subprocess", "pty", "evals.marks"}
 # the only places allowed to write: the guarded writer, and the temp-dir creation of `materialise`
 ALLOWED = {("playbook.py", "_guarded_write"): {"open", "os.replace"},
-           ("playbook.py", "materialise"): {"mkdir"}}
+           ("playbook.py", "materialise"): {"mkdir"},
+           ("playbook.py", "eval_root"): {"tempfile.TemporaryDirectory", "cleanup"}}
+
+
+def _write_mode(call: ast.Call, pos: int) -> bool:
+    """True unless the call's mode is a literal read-only mode ('r', 'rb', 'rt')."""
+    mode = call.args[pos] if len(call.args) > pos else next((k.value for k in call.keywords if k.arg == "mode"), None)
+    if mode is None:
+        return False  # open() and Path.open() default to "r"
+    return not (isinstance(mode, ast.Constant) and set(str(mode.value)) <= set("rbt"))
 
 
 def _sinks(tree: ast.AST):
@@ -38,13 +54,15 @@ def _sinks(tree: ast.AST):
             if isinstance(child, ast.Call):
                 f = child.func
                 if isinstance(f, ast.Name) and f.id == "open":
-                    mode = child.args[1] if len(child.args) > 1 else next(
-                        (k.value for k in child.keywords if k.arg == "mode"), None)
-                    if mode is None or not (isinstance(mode, ast.Constant) and set(str(mode.value)) <= set("rbt")):
+                    if _write_mode(child, 1):
                         out.append((fn, "open"))
+                elif isinstance(f, ast.Name) and f.id in {n for _, n in WRITE_FUNCS if _ == "tempfile"}:
+                    out.append((fn, f"tempfile.{f.id}"))  # from tempfile import X
                 elif isinstance(f, ast.Attribute):
                     if isinstance(f.value, ast.Name) and (f.value.id, f.attr) in WRITE_FUNCS:
                         out.append((fn, f"{f.value.id}.{f.attr}"))
+                    elif f.attr == "open" and _write_mode(child, 0):  # Path.open("w"), fh.open(...)
+                        out.append((fn, "Path.open"))
                     elif f.attr in WRITE_METHODS:
                         out.append((fn, f.attr))
             visit(child, name)
@@ -89,8 +107,27 @@ def test_no_frozen_path_literals(path):
     docs = _docstrings(tree)
     for node in ast.walk(tree):
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docs:
-            for fp in FROZEN:
-                assert fp not in node.value, f"{path.name} names frozen path {fp!r} in {node.value!r}"
+            for fp, rx in FROZEN_RX:
+                assert not rx.search(node.value), f"{path.name} names frozen path {fp!r} in {node.value!r}"
+
+
+ROGUE = """
+import io, codecs, os, tempfile
+from pathlib import Path
+from tempfile import mkstemp
+def f(p, m):
+    open(p, "w"); open(p, m); Path(p).open("a"); Path(p).open(mode="w"); io.open(p, "wb"); codecs.open(p, "w")
+    os.open(p, os.O_WRONLY); os.write(3, b"x"); os.fdopen(3, "w"); mkstemp(); tempfile.NamedTemporaryFile()
+    Path(p).write_text("x"); Path(p).unlink(); os.replace(p, p)
+def ok(p):
+    open(p); open(p, "rb"); Path(p).open(); Path(p).read_text()
+"""
+
+
+def test_scanner_catches_every_write_form():
+    sinks = _sinks(ast.parse(ROGUE))
+    assert all(fn == "f" for fn, _ in sinks)  # nothing in ok()
+    assert len(sinks) == 14, sinks
 
 
 def test_gates_itself_has_no_write_sink():
@@ -111,3 +148,16 @@ def test_guard_refuses_every_frozen_path(tmp_path, rel):
     with pytest.raises(pbm.PlaybookError, match="refusing"):
         pbm._guarded_write(target, "x", allowed_root=tmp_path)
     assert not target.exists()
+
+
+def test_packaging_ships_the_improvement_loop_and_evals():
+    import tomllib
+    cfg = tomllib.loads((REPO / "pyproject.toml").read_text())["tool"]["setuptools"]
+    inc = cfg["packages"]["find"]["include"]
+    assert "dh*" in inc and "evals*" in inc
+    assert "*.jsonl" in cfg["package-data"]["evals"]
+
+
+def test_data_dir_is_frozen():
+    assert {"data", "data/taxonomy"} <= set(config.FROZEN_PATHS)
+    assert any(k.startswith("data/taxonomy/") for k in config.frozen_digest(REPO))

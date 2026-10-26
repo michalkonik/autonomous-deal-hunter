@@ -1,6 +1,8 @@
 """Round pipeline (scheduler.run_round) with a fake adapter, a fake LLM and fixed NBP rates: no network, no model."""
+import asyncio
 import json
 import random
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -60,17 +62,22 @@ class FakeAdapter(Adapter):
     """Polish marketplace (market PL). Returns its listings for every query; fetches one page per search."""
     name, domain, country, currency = "allegro_lokalnie", "fake.test", "PL", "PLN"
 
-    def __init__(self, listings, alive=(True, None)):
+    def __init__(self, listings, alive=(True, None), detail_delay=0.0, search_delay=0.0):
         self.listings, self.alive_result = listings, alive
+        self.detail_delay, self.search_delay = detail_delay, search_delay
         self.searches, self.details, self.alive_calls = [], 0, 0
 
     async def search(self, query: Query, fetcher, to_pln=None):
         self.searches.append(query.text)
-        await fetcher.get(f"https://fake.test/s?q={query.text}", kind="html")
+        if self.search_delay:
+            await asyncio.sleep(self.search_delay)
+        await fetcher.get(f"https://{self.domain}/s?q={query.text}", kind="html")
         return [Listing(**{**l.__dict__}) for l in self.listings]
 
     async def detail(self, listing, fetcher):
         self.details += 1
+        if self.detail_delay:
+            await asyncio.sleep(self.detail_delay)  # suspends: other arms' tasks run meanwhile
         listing.description = "Karta sprawna, testowana, sprzedaję bo zmieniam na nowszą."
         listing.photos = ["https://fake.test/p1.jpg"]
         return listing
@@ -84,13 +91,13 @@ class FakeAdapter(Adapter):
 
 
 class FakeLLM:
-    def __init__(self, reply):
-        self.reply, self.calls = reply, []
+    def __init__(self, reply, senior=None):
+        self.reply, self.senior, self.calls = reply, senior, []
 
     async def chat_json(self, role, system, user, schema, max_tokens=600):
         self.calls.append((role, user))
         assert "<listing>" in user
-        return dict(self.reply)
+        return dict(self.senior if role == "senior" and self.senior is not None else self.reply)
 
 
 def listing(sid="1", title="Gigabyte RTX 3060 Gaming OC używana", price="700"):
@@ -187,10 +194,12 @@ async def test_second_round_does_not_reprocess_or_duplicate(tmp_path):
     await scheduler.run_round(ctx)
     s2 = await scheduler.run_round(ctx)
     assert len(llm.calls) == 1 and s2.candidates == 0 and len(ctx.store.deals()) == 1
-    # a price change is re-evaluated, reusing the stored LLM extraction; the same listing never gets a 2nd deal
+    # a price change is re-evaluated, reusing the stored LLM extraction; the listing's own deal is UPDATED
     ad.listings = [listing(price="650")]
     s3 = await scheduler.run_round(ctx)
-    assert len(llm.calls) == 1 and s3.candidates == 1 and s3.duplicates == 1 and len(ctx.store.deals()) == 1
+    assert len(llm.calls) == 1 and s3.candidates == 1 and s3.updated == 1 and s3.duplicates == 0
+    ds = ctx.store.deals()
+    assert len(ds) == 1 and json.loads(ds[0].evidence_json)["listing"]["price"] == "650"
 
 
 async def test_cheap_filter_keeps_bait_and_noise_away_from_llm(tmp_path):
@@ -493,3 +502,231 @@ async def test_rules_only_evaluation_is_redone_when_the_llm_is_back(tmp_path):
     assert ctx.store.conn.execute("select note from evaluations").fetchone()["note"] == ""
     await scheduler.run_round(ctx)
     assert len(llm.calls) == 1  # done once
+
+
+# ------------------------------------------------------------------------------------------------ review fix round 1
+
+def tier1_ctx(tmp_path, ad, llm=None, **kw):
+    """Comps for a verified tier-1 RTX 3060 at 6400 PLN (see test_tier1_push_and_screenshot_when_not_dry)."""
+    ctx = make_ctx(tmp_path, ad, llm, dry=False, **kw)
+    for i in range(14):
+        ctx.store.add_comp(KEY, "used", "olx", Decimal("9000") + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
+    return ctx
+
+
+TWO_QUERIES = [{"id": "q1", "kind": "query", "target": "all", "value": "rtx 3060", "sentinel": False},
+               {"id": "q2", "kind": "query", "target": "all", "value": "rtx 3060 12gb", "sentinel": False}]
+
+
+async def test_two_arms_same_listing_one_deal_one_push(tmp_path):
+    """Critical 1: two arms return the same listing; detail() suspends so both evaluations would overlap."""
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")], detail_delay=0.05)
+    ctx = tier1_ctx(tmp_path, ad, items=TWO_QUERIES)
+    stats = await scheduler.run_round(ctx)
+    assert len(ad.searches) == 2 and stats.listings_seen == 2
+    assert len(ctx.store.deals()) == 1 and len(ctx.pushes) == 1 and ad.details == 1
+
+
+async def test_concurrent_saves_of_one_listing_make_one_deal(tmp_path):
+    """The save lock + unique index hold even when two evaluations of one listing race to _save."""
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")], detail_delay=0.05)
+    ctx = tier1_ctx(tmp_path, ad)
+    r = scheduler._Round(ctx)
+    await r._warm_rates()
+    lid = ctx.store.upsert_listing(listing("5", "RTX 3060 12GB używana", "6400"))
+    from dh.match import rules_extract
+    ex = rules_extract("RTX 3060 12GB używana", "", "pl")
+    arm = scheduler.Arm("a", "allegro_lokalnie", Query(text="x"), "q")
+    l = listing("5", "RTX 3060 12GB używana", "6400")
+    await asyncio.gather(r._deal_path(l, lid, ex, arm, Decimal("6400"), ad),
+                         r._deal_path(listing("5", "RTX 3060 12GB używana", "6400"), lid, ex, arm, Decimal("6400"), ad))
+    assert len(ctx.store.deals()) == 1 and len(ctx.pushes) == 1
+    idx = ctx.store.conn.execute("select name from sqlite_master where name='idx_deals_listing'").fetchone()
+    assert idx is not None
+
+
+async def test_retier_updates_the_deal_and_pushes_once(tmp_path):
+    """Important 1: valued with the LLM off -> tier 3; the LLM confirms the key next round -> the SAME deal row
+    becomes tier 1, is pushed once; later rounds never push it again."""
+    ad = FakeAdapter([listing("5", "RTX 3060 używana", "6400")])  # rules certainty 0.7
+    ctx = tier1_ctx(tmp_path, ad)
+    s1 = await scheduler.run_round(ctx)
+    d1 = ctx.store.deals()
+    assert [d.tier for d in d1] == [3] and ctx.pushes == [], s1.deals
+    ctx.llm = FakeLLM({**LLM_3060, "certainty": 0.95}, senior={"same": True, "key": KEY, "certainty": 0.95})
+    s2 = await scheduler.run_round(ctx)  # llm_pending -> re-evaluated
+    d2 = ctx.store.deals()
+    assert len(d2) == 1 and d2[0].id == d1[0].id and d2[0].tier == 1 and s2.updated == 1
+    assert len(ctx.pushes) == 1
+    ad.listings = [listing("5", "RTX 3060 używana", "6390")]  # small cut: re-evaluated, still tier 1
+    await scheduler.run_round(ctx)
+    assert len(ctx.store.deals()) == 1 and len(ctx.pushes) == 1
+
+
+async def test_unevaluated_listings_are_requeued_at_round_start(tmp_path):
+    """Important 2: a persisted (e.g. acked mailbox) listing whose evaluation never ran is evaluated next round even
+    though no search returns it again."""
+    ad = FakeAdapter([])
+    ctx = make_ctx(tmp_path, ad, None)
+    seed_comps(ctx.store)
+    olx = Listing(**{**listing("m9", "RTX 3060 12GB używana", "700").__dict__, "source": "olx"})
+    ledger.observe(ctx.store, "olx", [olx], NOW)  # persisted, never evaluated
+    mail = FakeMail([], ctx.store)
+    ctx.adapters["mailbox"] = mail
+    stats = await scheduler.run_round(ctx)
+    assert stats.requeued == 1 and stats.candidates == 1
+    assert ctx.store.conn.execute("select count(*) from evaluations").fetchone()[0] == 1
+    assert (await scheduler.run_round(ctx)).requeued == 0
+
+
+async def test_llm_budget_deferral_is_requeued(tmp_path):
+    ls = [listing("1", "RTX 3060 używana", "700"), listing("2", "Gigabyte RTX 3060 używana", "710")]
+    llm = FakeLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter(ls), llm, max_llm_items=1)
+    s1 = await scheduler.run_round(ctx)
+    assert s1.llm_deferred == 1 and len(llm.calls) == 1
+    ctx.adapters["allegro_lokalnie"].listings = []  # nothing returned any more
+    s2 = await scheduler.run_round(ctx)
+    assert s2.requeued == 1 and len(llm.calls) == 2
+
+
+async def test_sweep_deadline_cuts_only_the_stuck_source(tmp_path):
+    """Important 3: one source hangs; its sweep is cut at sources.sweep_timeout_s, the other source's deal is saved."""
+    good = FakeAdapter([listing("1", "RX 6800 używana", "900")])
+
+    class Stuck(FakeAdapter):
+        name, domain = "sprzedajemy", "stuck.test"
+    stuck = Stuck([], search_delay=30)
+    ctx = make_ctx(tmp_path, good, None)
+    ctx.adapters["sprzedajemy"] = stuck
+    data = ctx.cfg.to_dict()
+    data["sources"] = {**data["sources"], "sweep_timeout_s": 0.3}
+    ctx.cfg = config.Config(data, REPO)
+    for i in range(10):
+        ctx.store.add_comp(RX, "used", "olx", Decimal("1400") + i, NOW - timedelta(days=1 + i), "owner_sale", f"r:{i}")
+    stats = await scheduler.run_round(ctx)
+    assert stats.sweep_timeouts == ["sprzedajemy"] and stats.seconds < 10
+    assert len(ctx.store.deals()) == 1
+    assert ctx.store.conn.execute("select kind from health where source='sprzedajemy'").fetchone()["kind"] == "sweep_timeout"
+
+
+async def test_round_timeout_gives_started_evaluations_a_grace_period(tmp_path):
+    ad = FakeAdapter([listing()], detail_delay=0.6)
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060), round_timeout_s=0.3, timeout_grace_s=2)
+    seed_comps(ctx.store)
+    stats = await scheduler.run_round(ctx)
+    assert len(ctx.store.deals()) == 1  # finished inside the grace period
+    assert any("grace" in e for e in stats.errors)
+    ad2 = FakeAdapter([listing()], detail_delay=5)
+    ctx2 = make_ctx(tmp_path / "b", ad2, FakeLLM(LLM_3060), round_timeout_s=0.2, timeout_grace_s=0.3)
+    seed_comps(ctx2.store)
+    s2 = await scheduler.run_round(ctx2)
+    assert ctx2.store.deals() == [] and any("cancelled" in e for e in s2.errors) and s2.seconds < 3
+
+
+async def test_foreign_model_makes_the_round_rules_only(tmp_path):
+    """Important 4: a model outside the roles is loaded -> no LLM call this round, LLM listings are llm_pending."""
+    llm = FakeLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), llm)
+    seed_comps(ctx.store)
+
+    async def foreign():
+        return ["someone-elses-model"]
+    ctx.llm_check = foreign
+    stats = await scheduler.run_round(ctx)
+    assert llm.calls == [] and stats.llm_mode == "foreign_model" and stats.foreign_models == ["someone-elses-model"]
+    assert ctx.store.conn.execute("select note from evaluations").fetchone()["note"] == "llm_pending"
+
+    async def clear():
+        return []
+    ctx.llm_check = clear
+    s2 = await scheduler.run_round(ctx)
+    assert len(llm.calls) == 1 and s2.llm_mode == "on"
+
+
+def _plan_sim(tmp_path, seed: int, rounds: int = 200):
+    """Production arm selection (_Round._plan -> Bandit.select, I5 ruling) with simulated rewards: 40 arms on one
+    source (16 at 0.3 value units per fetch, 16 at 0.05, 8 dead), budget 10 searches per round (the 25 % arm coverage
+    of production: budget 60 of ~300 arms), one fetch per selected arm."""
+    rates = {**{f"good{i}": 0.3 for i in range(16)}, **{f"poor{i}": 0.05 for i in range(16)},
+             **{f"dead{i}": 0.0 for i in range(8)}}
+    items = [{"id": q, "kind": "query", "target": "all", "value": q, "sentinel": False} for q in rates]
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None, items=items, budget=10, max_searches_per_source=12)
+    ctx.rng = random.Random(seed)
+    sim = random.Random(seed + 1000)
+    r = scheduler._Round(ctx)
+    got: Counter = Counter()
+    for _ in range(rounds):
+        ctx.budget = 10
+        r.stats = scheduler.RoundStats()
+        for arm in r._plan():
+            q = arm.query.text
+            got[q] += 1
+            lam, k, t = rates[q], 0, sim.expovariate(1.0) if rates[q] > 0 else float("inf")
+            while t < lam:
+                k += 1
+                t += sim.expovariate(1.0)
+            ctx.bandit.update(arm.id, float(k), 1)
+        ctx.bandit.discount()
+    return got, rates
+
+
+@pytest.mark.parametrize("seed", range(1, 16))
+def test_plan_shifts_searches_to_productive_arms_and_keeps_exploring(tmp_path, seed):
+    """>= 3x selection frequency for 0.3 vs 0.05 arms (local simulation of the same setup: 3.33-4.41x over these 15
+    seeds with the plan's prior (1, 10)); no arm starves: each gets its 3 guaranteed pulls plus at least half its
+    expected share of the exploration slots (200 rounds x 1 slot / ~30 non-top arms ~ 6.7)."""
+    got, rates = _plan_sim(tmp_path, seed)
+    per = lambda p: sum(v for k, v in got.items() if k.startswith(p)) / sum(1 for k in rates if k.startswith(p))  # noqa: E731
+    assert per("good") >= 3 * per("poor"), got
+    assert min(got[a] for a in rates) >= 6, got
+    assert sum(got.values()) == 2000
+
+
+def test_select_reserves_exploration_and_new_arm_pulls(tmp_path):
+    from dh.bandit import Bandit
+    b = Bandit(Store(tmp_path / "s.db"))
+    arms = [f"a{i}" for i in range(20)]
+    for a in arms[:19]:
+        for _ in range(3):
+            b.update(a, 5.0 if a == "a0" else 0.0, 1)
+    out = b.select(arms, 10, random.Random(4))
+    assert sorted(out) == sorted(arms)  # a full order; the caller takes the first k it can use
+    assert out[0] == "a19"  # the new arm's guaranteed pull comes first
+    assert "a0" in out[:10]  # the top draw
+    top = out[:10]
+    assert len(set(top)) == 10
+
+
+async def test_cancelled_round_leaves_no_task_running(tmp_path):
+    """Important 6: SIGTERM cancels the round: every sweep and evaluation task is cancelled and awaited."""
+    ad = FakeAdapter([listing()], detail_delay=10)
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    t = asyncio.create_task(scheduler.run_round(ctx))
+    for _ in range(100):
+        await asyncio.sleep(0.02)
+        if ad.details:
+            break
+    assert ad.details == 1  # an evaluation is inside detail()
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    others = [x for x in asyncio.all_tasks() if x is not asyncio.current_task()]
+    assert others == []
+    assert ctx.store.conn.execute("select count(*) from rounds").fetchone()[0] == 0  # no bookkeeping for it
+
+
+async def test_live_price_change_at_verification_revalues(tmp_path):
+    """Minor: the alive check reads a different price -> the deal is valued at the live price (or dropped)."""
+    ad = FakeAdapter([listing()], alive=(True, Decimal("720")))
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    stats = await scheduler.run_round(ctx)
+    d = ctx.store.deals()[0]
+    assert stats.price_changed == 1 and json.loads(d.evidence_json)["listing"]["price"] == "720"
+    ad2 = FakeAdapter([listing()], alive=(True, Decimal("1390")))  # now no margin at all
+    ctx2 = make_ctx(tmp_path / "b", ad2, FakeLLM(LLM_3060))
+    seed_comps(ctx2.store)
+    s2 = await scheduler.run_round(ctx2)
+    assert ctx2.store.deals() == [] and s2.dropped.get("price_changed_below_floor") == 1

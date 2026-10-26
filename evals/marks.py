@@ -39,8 +39,21 @@ def _market(deal) -> dict | None:
             "channels": [ni.get("exit_channel") or "allegro"]}
 
 
-def add_from_marks(store, path: Path = GOLDEN) -> int:
-    """Append one golden case per new verified mark; returns the number added."""
+class AgentRunning(RuntimeError):
+    """evals/ is frozen while the agent runs: the rounds would refuse to continue."""
+
+
+def add_from_marks(store, path: Path = GOLDEN, *, running: bool | None = None) -> int:
+    """Append one golden case per new verified mark; returns the number added. Refused while the agent runs
+    (evals/ is in the frozen digest: changing it mid-run would stop the rounds)."""
+    if running is None:
+        try:
+            from dh.runtime import is_active
+            running = bool(is_active())
+        except Exception:  # noqa: BLE001 - no systemd: not running
+            running = False
+    if running:
+        raise AgentRunning("stop the agent first (dh stop): evals/ is frozen while it runs")
     path = Path(path)
     have = set()
     if path.is_file():
