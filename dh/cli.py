@@ -11,8 +11,9 @@ import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 
-STUBS = ["replay", "eval", "playbook"]  # later milestones
-COMMANDS = ["start", "stop", "status", "deals", "show", "verify", "replay", "eval", "playbook", "books", "round"]
+STUBS = ["replay"]  # later milestone
+COMMANDS = ["start", "stop", "status", "deals", "show", "verify", "replay", "eval", "playbook", "books", "round",
+            "report"]
 
 
 def _stub(args: argparse.Namespace) -> int:
@@ -60,8 +61,9 @@ def cmd_status(args) -> int:
     from . import runtime
     root, cfg = _ctx()
     s = runtime.status(cfg, root)
+    imp_text, imp = _improvement_status(root)
     if args.json:
-        _dump(s)
+        _dump({**s, "improvement": imp})
         return 0
     up = f", up {s['uptime_s'] // 60} min" if s.get("uptime_s") else ""
     print(f"deal-hunter: {'RUNNING' if s['running'] else 'stopped'} (unit {s['unit']}, state {s['state']}"
@@ -83,7 +85,59 @@ def cmd_status(args) -> int:
     print(f"  ntfy topic: {s.get('ntfy_topic')}")
     lr = s.get("log_repo") or {}
     print(f"  log repo: {lr.get('log_dir')} clone={lr.get('clone')} last={lr.get('last_commit')} remote={lr.get('remote')}")
+    print("improvement loop:")
+    print("\n".join("  " + ln for ln in imp_text.splitlines()))
     return 0
+
+
+class _RO:
+    """Read-only stand-in for a Store: the improvement status must never write to a running agent's database."""
+
+    def __init__(self, path):
+        import sqlite3
+        self.conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        self.conn.row_factory = sqlite3.Row
+
+    def ensure_table(self, sql):  # migrations are the agent's job; never from a status call
+        pass
+
+    def close(self):
+        self.conn.close()
+
+
+def _improvement_status(root) -> tuple[str, dict]:
+    """(text, dict) of the improvement loop for `dh status`, from a READ-ONLY connection (initialised or not)."""
+    import sqlite3
+
+    from . import ledger, runtime
+    from .improve import gates
+    p = runtime.db_path(root)
+    uninit = ("not initialised yet (the first round after the next `dh start` sets it up)", {"initialised": False})
+    try:
+        st = _RO(p)
+    except sqlite3.Error:
+        return uninit
+    try:
+        row = st.conn.execute("select value from improve_state where key='controller'").fetchone()
+        if row is None:
+            return uninit
+        s = json.loads(row["value"])
+        wh = ledger.watched_hours(st)
+        out = {k: s.get(k) for k in ("phase", "maintenance", "maintenance_reason", "proposal_id", "champion",
+                                      "challenger", "door", "consecutive_rejections")}
+        out.update(watched_hours=round(wh, 2),
+                   cooldown_left_wh=round(max(0.0, s.get("cooldown_until_wh", 0) - wh), 2),
+                   next_review_in_wh=round(max(0.0, s.get("last_review_wh", 0) + gates.WEEKLY_REVIEW_WATCHED_HOURS - wh), 2),
+                   owner_review=[r["id"] for r in st.conn.execute(
+                       "select id from proposals where status='owner_review' order by id")],
+                   events=(s.get("events") or [])[-10:])
+        if s.get("probation"):
+            out["probation_left_wh"] = round(max(0.0, s["probation"]["started_wh"] + gates.PROBATION_WATCHED_HOURS - wh), 2)
+    except (sqlite3.Error, ValueError, KeyError):
+        return uninit
+    finally:
+        st.close()
+    return json.dumps(out, indent=2, default=str), {"initialised": True, **out}
 
 
 # ------------------------------------------------------------------------------------------------ round
@@ -126,6 +180,7 @@ async def _round(args) -> int:
     try:
         while True:
             st = await scheduler.run_round(ctx)
+            await runtime.post_round(ctx, st, weekly=False)
             if args.json:
                 _dump(st.to_dict())
             else:
@@ -288,6 +343,81 @@ def cmd_books(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------------------------------------ improvement loop
+
+
+def _emit(res: tuple[str, int]) -> int:
+    text, code = res
+    print(text)
+    return code
+
+
+def cmd_playbook(args) -> int:
+    """`dh playbook`: show; or one owner action (rollback, maintenance, pending, label, apply)."""
+    from . import improve
+    root, _ = _ctx()
+    if args.rollback is not None:
+        return _emit(improve.cli_rollback(args.rollback, root=root))
+    if args.maintenance is not None:
+        return _emit(improve.cli_maintenance(args.maintenance == "on", root=root))
+    if args.pending:
+        return _emit(improve.cli_pending(root=root))
+    if args.label is not None:
+        return _emit(improve.cli_label(int(args.label[0]), args.label[1], root=root))
+    if args.apply is not None:
+        from . import runtime
+        if not runtime.is_active():  # the proposal is checked with the LIVE model: only the running agent has it
+            print("refused: --apply needs the running agent (dh start): it re-checks the must-pass set with the "
+                  "live model, and a foreground command must not load models behind the agent's RAM guard")
+            return 1
+        return _emit(improve.cli_apply(args.apply, root=root, running=True))
+    return _emit(improve.cli_playbook_show(root=root))
+
+
+def cmd_eval(args) -> int:
+    """`dh eval`: score the active (or a given) playbook on the must-pass and golden sets; `--add-from-marks`
+    (owner only, refused while the agent runs) extends the golden set from verified marks."""
+    root, _ = _ctx()
+    if args.add_from_marks:
+        from evals import marks
+        store = _store(root)
+        if store is None:
+            return 1
+        try:
+            n = marks.add_from_marks(store)
+        except marks.AgentRunning as e:
+            print(f"refused: {e}")
+            return 1
+        finally:
+            store.close()
+        print(f"golden cases added from marks: {n}")
+        return 0
+    from . import improve
+    return _emit(improve.cli_eval(args.version, root=root))
+
+
+def cmd_report(args) -> int:
+    """`dh report --weekly`: the weekly report (Markdown); `--publish` also writes it into the log repo's weekly/."""
+    from . import improve, publish, runtime
+    root, cfg = _ctx()
+    if args.publish and runtime.is_active():
+        print("refused: the agent is running and publishes the weekly report itself (every 168 watched hours); "
+              "stop it first to publish by hand")
+        return 1
+    out = _emit(improve.cli_weekly(root=root))
+    if args.publish and out == 0:
+        store = _store(root)
+        if store is None:
+            return 1
+        try:
+            path = asyncio.run(publish.publish_weekly(store, cfg, root, force=True))
+        finally:
+            store.close()
+        print(f"written to the log repo: {path}" if path else "not written (no log repo clone; see dh status)")
+        return 0 if path else 1
+    return out
+
+
 # ------------------------------------------------------------------------------------------------ parser
 
 
@@ -323,6 +453,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("books", help="costs (energy, LLM, fetches) and forecast")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_books)
+    sp = sub.add_parser("playbook", help="the active playbook and its versions; owner actions on the improvement loop")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--rollback", type=int, metavar="N", help="make version N active again")
+    g.add_argument("--maintenance", choices=["on", "off"], help="freeze the playbook (on) or allow proposals (off)")
+    g.add_argument("--pending", action="store_true", help="what waits for the owner (prompt proposals, labels)")
+    g.add_argument("--label", nargs=2, metavar=("ID", "TRUTH"), help="label a shadow disagreement: deal | not_deal | key:<key|none>")
+    g.add_argument("--apply", type=int, metavar="ID", help="apply a prompt proposal waiting for owner review")
+    sp.set_defaults(func=cmd_playbook)
+    sp = sub.add_parser("eval", help="must-pass and golden scores of the active playbook (exit 1 if must-pass < 100%%)")
+    sp.add_argument("--version", type=int, help="score this playbook version instead of the active one")
+    sp.add_argument("--add-from-marks", action="store_true", help="owner: extend the golden set from verified marks "
+                                                                    "(refused while the agent runs)")
+    sp.set_defaults(func=cmd_eval)
+    sp = sub.add_parser("report", help="reports for the log repo")
+    sp.add_argument("--weekly", action="store_true", required=True, help="the weekly report (Markdown)")
+    sp.add_argument("--publish", action="store_true", help="also write it into the log repo's weekly/ (committed by the next sync)")
+    sp.set_defaults(func=cmd_report)
     for name in STUBS:
         sp = sub.add_parser(name, help=f"{name} (later milestone)")
         sp.set_defaults(func=_stub)

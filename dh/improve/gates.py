@@ -453,6 +453,78 @@ async def evaluate(champion: Playbook, challenger: Playbook, store, *, cfg=None,
     return GateResult(True, "offline", detail)
 
 
+# Owner review of a prompt change (ruling 5): the must-pass set runs with the LIVE model and the new prompt.
+TRIAGE_SCHEMA = {
+    "type": "object", "required": ["p_scam", "verdict", "reasons"],
+    "properties": {"p_scam": {"type": "number", "minimum": 0, "maximum": 1},
+                   "verdict": {"type": "string", "enum": ["ok", "suspicious", "scam"]},
+                   "reasons": {"type": "array", "items": {"type": "string"}}}}
+TRIAGE_SCAM_CASES = "mp-scam-"  # off-platform scams: a triage verdict "ok" fails
+TRIAGE_DEAL_CASES = "mp-deal-"  # true deals: a triage verdict "scam" fails
+
+
+class _LiveProbe:
+    """Counts the live calls (and the system prompt each used) and the calls that failed."""
+
+    def __init__(self, inner):
+        self.inner, self.systems, self.failures = inner, [], 0
+
+    async def chat_json(self, role, system, user, schema, max_tokens=600):
+        from ..llm import LLMError
+        self.systems.append(system)
+        try:
+            return await self.inner.chat_json(role, system, user, schema, max_tokens=max_tokens)
+        except LLMError:
+            self.failures += 1
+            raise
+
+
+async def _live_triage(pb: Playbook, cases: list[dict], probe: _LiveProbe) -> list[str]:
+    from ..llm import LLMError, wrap_untrusted
+    prompt = pb.get("prompt.triage").value
+    bad = []
+    for c in cases:
+        cid = str(c["id"])
+        if not cid.startswith((TRIAGE_SCAM_CASES, TRIAGE_DEAL_CASES)):
+            continue
+        l = case_listing(c)
+        if l.contact_in_text:
+            continue  # the scam signal was redacted before the text: triage cannot see it (risk catches it)
+        try:
+            out = await probe.chat_json("worker", prompt, wrap_untrusted(f"Title: {l.title}\nDescription: {l.description}"),
+                                        TRIAGE_SCHEMA, max_tokens=300)
+        except LLMError:
+            bad.append(f"{cid}:unavailable")
+            continue
+        if cid.startswith(TRIAGE_SCAM_CASES) and out.get("verdict") == "ok":
+            bad.append(cid)
+        if cid.startswith(TRIAGE_DEAL_CASES) and out.get("verdict") == "scam":
+            bad.append(cid)
+    return bad
+
+
+async def must_pass_live(pb: Playbook, llm, item_id: str, *, cfg=None, cases: list[dict] | None = None) -> dict:
+    """Must-pass with the live model for a changed prompt `item_id`. ok only when every case passes, no live call
+    failed, and at least one call actually used the changed prompt (an unreachable model never approves anything)."""
+    probe = _LiveProbe(llm)
+    cases = load_cases(MUST_PASS) if cases is None else cases
+    res = await score_cases(pb, cases, cfg=cfg, llm=probe)
+    failed = [r.id for r in res if not r.ok]
+    if item_id == "prompt.triage":
+        failed += await _live_triage(pb, cases, probe)
+    prompt = pb.get(item_id).value if pb.get(item_id) else None
+    reached = sum(1 for x in probe.systems if x == prompt)
+    why = []
+    if failed:
+        why.append("must-pass cases failed")
+    if probe.failures:
+        why.append(f"{probe.failures} live calls were unavailable")
+    if not reached:
+        why.append("no must-pass case reached the changed prompt")
+    return {"ok": not why and bool(res), "failed": failed, "why": why, "calls": len(probe.systems),
+            "unavailable": probe.failures, "reached_changed_prompt": reached}
+
+
 async def must_pass_ok(pb: Playbook, *, cfg=None, llm=None) -> tuple[bool, list[str]]:
     """Re-run of the must-pass set (promotion check, daily probation re-check; with `llm`: live, for owner review)."""
     res = await score_cases(pb, load_cases(MUST_PASS), cfg=cfg, llm=llm)

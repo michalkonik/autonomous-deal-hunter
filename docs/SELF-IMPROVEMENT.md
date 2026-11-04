@@ -59,8 +59,10 @@ at most 1500 characters, other values at most 120.
    and no network. The gate rejects if the expected net of tier 1-3 falls more than 5%, if known false positives
    rise, or if a deal you bought or sold is lost.
 5. **owner review** (prompt changes only): `cli_pending` shows the proposed text and `cli_apply(id)` applies it.
-   The must-pass set runs again with the LIVE model and the new prompt. Only if it passes is the change promoted,
-   and it then goes through probation like any other.
+   The must-pass set runs again with the LIVE model and the new prompt (a triage change also gets live triage
+   verdicts on the scam and true-deal cases). Nothing is promoted if any case fails, if any live call was
+   unavailable, or if no case actually reached the changed prompt. The live result is kept in the proposal. A
+   promoted change then goes through probation like any other.
 6. **shadow** (`dh/improve/shadow.py`): every round, both playbooks judge the same evaluated listings and only the
    champion acts. Disagreements are stored and labelled later by verified outcomes. The decision is one exact
    binomial test, made once, when at least 40 shadow rounds and at least 10 labelled disagreements exist:
@@ -76,8 +78,10 @@ at most 1500 characters, other values at most 120.
 
    A final single-look test runs when probation ends. The must-pass set is re-run every 24 watched hours, and a
    failure there also rolls back. So does a **health rise**: a source and kind with at least 3 events since the
-   promotion and more than twice as many as in the equal watched window before it, while the sentinel's sources
-   stay healthy. An example is a cadence change that brings 429s.
+   promotion and more than twice as many as in the equal watched window before it. A rise on a source that the
+   change itself names (a cadence's source, a query's targets) always counts as the change's. The control is the
+   OTHER sentinel sources: if they rise too, the sites changed. An example is a cadence change that brings 429s,
+   even on a sentinel source.
 
 All thresholds are constants at the top of `gates.py`. The rounds refuse to run if that file changes while the agent
 runs (`config.FROZEN_PATHS`).
@@ -134,12 +138,15 @@ time by chance (research §3.1).
 - **Force a rollback**: `improve.cli_rollback(N)` makes version N active again and aborts any change in flight.
 - **Force maintenance on or off**: `improve.cli_maintenance(True | False)`.
 - **Apply a prompt change**: `improve.cli_apply(id)`, after reading it in `cli_pending`.
+- `dh status` and every other read never write: the controller is read-only until a round or an owner command
+  runs. An applied command is marked in the same commit that saves its effect.
 - These owner commands are **queued** (`improve_commands`). The running agent applies them at the start of its
   next round, and again just before saving if one arrives mid-round. When the agent is stopped, the CLI applies
   them at once. The controller's state is saved with a compare-and-swap, so no command is ever overwritten.
 - **Edit `playbook/items.yaml` by hand** if you like. The next round notices that the file matches no stored
-  version and records it as a new baseline version (note "owner edit"). It aborts any change in flight, logs a
-  health event and carries on.
+  version and records it as a new baseline version (note "owner edit", or "owner revert to vN" when you put back
+  an older version). It aborts any change in flight, logs a health event and carries on, all in one commit. A
+  change in flight whose version is no longer the live (or waiting) one is always aborted.
 - **Inject a change yourself**: `Controller.submit(delta)` runs a delta through the same gates. It is used by the
   acceptance tests.
 - **Extend the golden set**: `dh eval --add-from-marks` (`evals.marks.add_from_marks`) appends one case per new

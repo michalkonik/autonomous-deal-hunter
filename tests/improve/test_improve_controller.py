@@ -136,7 +136,7 @@ def test_maintenance_after_three_rejections(env):
         assert "3 consecutive rejections" in ctl.s["maintenance_reason"]
         # in maintenance a cluster of same-cause failures does NOT reopen the playbook ...
         ctl.s["last_review_wh"] = clock.wh  # (the weekly review is not due)
-        ctl._save()
+        ctl._commit()
         reflect.migrate(store)
         for k in range(3):
             store.conn.execute("insert into improve_failures (ref, cause) values (?, 'false_match')", (f"x{k}",))

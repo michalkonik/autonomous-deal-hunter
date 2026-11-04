@@ -12,6 +12,7 @@ Per round the controller records two counts in `improve_rounds`:
 from __future__ import annotations
 
 import json
+import weakref
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,12 +37,19 @@ def watched_hours(store, until: datetime | None = None) -> float:
 ROUNDS_COLUMNS = ("deals_n integer not null default 0", "health text")
 
 
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
 def migrate(store) -> None:
+    """Once per store object (so it never commits in the middle of the controller's transaction)."""
+    if store in _MIGRATED:
+        return
     store.ensure_table(ROUNDS_SQL)
     have = {r["name"] for r in store.conn.execute("pragma table_info(improve_rounds)")}
     for col in ROUNDS_COLUMNS:
         if col.split()[0] not in have:
             store.ensure_table(f"alter table improve_rounds add column {col}")
+    _MIGRATED.add(store)
 
 
 def record(store, round_id: int, watched_h: float, version: int | None, champion_n: int, sentinel_n: int,

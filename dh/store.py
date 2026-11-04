@@ -99,6 +99,10 @@ class Store:
         self.conn.commit()
         if "contact_in_text" not in {r["name"] for r in self.conn.execute("pragma table_info(listings)")}:
             self.ensure_table("alter table listings add column contact_in_text integer not null default 0")
+        have = {r["name"] for r in self.conn.execute("pragma table_info(extractions)")}
+        for col in ("prompt_sha text", "extracted_at text"):  # which extraction prompt produced an LLM result, when
+            if col.split()[0] not in have:
+                self.ensure_table(f"alter table extractions add column {col}")
 
     def ensure_table(self, sql: str) -> None:
         self.conn.execute(sql)
@@ -162,11 +166,24 @@ class Store:
 
     # extractions
     def save_extraction(self, listing_id: int, e: Extraction) -> None:
+        """Upsert. An LLM result carries the extraction prompt's sha in its notes ("prompt_sha:<sha>", set by
+        dh.extract); it is stored with the time. Re-saving a cached LLM result without that note keeps the stored
+        sha; a rules result clears it."""
+        sha = next((n.split(":", 1)[1] for n in e.notes if n.startswith("prompt_sha:")), None)
+        at = datetime.now(timezone.utc).isoformat() if sha else None
         self.conn.execute(
-            """insert or replace into extractions (listing_id, key, category, certainty, condition, defects,
-               box_only, for_parts, wanted_ad, bundle_items, method) values (?,?,?,?,?,?,?,?,?,?,?)""",
+            """insert into extractions (listing_id, key, category, certainty, condition, defects,
+               box_only, for_parts, wanted_ad, bundle_items, method, prompt_sha, extracted_at)
+               values (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               on conflict(listing_id) do update set key=excluded.key, category=excluded.category,
+               certainty=excluded.certainty, condition=excluded.condition, defects=excluded.defects,
+               box_only=excluded.box_only, for_parts=excluded.for_parts, wanted_ad=excluded.wanted_ad,
+               bundle_items=excluded.bundle_items, method=excluded.method,
+               prompt_sha=case when excluded.method='llm' then coalesce(excluded.prompt_sha, extractions.prompt_sha) end,
+               extracted_at=case when excluded.method='llm'
+                                 then coalesce(excluded.extracted_at, extractions.extracted_at) end""",
             (listing_id, e.key, e.category, e.certainty, e.condition, json.dumps(e.defects), int(e.box_only),
-             int(e.for_parts), int(e.wanted_ad), json.dumps(e.bundle_items), e.method))
+             int(e.for_parts), int(e.wanted_ad), json.dumps(e.bundle_items), e.method, sha, at))
         self.conn.commit()
 
     # deals

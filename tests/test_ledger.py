@@ -507,3 +507,22 @@ def test_migration_tracked_per_store_object(tmp_path):
         assert s.conn.execute("select count(*) c from sweeps").fetchone()["c"] == 1
         s.close()
         del s
+
+
+def test_watched_hours_union_partial_nested_and_open_windows(store):
+    t0 = h(0)
+    a = ledger.open_window(store, "olx", t0)            # 0..4
+    store.close_window(a, t0 + timedelta(hours=4))
+    b = ledger.open_window(store, "bazos", t0 + timedelta(hours=3))   # partial overlap: 3..6 -> union 0..6
+    store.close_window(b, t0 + timedelta(hours=6))
+    c = ledger.open_window(store, "kleinanzeigen", t0 + timedelta(hours=1))  # nested in 0..6
+    store.close_window(c, t0 + timedelta(hours=2))
+    assert ledger.watched_hours(store) == pytest.approx(6.0)
+    d = ledger.open_window(store, "hardverapro", t0 + timedelta(hours=10))  # open window: counts to last_obs_at
+    store.conn.execute("update windows set last_obs_at=? where id=?", ((t0 + timedelta(hours=12)).isoformat(), d))
+    store.conn.commit()
+    assert ledger.watched_hours(store) == pytest.approx(8.0)
+    assert ledger.watched_hours(store, until=t0 + timedelta(hours=11)) == pytest.approx(7.0)
+    assert ledger.watched_hours(store, "hardverapro") == pytest.approx(2.0)
+    e = ledger.open_window(store, "olx", t0 + timedelta(hours=20))  # open, never observed: zero
+    assert ledger.watched_hours(store) == pytest.approx(8.0)

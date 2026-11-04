@@ -333,6 +333,10 @@ async def _ensure_clone(log_dir: Path, remote: str | None, store) -> bool:
     log_dir.parent.mkdir(parents=True, exist_ok=True)
     rc, out = await _git(log_dir.parent, "clone", "--branch", BRANCH, "--", remote, str(log_dir))
     if rc != 0:
+        # no `log` branch on the remote yet (a fresh GitHub repo: empty, or only `main`): clone what exists; `sync`
+        # then does `checkout -B log` and pushes `log` (never the default branch)
+        rc, out = await _git(log_dir.parent, "clone", "--", remote, str(log_dir))
+    if rc != 0:
         health_once(store, "publish", "clone_failed", out[:500])
         return False
     return True
@@ -368,8 +372,10 @@ async def sync(store, cfg, root: Path | None = None) -> dict:
         return res
     if (await _git(log_dir, "symbolic-ref", "-q", "HEAD"))[1] != f"refs/heads/{BRANCH}":
         await _git(log_dir, "checkout", "-q", "-B", BRANCH)
-    rc, out = await _git(log_dir, "pull", "--rebase", "origin", BRANCH)
-    res["pulled"] = rc == 0
+    lrc, _ = await _git(log_dir, "ls-remote", "--exit-code", "--heads", "origin", BRANCH)
+    has_remote = lrc != 2  # 2 = reachable, no such branch yet; any other failure is left to the pull to report
+    rc, out = await _git(log_dir, "pull", "--rebase", "origin", BRANCH) if has_remote else (0, "")
+    res["pulled"] = rc == 0 and has_remote
     bad: set[int] = set()
     if rc != 0:
         await _git(log_dir, "rebase", "--abort")
@@ -413,6 +419,8 @@ async def sync(store, cfg, root: Path | None = None) -> dict:
         if rc != 0:
             health_once(store, "publish", "commit_failed", out[:500])
     # push if anything is ahead of the remote (also covers commits left over from a failed earlier push)
+    if (await _git(log_dir, "rev-parse", "--verify", "-q", "HEAD"))[0] != 0:
+        return res  # nothing committed yet (empty remote, nothing to publish): nothing to push
     rc, ahead = await _git(log_dir, "rev-list", "--count", f"origin/{BRANCH}..HEAD")
     if rc != 0 or ahead.strip() != "0":
         rc, out = await _git(log_dir, "push", "origin", BRANCH)
@@ -420,6 +428,40 @@ async def sync(store, cfg, root: Path | None = None) -> dict:
         if rc != 0:
             health_once(store, "publish", "push_failed", out[:500])
     return res
+
+
+WEEKLY_SQL = """create table if not exists weekly_reports (
+  id integer primary key, watched_h real not null, path text not null, at text not null
+)"""
+
+
+async def publish_weekly(store, cfg, root: Path, *, now: datetime | None = None, force: bool = False) -> Path | None:
+    """Write the weekly report into the log clone (`weekly/YYYY-MM-DD.md`; the next `sync` commits and pushes it).
+
+    Due every `WEEKLY_REVIEW_WATCHED_HOURS` (168) watched hours since the previous one (the union of observation
+    windows, the same clock as the improvement loop); `force` (dh report --weekly --publish) skips the check. No
+    clone yet: a health event and nothing is recorded, so the next round tries again. Returns the file or None."""
+    from .improve import gates, monitor, report
+    now = now or datetime.now(timezone.utc)
+    store.ensure_table(WEEKLY_SQL)
+    wh = monitor.watched_hours(store, until=now)
+    last = store.conn.execute("select coalesce(max(watched_h), 0) from weekly_reports").fetchone()[0]
+    if not force and wh - float(last) < gates.WEEKLY_REVIEW_WATCHED_HOURS:
+        return None
+    log_dir = Path(str(cfg.publish.log_dir)).expanduser()
+    if not (log_dir / ".git").is_dir():
+        health_once(store, "publish", "weekly_no_clone", f"{log_dir} is not a clone yet: weekly report waits")
+        return None
+    text = await report.weekly_async(store, now, cfg)
+    path = log_dir / "weekly" / f"{now.date().isoformat()}.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = log_dir.parent / f".{log_dir.name}-weekly.tmp"  # outside the clone: `git add -A` must never see it
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+    store.conn.execute("insert into weekly_reports (watched_h, path, at) values (?,?,?)",
+                       (wh, str(path), now.isoformat()))
+    store.conn.commit()
+    return path
 
 
 async def run_loop(store, cfg, root: Path, stop: asyncio.Event) -> None:

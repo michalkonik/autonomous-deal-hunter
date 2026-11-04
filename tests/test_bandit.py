@@ -88,3 +88,4 @@ def test_value_units():
     # (sum expected net USD of tier 1-3 + 0.2 x sum tier 4) / 100
     assert value_units([(1, 300.0), (3, 100.0), (4, 50.0), (None, 999.0)]) == pytest.approx(4.1)
     assert value_units([]) == 0.0
+

@@ -683,19 +683,40 @@ def test_plan_shifts_searches_to_productive_arms_and_keeps_exploring(tmp_path, s
     assert sum(got.values()) == 2000
 
 
-def test_select_reserves_exploration_and_new_arm_pulls(tmp_path):
+def _select_runs(tmp_path, floor: float, seeds: int):
+    """20 arms: 5 good (high reward per fetch), 14 poor (no reward; poor0 the cheapest, poor13 the dearest, so their
+    Thompson draws differ), 1 new. k = 10. One store, arms re-seeded per run through select's rng only."""
     from dh.bandit import Bandit
-    b = Bandit(Store(tmp_path / "s.db"))
-    arms = [f"a{i}" for i in range(20)]
-    for a in arms[:19]:
+    st = Store(tmp_path / f"s{floor}.db")
+    b = Bandit(st, floor=floor)
+    for i in range(5):
         for _ in range(3):
-            b.update(a, 5.0 if a == "a0" else 0.0, 1)
-    out = b.select(arms, 10, random.Random(4))
-    assert sorted(out) == sorted(arms)  # a full order; the caller takes the first k it can use
-    assert out[0] == "a19"  # the new arm's guaranteed pull comes first
-    assert "a0" in out[:10]  # the top draw
-    top = out[:10]
-    assert len(set(top)) == 10
+            b.update(f"good{i}", 20.0, 1)
+    for i in range(14):
+        for _ in range(3):
+            b.update(f"poor{i}", 0.0, 10 * (i + 1))
+    arms = [f"good{i}" for i in range(5)] + [f"poor{i}" for i in range(14)] + ["new"]
+    return arms, [b.select(arms, 10, random.Random(seed)) for seed in range(seeds)]
+
+
+def test_select_reserves_exploration_and_new_arm_pulls(tmp_path):
+    """A full order; the new arm's guaranteed pull first; the top draws next; and ceil(floor x k) slots in the first k
+    drawn uniformly from the arms the draws did not pick: the worst-looking poor arm still gets ~ its share with
+    floor 0.3 and almost never with floor 0."""
+    def poor_freq(floor):
+        arms, outs = _select_runs(tmp_path, floor, 400)
+        cnt = Counter()
+        for out in outs:
+            assert sorted(out) == sorted(arms)  # every arm once
+            assert out[0] == "new"
+            top = out[:10]
+            assert len(set(top)) == 10 and {f"good{i}" for i in range(5)} <= set(top)
+            assert sum(a.startswith("poor") for a in top) == 4
+            cnt.update(a for a in top if a.startswith("poor"))
+        return [cnt[f"poor{i}"] / len(outs) for i in range(14)]
+    with_floor, no_floor = poor_freq(0.3), poor_freq(0.0)
+    assert min(with_floor) >= 0.15, with_floor  # ~3 uniform slots + 1 by draw over 14 arms: >= ~0.21 each
+    assert no_floor[13] < 0.1 and no_floor[0] > 0.6, no_floor  # draws alone favour the cheap arm
 
 
 async def test_cancelled_round_leaves_no_task_running(tmp_path):
@@ -730,3 +751,87 @@ async def test_live_price_change_at_verification_revalues(tmp_path):
     seed_comps(ctx2.store)
     s2 = await scheduler.run_round(ctx2)
     assert ctx2.store.deals() == [] and s2.dropped.get("price_changed_below_floor") == 1
+
+
+# ------------------------------------------------------------------------------------------------ wiring minors
+
+
+async def test_tier1_push_is_queued_when_the_round_is_cancelled_after_reservation(tmp_path):
+    """Task 19 minor: SIGTERM while the push is in flight must not lose a reserved tier-1 push: it is queued for the
+    retry (pending_pushes) and the reservation stays, so it is never sent twice."""
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+    ctx = tier1_ctx(tmp_path, ad)
+    started = asyncio.Event()
+
+    async def slow_push(deal, card_url, **kw):
+        started.set()
+        await asyncio.sleep(30)
+        return True
+    ctx.push = slow_push
+    t = asyncio.create_task(scheduler.run_round(ctx))
+    await asyncio.wait_for(started.wait(), 20)
+    t.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await t
+    rows = ctx.store.conn.execute("select payload from pending_pushes").fetchall()
+    assert len(rows) == 1
+    payload = json.loads(rows[0]["payload"])
+    assert payload["headers"]["Click"].startswith("https://fake.test/oferta/5") and "rtx-3060" in payload["headers"]["Title"]
+    assert ctx.store.conn.execute("select count(*) from deal_pushes").fetchone()[0] == 1
+
+
+async def test_live_price_change_is_recorded_as_the_evaluated_price(tmp_path):
+    """Task 19 minor: the evaluation row carries the re-valued (live) price, so the next sweep that reads that price
+    does not evaluate the listing again."""
+    ad = FakeAdapter([listing()], alive=(True, Decimal("720")))
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    ev = ctx.store.conn.execute("select price from evaluations").fetchone()
+    assert Decimal(ev["price"]) == Decimal("720")
+    ad.listings = [listing(price="720")]
+    s2 = await scheduler.run_round(ctx)
+    assert s2.processed == 0
+
+
+def test_deal_index_health_event_is_recorded_once_per_process(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler, "_INDEX_WARNED", False)
+    st = Store(tmp_path / "d.db")
+    for _ in range(2):  # duplicate deals per listing: the unique index cannot be created
+        st.conn.execute("insert into deals (listing_ref, key, tier) values (7, 'k', 2)")
+    st.conn.commit()
+    for _ in range(3):
+        assert scheduler.ensure_deal_index(st) is False
+    n = st.conn.execute("select count(*) from health where kind='deal_index'").fetchone()[0]
+    assert n == 1
+
+
+async def test_sweep_exception_is_surfaced_in_the_round_errors(tmp_path, monkeypatch):
+    """Task 19 minor: a sweep that dies with a non-timeout exception shows in stats.errors and the health table;
+    the round still completes."""
+    ad = FakeAdapter([listing()])
+    ctx = make_ctx(tmp_path, ad, None)
+
+    def boom(*a, **kw):
+        raise RuntimeError("ledger exploded")
+    monkeypatch.setattr(scheduler.ledger, "sweep_disappeared", boom)
+    stats = await scheduler.run_round(ctx)
+    assert any("allegro_lokalnie" in e and "ledger exploded" in e for e in stats.errors), stats.errors
+    assert ctx.store.conn.execute("select count(*) from health where kind='sweep_error'").fetchone()[0] == 1
+    assert stats.round_id
+
+
+def test_rules_extract_gets_the_round_root(tmp_path, monkeypatch):
+    """Playbook aliases of the active root apply: the scheduler passes root= to both rules_extract calls."""
+    seen = []
+    real = scheduler.rules_extract
+
+    def spy(*a, **kw):
+        seen.append(kw.get("root"))
+        return real(*a, **kw)
+    monkeypatch.setattr(scheduler, "rules_extract", spy)
+    ad = FakeAdapter([listing("1", "RTX 3060 12GB używana", "700")])
+    ctx = make_ctx(tmp_path, ad, None)
+    seed_comps(ctx.store)
+    asyncio.run(scheduler.run_round(ctx))
+    assert seen and all(r == ctx.root for r in seen)

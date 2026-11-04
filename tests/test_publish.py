@@ -242,3 +242,44 @@ def test_wrong_branch_refused(tmp_path):
         (tmp_path / "config" / "publish.yaml").read_text().replace("branch: log", "branch: main"))
     r = asyncio.run(publish.sync(st, config.load(tmp_path), tmp_path))
     assert not r["pushed"] and st.conn.execute("select count(*) from health where kind='bad_branch'").fetchone()[0] == 1
+
+
+def _env_with_remote(tmp_path, bare):
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "publish.yaml").write_text(
+        f"interval_min: 30\nremote: {bare}\nbranch: log\nlog_dir: {tmp_path / 'clone'}\ncards_dir: var/cards/deals\n")
+    return config.load(tmp_path), Store(tmp_path / "t.db")
+
+
+def test_empty_remote_without_a_log_branch_gets_log_pushed(tmp_path):
+    bare = tmp_path / "empty.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    cfg, st = _env_with_remote(tmp_path, bare)
+    asyncio.run(publish.sync(st, cfg, tmp_path))  # no deals yet: the index is published; log is created on the remote
+    did = add_deal(st, tmp_path)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["pushed"] and r["committed"]
+    heads = git(bare, "for-each-ref", "--format=%(refname)").split()
+    assert heads == ["refs/heads/log"]  # log exists, main was never created
+    assert f"deal-{did}.md" in git(bare, "ls-tree", "-r", "--name-only", "log")
+    assert st.conn.execute("select count(*) from health where source='publish' and kind in "
+                           "('clone_failed','pull_failed','fetch_failed','push_failed')").fetchone()[0] == 0
+
+
+def test_remote_with_only_main_gets_log_branch_and_main_is_untouched(tmp_path):
+    bare = tmp_path / "m.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+    seed = tmp_path / "seed"
+    subprocess.run(["git", "clone", "-q", str(bare), str(seed)], check=True, capture_output=True)
+    (seed / "README.md").write_text("hello\n")
+    git(seed, "add", "-A"); git(seed, "commit", "-qm", "init"); git(seed, "branch", "-M", "main"); git(seed, "push", "-q", "origin", "main")
+    main_sha = git(bare, "rev-parse", "main").strip()
+    cfg, st = _env_with_remote(tmp_path, bare)
+    did = add_deal(st, tmp_path)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["pushed"]
+    assert git(bare, "rev-parse", "main").strip() == main_sha  # never pushes the default branch
+    assert f"deal-{did}.md" in git(bare, "ls-tree", "-r", "--name-only", "log")
+    assert git(tmp_path / "clone", "symbolic-ref", "HEAD").strip() == "refs/heads/log"
+    r2 = asyncio.run(publish.sync(st, cfg, tmp_path))  # second cycle: log now exists remotely; plain pull path
+    assert r2["pulled"] and not r2["committed"]

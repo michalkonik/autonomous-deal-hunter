@@ -12,8 +12,8 @@ first, then the top draws, with ceil(floor x k) uniformly random exploration slo
 budget is shared by one Thompson draw per arm, mixed with a floor so every arm keeps at least `floor`/len of it:
     share_i = floor/len + (1 - floor) * draw_i / sum(draws)
 Integer allocation is systematic sampling on the cumulative shares (unbiased: E[alloc_i] = budget x share_i).
-`order` gives the scheduler a distinct, prioritised arm list from the same shares (weighted sampling without
-replacement), new arms first.
+`order` gives a distinct, prioritised arm list from the same shares (weighted sampling without replacement), new
+arms first; the scheduler itself calls `select`.
 
 Arms with blocks or errors are throttled by the fetcher's health state, not here (spec §9.2).
 State lives in the `arm_stats` table: `pulls` = number of updates (undiscounted), `reward`, plus `fetches`
@@ -164,7 +164,8 @@ class Bandit:
 
     def order(self, arms: list[str], rng: random.Random) -> list[str]:
         """Every arm once, in priority order: new arms first, then weighted sampling without replacement by share
-        (Efraimidis-Spirakis keys u^(1/w)). The scheduler takes arms from the front until its budget is spent."""
+        (Efraimidis-Spirakis keys u^(1/w)). The scheduler no longer uses it (I5 ruling: it calls `select`, which
+        takes the top Thompson draws plus uniform exploration slots); kept as the share-weighted alternative."""
         arms = list(dict.fromkeys(arms))
         if not arms:
             return []

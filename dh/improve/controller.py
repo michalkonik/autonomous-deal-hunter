@@ -35,6 +35,7 @@ Robustness:
 """
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,7 +70,17 @@ def _default() -> dict:
             "challenger": None, "champion": None, "previous": None, "door": None, "shadow_started_wh": None,
             "probation": None, "promoted_wh": None, "consecutive_rejections": 0, "cooldown_until_wh": 0.0,
             "last_review_wh": 0.0, "last_health_id": 0, "health_pending": {}, "last_mark_id": 0, "monitor": None,
-            "events": []}
+            "delta_sources": [], "file_pending": None, "events": []}
+
+
+def _sources_of(item) -> list[str]:
+    """Sources a delta's item names: a cadence's source, a query's explicit targets ('all' names none)."""
+    if item.kind == "cadence":
+        return [item.target.strip().lower()]
+    if item.kind == "query":
+        t = item.target.strip().lower()
+        return [] if t in ("all", "*") else [x.strip() for x in t.split(",") if x.strip()]
+    return []
 
 
 def _now() -> str:
@@ -114,47 +125,82 @@ class Controller:
                 store.ensure_table(f"alter table proposals add column {col}")
         self.rev = 0
         self._new: list[dict] = []
-        self.s = self._load()
-        if self.s["champion"] is None:
-            self.s["champion"] = ensure_baseline(store, self.root)
-            self.s["sentinel_version"] = sentinel_version or self.s["champion"]
-            self.s["last_review_wh"] = self.clock()
-            self.s["last_health_id"] = self._max_health_id()
-            self._save()
-        self._reconcile(self.clock())
-        self._save_retry()
+        self._sentinel_version = sentinel_version
+        self.s = self._load()  # READ-ONLY construction: `dh status` never writes; on_round / commands write
+
+    def _init(self, wh: float) -> None:
+        """First real use: the file becomes baseline v1 and the state starts (saved by the next _commit)."""
+        if self.s["champion"] is not None:
+            return
+        self.s["champion"] = ensure_baseline(self.store, self.root)
+        self.s["sentinel_version"] = self._sentinel_version or self.s["champion"]
+        self.s["last_review_wh"] = wh
+        # history from before the loop existed (older than a day) never counts towards a first alarm
+        self.s["last_health_id"] = int(self.store.conn.execute(
+            "select coalesce(max(id),0) from health where at < datetime('now','-1 day')").fetchone()[0])
 
     # ------------------------------------------------------------ persistence
     def _load(self) -> dict:
         r = self.store.conn.execute("select value, rev from improve_state where key='controller'").fetchone()
         self.rev = int(r["rev"]) if r else 0
-        return {**_default(), **(json.loads(r["value"]) if r else {})}
+        st = {**_default(), **(json.loads(r["value"]) if r else {})}
+        self._snap = copy.deepcopy(st)
+        return st
 
-    def _save(self, commit: bool = True) -> None:
-        """Compare-and-swap on `rev`. Raises StateConflict (and rolls back the open transaction) on a conflict."""
+    def _save_cas(self) -> None:
+        """Compare-and-swap on `rev` inside the open transaction (nothing committed here)."""
         self.s["events"] = self.s["events"][-50:]
         value = json.dumps(self.s, default=str)
         cur = self.store.conn.execute("update improve_state set value=?, rev=rev+1 where key='controller' and rev=?",
                                       (value, self.rev))
         if cur.rowcount == 0:
-            exists = self.store.conn.execute("select 1 from improve_state where key='controller'").fetchone()
-            if exists is not None:
-                self.store.conn.rollback()
+            if self.store.conn.execute("select 1 from improve_state where key='controller'").fetchone() is not None:
                 raise StateConflict("the controller state changed since it was loaded")
             self.store.conn.execute("insert into improve_state (key, value, rev) values ('controller', ?, 1)", (value,))
             self.rev = 1
         else:
             self.rev += 1
-        if commit:
-            self.store.conn.commit()
 
-    def _save_retry(self) -> None:
+    def _commit(self) -> None:
+        """THE commit point: the state (CAS) and every pending row of this step (version statuses, proposals,
+        applied-command marks, health events) in ONE commit, then playbook/items.yaml. On a CAS conflict the newer
+        stored state is reloaded inside the same transaction and this step's changes (the fields it changed, its
+        events) are re-applied on top: nothing applied is dropped."""
         try:
-            self._save()
+            self._save_cas()
         except StateConflict:
-            self.s = self._load()
-            self._event(self.clock(), "state_conflict", note="another writer saved first; reloaded")
-            self._save()
+            mine = {k: v for k, v in self.s.items() if k != "events" and self._snap.get(k) != v}
+            theirs = self._load()
+            theirs.update(mine)
+            theirs["events"] = theirs["events"] + [e for e in self._new if e not in theirs["events"]]
+            self.s = theirs
+            self._event(self.clock(), "state_conflict", note="another writer saved first; merged this step on top")
+            self._save_cas()
+        self.store.conn.commit()
+        self._snap = copy.deepcopy(self.s)
+        if self.s.get("file_pending"):
+            self._sync_file()
+            # the write is done: from now on a different file can only be a human edit or a hand revert
+            self.s["file_pending"] = None
+            self._save_cas()
+            self.store.conn.commit()
+            self._snap = copy.deepcopy(self.s)
+
+    def _sync_file(self) -> None:
+        """Bring playbook/items.yaml in line with the champion after a commit that changed it."""
+        fp = self.s.get("file_pending") or {}
+        try:
+            on_disk = Playbook.from_file(self.root).sha()
+        except PlaybookError:
+            on_disk = None
+        if on_disk != fp.get("to"):
+            self.champion().activate(self.root)
+
+    def _champion_changed(self, old: int | None, new: int) -> None:
+        """Record the file write this commit owes (a crash before it is repaired, not mistaken for an edit)."""
+        self.s["file_pending"] = {"from": version_sha(self.store, old) if old else None,
+                                  "to": version_sha(self.store, new)}
+        self.s["champion"] = new
 
     def _event(self, wh: float, what: str, **kw) -> dict:
         e = {"wh": round(wh, 2), "event": what, **kw}
@@ -163,10 +209,9 @@ class Controller:
         return e
 
     def _health(self, kind: str, detail: str) -> None:
-        self.store.add_health("improve", kind, detail[:500])
-
-    def _max_health_id(self) -> int:
-        return int(self.store.conn.execute("select coalesce(max(id),0) from health").fetchone()[0])
+        """A health event in the CURRENT transaction (committed with the state change it reports)."""
+        self.store.conn.execute("insert into health (source, kind, detail) values (?,?,?)",
+                                ("improve", kind, detail[:500]))
 
     def _set_phase(self, phase: str) -> None:
         """Every phase change consumes the health events gathered so far (they belonged to the previous state)."""
@@ -183,10 +228,13 @@ class Controller:
         return self.s["phase"]
 
     def champion(self) -> Playbook:
+        if self.s["champion"] is None:
+            return Playbook.load(store=self.store, root=self.root)
         return Playbook.load(self.s["champion"], store=self.store)
 
     def sentinel_playbook(self) -> Playbook:
-        return Playbook.load(self.s.get("sentinel_version") or self.s["champion"], store=self.store)
+        v = self.s.get("sentinel_version") or self.s["champion"]
+        return Playbook.load(v, store=self.store) if v else Playbook.load(store=self.store, root=self.root)
 
     def status(self) -> dict:
         wh = self.clock()
@@ -205,73 +253,99 @@ class Controller:
         return out
 
     # ------------------------------------------------------------ reconciliation
+    def _version_status(self, vid: int | None) -> str | None:
+        if vid is None:
+            return None
+        r = self.store.conn.execute("select status from playbook_versions where id=?", (vid,)).fetchone()
+        return None if r is None else r["status"]
+
+    def _abort_in_flight(self, wh: float, why: str) -> None:
+        pid = self.s.get("proposal_id")
+        if pid:
+            self._proposal(pid, "aborted", "reconcile", {"why": why})
+        for v in {self.s.get("challenger"), self.s["champion"] if self.phase == "probation" else None} - {None}:
+            if self._version_status(v) in ("shadow", "promoted") and v != active_version(self.store):
+                set_status(self.store, v, "aborted", commit=False)
+        self._health("in_flight_aborted", f"proposal {pid}: {why}")
+        self.s.update(challenger=None, proposal_id=None, door=None, probation=None, shadow_started_wh=None,
+                      promoted_wh=None, delta_sources=[])
+        self._rest()
+        self._event(wh, "in_flight_aborted", proposal=pid, why=why)
+
     def _reconcile(self, wh: float) -> None:
+        """Make state, versions and the file agree (start of every round and of every owner command)."""
         active = active_version(self.store)
         if active is None:
             active = ensure_baseline(self.store, self.root)
+        # 1. a change in flight must still be the one that is live (probation) or waiting (shadow)
+        if self.phase == "probation" and (self.s["champion"] != active
+                                          or self._version_status(self.s["champion"]) != "promoted"):
+            self._abort_in_flight(wh, f"probation version v{self.s['champion']} is no longer the active one (v{active})")
+        unsaved_promotion = (self.phase == "shadow" and self.s.get("challenger") == active
+                             and self._version_status(active) == "promoted")
+        if self.phase == "shadow" and not unsaved_promotion and (
+                self._version_status(self.s.get("challenger")) != "shadow" or self.s["champion"] != active):
+            self._abort_in_flight(wh, f"shadow challenger v{self.s.get('challenger')} is stale (active v{active})")
         if self.s["champion"] != active:
             prev = self.s["champion"]
             self._health("state_mismatch", f"controller state said v{prev}, the active version is v{active}")
-            status = self.store.conn.execute("select status, proposal_id from playbook_versions where id=?",
-                                             (active,)).fetchone()
-            self.s.update(champion=active, previous=prev, monitor=None)
-            if status is not None and status["status"] == "promoted" and self.phase != "probation":
-                # a promotion whose state was never saved: the running version is watched, never unprobated
+            self.s.update(previous=prev, monitor=None)
+            if unsaved_promotion:  # (legacy) a promotion whose state was lost: watched, never run unprobated
                 cc, sc = monitor.counts(self.store, version=prev, last=gates.CUSUM_BASELINE_ROUNDS)
-                self.s.update(proposal_id=status["proposal_id"] or self.s.get("proposal_id"), challenger=active,
-                              probation=probation.Probation.start(active, prev, wh, cc, sc).to_dict(), promoted_wh=wh)
+                self.s.update(probation=probation.Probation.start(active, prev, wh, cc, sc).to_dict(), promoted_wh=wh)
+                self._champion_changed(prev, active)
                 self._set_phase("probation")
                 self._event(wh, "reconciled_probation", version=active, previous=prev)
             else:
+                self._champion_changed(prev, active)
                 self._event(wh, "reconciled", version=active, previous=prev)
-        if self.phase == "shadow" and self.s.get("challenger"):
-            st = self.store.conn.execute("select status from playbook_versions where id=?",
-                                         (self.s["challenger"],)).fetchone()
-            if st is None or st["status"] != "shadow":  # decided, but the state save was lost
-                self.s.update(challenger=None, proposal_id=None, door=None, shadow_started_wh=None)
-                self._rest()
-                self._event(wh, "reconciled_shadow_end")
+        # 2. the file
         try:
             file_pb = Playbook.from_file(self.root)
         except PlaybookError as e:
             self._health("playbook_file_invalid", str(e))
-            self.champion().activate(self.root)
+            self._champion_changed(self.s["champion"], self.s["champion"])
             self._event(wh, "file_restored", version=active)
             return
-        want = version_sha(self.store, self.s["champion"])
-        have = file_pb.sha()
+        have, want = file_pb.sha(), version_sha(self.store, self.s["champion"])
+        pending = self.s.get("file_pending")
         if have == want:
+            self.s["file_pending"] = None
             return
-        known = self.store.conn.execute("select id from playbook_versions where sha=? order by id desc limit 1",
-                                        (have,)).fetchone()
-        if known is not None:  # an older version on disk: a crash between the commit and the file write
-            self.champion().activate(self.root)
-            self._health("file_reconciled", f"playbook file was v{known['id']}, rewrote v{self.s['champion']}")
-            self._event(wh, "file_reconciled", was=known["id"], now=self.s["champion"])
-            return
+        if pending and have == pending.get("from"):  # a crash between the commit and the file write
+            self._health("file_reconciled", f"playbook file was the previous version; rewrote v{self.s['champion']}")
+            self._event(wh, "file_reconciled", now=self.s["champion"])
+            return  # file_pending stays: _commit's _sync_file writes it
         self._owner_edit(file_pb, wh)
 
     def _owner_edit(self, file_pb: Playbook, wh: float) -> None:
-        """playbook/items.yaml changed outside the loop: the owner's edit becomes the new baseline."""
+        """playbook/items.yaml changed outside the loop: the owner's edit (or hand revert) becomes the new baseline.
+        All rows here join the state in the next commit (one transaction)."""
         errs = file_pb.errors()
         if errs:
             self._health("owner_edit_invalid", "; ".join(errs[:5]))
-            self.champion().activate(self.root)
+            self._champion_changed(self.s["champion"], self.s["champion"])  # the file is restored after the commit
             self._event(wh, "owner_edit_rejected", errors=errs[:5])
             return
+        known = self.store.conn.execute("select id from playbook_versions where sha=? order by id desc limit 1",
+                                        (file_pb.sha(),)).fetchone()
+        note = (f"owner revert to v{known['id']} (playbook/items.yaml set back by hand)" if known else
+                "owner edit (playbook/items.yaml changed outside the loop)")
         pid = self.s.get("proposal_id")
-        if pid and self.phase in ("shadow", "probation"):
-            self._proposal(pid, "aborted", "owner_edit", {"note": "the owner edited playbook/items.yaml"})
-            if self.s.get("challenger") and self.phase == "shadow":
-                set_status(self.store, self.s["challenger"], "aborted")
-        vid = file_pb.save_version(self.store, status="baseline", parent=self.s["champion"],
-                                   note="owner edit (playbook/items.yaml changed outside the loop)")
-        self._health("owner_edit", f"playbook file edited by hand: stored as baseline v{vid}"
-                     + (f"; proposal {pid} aborted" if pid and self.phase in ("shadow", "probation") else ""))
-        self.s.update(champion=vid, challenger=None, proposal_id=None, door=None, probation=None,
-                      shadow_started_wh=None, monitor=None)
+        in_flight = bool(pid) and self.phase in ("shadow", "probation")
+        old = self.s["champion"]
+        if in_flight:
+            self._proposal(pid, "aborted", "owner_edit", {"note": note})
+            for v in {self.s.get("challenger"), old if self.phase == "probation" else None} - {None}:
+                set_status(self.store, v, "aborted", commit=False)
+        vid = file_pb.save_version(self.store, status="baseline", parent=old, note=note, commit=False)
+        self._health("owner_edit", f"{note}: stored as baseline v{vid}" + (f"; proposal {pid} aborted" if in_flight else ""))
+        self.s.update(challenger=None, proposal_id=None, door=None, probation=None, shadow_started_wh=None,
+                      monitor=None, promoted_wh=None, delta_sources=[], previous=old)
+        self.s["champion"] = vid
+        self.s["file_pending"] = None  # the file IS this version
         self._rest()
-        self._event(wh, "owner_edit", version=vid)
+        self._event(wh, "owner_edit", version=vid, note=note)
 
     # ------------------------------------------------------------ owner commands
     async def apply_commands(self, wh: float) -> int:
@@ -284,9 +358,7 @@ class Controller:
                 result = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
             self.store.conn.execute("update improve_commands set applied_at=?, result=? where id=?",
                                     (_now(), json.dumps(result, default=str), r["id"]))
-        if rows:
-            self.store.conn.commit()
-        return len(rows)
+        return len(rows)  # the marks are committed by the caller's _commit, together with the effects
 
     async def _command(self, cmd: str, args: dict, wh: float) -> dict:
         if cmd == "rollback":
@@ -304,10 +376,12 @@ class Controller:
     async def process_commands(self) -> int:
         """Apply the queued owner commands now (the CLI does this when the agent is not running)."""
         self.s = self._load()
+        self._new = []
         wh = self.clock()
-        n = await self.apply_commands(wh)
+        self._init(wh)
         self._reconcile(wh)
-        self._save_retry()
+        n = await self.apply_commands(wh)
+        self._commit()
         return n
 
     # ------------------------------------------------------------ the round hook
@@ -318,8 +392,10 @@ class Controller:
         self.s = self._load()
         wh = self.clock()
         self._new = []
-        await self.apply_commands(wh)
+        self._init(wh)
         self._reconcile(wh)
+        await self.apply_commands(wh)
+        self._commit()  # commands and reconciliation are durable before the round's own work can fail
         replay.record_prompt_epoch(self.store, prompt_sha(self.champion()), datetime.now(timezone.utc))
         health = self._take_health()
         rid = round_id if round_id is not None else (round_stats or {}).get("round_id")
@@ -345,13 +421,7 @@ class Controller:
             if trig is not None:
                 await self._reflect_and_propose(trig[0], trig[1], wh)
         await self.apply_commands(wh)  # an owner command that arrived during this round
-        try:
-            self._save()
-        except StateConflict:
-            self.s = self._load()
-            await self.apply_commands(wh)
-            self._event(wh, "state_conflict", note="another writer saved during the round; reloaded")
-            self._save()
+        self._commit()
         return list(self._new)
 
     def _take_health(self) -> dict[str, int]:
@@ -445,10 +515,13 @@ class Controller:
         """Put one delta through the gates (owner or test injection; the reflector uses the same path).
         Raises InFlight while another change is in shadow or probation."""
         self.s = self._load()
+        self._new = []
         wh = self.clock()
+        self._init(wh)
         self._reconcile(wh)
+        self._commit()
         await self._run(delta, trigger, wh)
-        self._save_retry()
+        self._commit()
         return self.status()
 
     async def _run(self, delta: Delta, trigger: str, wh: float, cause: str | None = None) -> None:
@@ -467,6 +540,7 @@ class Controller:
         pid = cur.lastrowid
         reflect.consume(self.store, cause, pid)
         self.s["proposal_id"] = pid
+        self.s["delta_sources"] = _sources_of(delta.item)
         try:
             challenger = champ.apply(delta)
         except Exception as e:  # noqa: BLE001 - PlaybookError: schema, caps, sentinel
@@ -510,15 +584,16 @@ class Controller:
         except PlaybookError as e:
             self._proposal(pid, "rejected", "owner_apply", {"errors": [str(e)]})
             return {"ok": False, "error": str(e)}
-        ok, bad = await gates.must_pass_ok(challenger, cfg=self.cfg, llm=self.llm)
-        detail = {"live_must_pass": ok, "failed": bad, "applied_at_wh": round(wh, 2)}
-        if not ok:
+        live = await gates.must_pass_live(challenger, self.llm, delta.item.id, cfg=self.cfg)
+        detail = {"live_must_pass": live, "applied_at_wh": round(wh, 2)}
+        if not live["ok"]:
             self._proposal(pid, "rejected", "owner_live_must_pass", detail)
-            self._event(wh, "owner_apply_failed", proposal=pid, failed=bad)
-            return {"ok": False, "error": "must-pass failed with the live model", "failed": bad}
+            self._event(wh, "owner_apply_failed", proposal=pid, why=live["why"], failed=live["failed"])
+            return {"ok": False, "error": "; ".join(live["why"]), "failed": live["failed"],
+                    "unavailable": live["unavailable"], "reached_changed_prompt": live["reached_changed_prompt"]}
         vid = challenger.save_version(self.store, status="shadow", parent=self.s["champion"], delta=delta,
                                       proposal_id=pid)
-        self.s.update(proposal_id=pid, challenger=vid, door="llm")
+        self.s.update(proposal_id=pid, challenger=vid, door="llm", delta_sources=[])
         self._proposal(pid, "probation", "owner_applied", detail, version_id=vid)
         self._promote(wh)
         return {"ok": True, "version": vid}
@@ -544,13 +619,13 @@ class Controller:
         prev, vid, pid = self.s["champion"], self.s["challenger"], self.s["proposal_id"]
         cc, sc = monitor.counts(self.store, version=prev, last=gates.CUSUM_BASELINE_ROUNDS)
         p = probation.Probation.start(vid, prev, wh, cc, sc)
-        self.s.update(champion=vid, previous=prev, probation=p.to_dict(), monitor=None, promoted_wh=wh)
+        self.s.update(previous=prev, probation=p.to_dict(), monitor=None, promoted_wh=wh)
+        self._champion_changed(prev, vid)
         self._set_phase("probation")
         self._event(wh, "promoted", proposal=pid, version=vid, previous=prev)
         set_status(self.store, vid, "promoted", commit=False)
-        self._proposal(pid, "probation", "promoted", {}, commit=False)
-        self._save()  # one commit: version status + proposal + state
-        Playbook.load(vid, store=self.store).activate(self.root)
+        self._proposal(pid, "probation", "promoted", {})
+        # committed with the state by the caller's _commit (one transaction), then the file is written
 
     async def _probation_round(self, champion_n: int, sentinel_n: int, wh: float) -> None:
         p = probation.Probation(self.s["probation"])
@@ -576,7 +651,8 @@ class Controller:
 
     def _health_rise(self, wh: float) -> list[str]:
         """Source/kind keys whose health events since the promotion are >= HEALTH_ALARM_EVENTS and more than twice
-        the equal watched window before it, provided the sentinel's sources show no such rise (else: the sites)."""
+        the equal watched window before it. A rise on a source the delta names (cadence or query target) is always
+        the change's; the control is every OTHER sentinel source: if one of them rises too, the sites changed."""
         t0 = self.s.get("promoted_wh")
         if t0 is None:
             return []
@@ -584,8 +660,13 @@ class Controller:
         after = monitor.health_between(self.store, float(t0), wh)
         before = monitor.health_between(self.store, float(t0) - span, float(t0))
         rising = [k for k, n in after.items() if n >= gates.HEALTH_ALARM_EVENTS and n > 2 * before.get(k, 0)]
-        sent = monitor.sentinel_sources(self.sentinel_playbook())
-        if any(k.split("|", 1)[0] in sent or any(s in k.split("|", 1)[0] for s in sent) for k in rising):
+        named = set(self.s.get("delta_sources") or [])
+        control = monitor.sentinel_sources(self.sentinel_playbook()) - named
+
+        def on(key: str, sources: set[str]) -> bool:
+            src = key.split("|", 1)[0]
+            return any(s == src or s in src for s in sources)
+        if any(on(k, control) for k in rising):
             return []  # the control group is unhealthy too: the sites changed, not the playbook
         return sorted(rising)
 
@@ -596,48 +677,51 @@ class Controller:
         restored = active_version(self.store)
         if restored is None or restored == failed:
             raise PlaybookError("no promoted or baseline version to roll back to")
-        self.s.update(champion=restored, monitor=None)
+        self.s["monitor"] = None
+        self._champion_changed(failed, restored)
         self._event(wh, "rolled_back", proposal=pid, failed=failed, to=restored, why=why)
-        self._reject(wh, "probation", {"why": why}, status="failed_in_prod", version_status=None, commit=False)
-        self._save()
-        Playbook.load(restored, store=self.store).activate(self.root)
+        self._reject(wh, "probation", {"why": why}, status="failed_in_prod", version_status=None)
 
     def _accept(self, wh: float) -> None:
         pid = self.s["proposal_id"]
         self._proposal(pid, "accepted", "probation_passed", {})
         self._event(wh, "accepted", proposal=pid, version=self.s["champion"])
         self.s.update(consecutive_rejections=0, cooldown_until_wh=wh, proposal_id=None, challenger=None, door=None,
-                      probation=None, shadow_started_wh=None, promoted_wh=None)
+                      probation=None, shadow_started_wh=None, promoted_wh=None, delta_sources=[])
         self._rest()
 
     def _reject(self, wh: float, stage: str, detail: dict, *, status: str = "rejected",
-                version_status: str | None = "rejected", commit: bool = True) -> None:
+                version_status: str | None = "rejected") -> None:
         pid = self.s["proposal_id"]
         if version_status and self.s.get("challenger"):
-            set_status(self.store, self.s["challenger"], version_status, commit=commit)
-        self._proposal(pid, status, stage, detail, commit=commit)
+            set_status(self.store, self.s["challenger"], version_status, commit=False)
+        self._proposal(pid, status, stage, detail)
         n = self.s["consecutive_rejections"] + 1
         cool = gates.cooldown_hours(n)
         self.s.update(consecutive_rejections=n, cooldown_until_wh=wh + cool, proposal_id=None, challenger=None,
-                      door=None, probation=None, shadow_started_wh=None, promoted_wh=None)
+                      door=None, probation=None, shadow_started_wh=None, promoted_wh=None, delta_sources=[])
         self._event(wh, "rejected", proposal=pid, stage=stage, consecutive=n, cooldown_wh=cool)
         if n >= gates.MAINTENANCE_AFTER_REJECTIONS and not self.s["maintenance"]:
             self._enter_maintenance(wh, f"{n} consecutive rejections")
         self._rest()
 
-    def _proposal(self, pid: int | None, status: str, stage: str, detail: dict, version_id: int | None = None,
-                  commit: bool = True) -> None:
+    def _proposal(self, pid: int | None, status: str, stage: str, detail: dict, version_id: int | None = None) -> None:
+        """Update a proposal in the current transaction. `detail` is MERGED into what is stored (a later stage never
+        erases an earlier stage's record, e.g. the live must-pass result of an owner apply)."""
         if pid is None:
             return
-        r = self.store.conn.execute("select payload from proposals where id=?", (pid,)).fetchone()
-        payload = json.loads(r["payload"]) if r else {}
+        r = self.store.conn.execute("select payload, detail from proposals where id=?", (pid,)).fetchone()
+        payload = json.loads(r["payload"]) if r and r["payload"] else {}
+        try:
+            old = json.loads(r["detail"]) if r and r["detail"] else {}
+        except ValueError:
+            old = {}
         payload["stage"] = stage
+        merged = {**(old if isinstance(old, dict) else {}), **(detail or {})}
         self.store.conn.execute(
             "update proposals set status=?, stage=?, payload=?, detail=?, decided_at=?, version_id=coalesce(?, version_id) "
-            "where id=?", (status, stage, json.dumps(payload, default=str), json.dumps(detail, default=str)[:20000],
+            "where id=?", (status, stage, json.dumps(payload, default=str), json.dumps(merged, default=str)[:20000],
                            _now(), version_id, pid))
-        if commit:
-            self.store.conn.commit()
 
     # ------------------------------------------------------------ maintenance and owner actions
     def _enter_maintenance(self, wh: float, reason: str) -> None:
@@ -659,16 +743,18 @@ class Controller:
         """Make `version` active again (stored as a new promoted copy) and abort any change in flight."""
         target = Playbook.load(version, store=self.store)
         pid = self.s.get("proposal_id")
+        old = self.s["champion"]
         if pid:
-            self._proposal(pid, "aborted", "owner_rollback", {"to": version}, commit=False)
+            self._proposal(pid, "aborted", "owner_rollback", {"to": version})
             if self.s.get("challenger") and self.phase == "shadow":
                 set_status(self.store, self.s["challenger"], "aborted", commit=False)
-        vid = target.save_version(self.store, status="promoted", parent=self.s["champion"],
-                                  note=f"owner rollback to v{version}", commit=False)
-        self.s.update(champion=vid, challenger=None, proposal_id=None, door=None, probation=None,
-                      shadow_started_wh=None, monitor=None, promoted_wh=None)
+            if self.phase == "probation":
+                set_status(self.store, old, "aborted", commit=False)
+        vid = target.save_version(self.store, status="promoted", parent=old, note=f"owner rollback to v{version}",
+                                  commit=False)
+        self.s.update(challenger=None, proposal_id=None, door=None, probation=None, shadow_started_wh=None,
+                      monitor=None, promoted_wh=None, delta_sources=[])
+        self._champion_changed(old, vid)
         self._rest()
         self._event(wh, "owner_rollback", to=version, as_version=vid)
-        self._save()
-        target.activate(self.root)
-        return {"ok": True, "version": vid, "to": version}
+        return {"ok": True, "version": vid, "to": version}  # committed with the command mark by the caller

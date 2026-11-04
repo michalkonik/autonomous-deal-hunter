@@ -26,7 +26,8 @@ WRITE_METHODS = {"write_text", "write_bytes", "unlink", "rmdir", "touch", "chmod
 WRITE_FUNCS = {("os", "replace"), ("os", "rename"), ("os", "remove"), ("os", "unlink"), ("os", "makedirs"),
                ("os", "rmdir"), ("os", "system"), ("os", "popen"), ("os", "symlink"), ("os", "link"),
                ("os", "truncate"), ("os", "chmod"), ("os", "open"), ("os", "write"), ("os", "fdopen"),
-               ("os", "mkdir"), ("io", "open"), ("codecs", "open"),
+               ("os", "mkdir"), ("io", "open"), ("codecs", "open"), ("os", "renames"), ("os", "ftruncate"),
+               ("os", "utime"),
                ("tempfile", "mkstemp"), ("tempfile", "mkdtemp"), ("tempfile", "NamedTemporaryFile"),
                ("tempfile", "TemporaryFile"), ("tempfile", "SpooledTemporaryFile"), ("tempfile", "TemporaryDirectory")}
 FORBIDDEN_IMPORTS = {"shutil", "subprocess", "pty", "evals.marks"}
@@ -45,7 +46,17 @@ def _write_mode(call: ast.Call, pos: int) -> bool:
 
 
 def _sinks(tree: ast.AST):
-    """(function name, sink) for every write-capable call."""
+    """(function name, sink) for every write-capable call. Import aliases are resolved: `import os as o` then
+    `o.replace(...)`, and `from os import replace as r` then `r(...)`, are both os.replace."""
+    modules: dict[str, str] = {}
+    names: dict[str, tuple[str, str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                modules[a.asname or a.name.split(".")[0]] = a.name if a.asname else a.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            for a in node.names:
+                names[a.asname or a.name] = (node.module, a.name)
     out = []
 
     def visit(node, fn):
@@ -53,16 +64,26 @@ def _sinks(tree: ast.AST):
             name = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
             if isinstance(child, ast.Call):
                 f = child.func
-                if isinstance(f, ast.Name) and f.id == "open":
+                if isinstance(f, ast.Name) and f.id == "open" and f.id not in names:
                     if _write_mode(child, 1):
                         out.append((fn, "open"))
-                elif isinstance(f, ast.Name) and f.id in {n for _, n in WRITE_FUNCS if _ == "tempfile"}:
-                    out.append((fn, f"tempfile.{f.id}"))  # from tempfile import X
+                elif isinstance(f, ast.Name) and f.id in names:
+                    mod, attr = names[f.id]
+                    if (mod, attr) in WRITE_FUNCS:
+                        out.append((fn, f"{mod}.{attr}"))
+                    elif (mod, attr) in {("io", "open"), ("codecs", "open")} or (attr == "open" and _write_mode(child, 1)):
+                        out.append((fn, f"{mod}.{attr}"))
                 elif isinstance(f, ast.Attribute):
-                    if isinstance(f.value, ast.Name) and (f.value.id, f.attr) in WRITE_FUNCS:
-                        out.append((fn, f"{f.value.id}.{f.attr}"))
+                    base = f.value.id if isinstance(f.value, ast.Name) else None
+                    mod = modules.get(base) if base else None
+                    if mod is not None and (mod, f.attr) in WRITE_FUNCS:
+                        out.append((fn, f"{mod}.{f.attr}"))
+                    elif mod is not None:
+                        pass  # another module function (dataclasses.replace, json.dumps...)
                     elif f.attr == "open" and _write_mode(child, 0):  # Path.open("w"), fh.open(...)
                         out.append((fn, "Path.open"))
+                    elif f.attr == "replace" and len(child.args) == 1 and not child.keywords:
+                        out.append((fn, "Path.replace"))  # str.replace takes two arguments
                     elif f.attr in WRITE_METHODS:
                         out.append((fn, f.attr))
             visit(child, name)
@@ -113,21 +134,26 @@ def test_no_frozen_path_literals(path):
 
 ROGUE = """
 import io, codecs, os, tempfile
+import os as o
 from pathlib import Path
 from tempfile import mkstemp
+from os import replace, renames as rn
+from dataclasses import replace as dc_replace
 def f(p, m):
     open(p, "w"); open(p, m); Path(p).open("a"); Path(p).open(mode="w"); io.open(p, "wb"); codecs.open(p, "w")
     os.open(p, os.O_WRONLY); os.write(3, b"x"); os.fdopen(3, "w"); mkstemp(); tempfile.NamedTemporaryFile()
     Path(p).write_text("x"); Path(p).unlink(); os.replace(p, p)
+    o.replace(p, p); replace(p, p); rn(p, p); Path(p).replace(p); Path(p).rename(p); os.renames(p, p)
+    os.ftruncate(3, 0); os.utime(p)
 def ok(p):
-    open(p); open(p, "rb"); Path(p).open(); Path(p).read_text()
+    open(p); open(p, "rb"); Path(p).open(); Path(p).read_text(); "a".replace("a", "b"); dc_replace(p, x=1)
 """
 
 
 def test_scanner_catches_every_write_form():
     sinks = _sinks(ast.parse(ROGUE))
     assert all(fn == "f" for fn, _ in sinks)  # nothing in ok()
-    assert len(sinks) == 14, sinks
+    assert len(sinks) == 22, sinks
 
 
 def test_gates_itself_has_no_write_sink():

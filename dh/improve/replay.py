@@ -232,8 +232,10 @@ def cached_extraction(store, lid: int, title: str | None = None, prompt_sha: str
             return None
         if title is not None and ev["title_hash"] != title_hash(title):
             return None
-        if prompt_sha is not None and prompt_sha_at(store, ev["at"]) != prompt_sha:
-            return None
+        if prompt_sha is not None:
+            made_by = r["prompt_sha"] if "prompt_sha" in r.keys() and r["prompt_sha"] else prompt_sha_at(store, ev["at"])
+            if made_by != prompt_sha:  # the sha stamped on the row; old rows: the epoch at their evaluation time
+                return None
     return Extraction(key=r["key"], category=r["category"], certainty=float(r["certainty"] or 0),
                       condition=r["condition"] or "unknown", defects=json.loads(r["defects"] or "[]"),
                       box_only=bool(r["box_only"]), for_parts=bool(r["for_parts"]), wanted_ad=bool(r["wanted_ad"]),

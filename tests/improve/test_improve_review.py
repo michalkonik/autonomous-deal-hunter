@@ -36,6 +36,13 @@ def make(env, llm=None):
     return Controller(store, root=root, llm=llm, clock=clock)
 
 
+def started(env, llm=None):
+    """A controller whose state exists (construction is read-only; the first command/round initialises it)."""
+    ctl = make(env, llm)
+    run(ctl.process_commands())
+    return ctl
+
+
 class LiveLLM:
     """A live extraction model stand-in: 'safe' answers 'no key' for everything, 'wrong' maps everything to a 4090."""
 
@@ -93,7 +100,7 @@ def test_owner_apply_runs_must_pass_with_the_live_model(env):
     pid = store.conn.execute("select id from proposals").fetchone()[0]
     wrong = LiveLLM("wrong")
     text, code = cli_apply(pid, root=root, store=store, running=False, llm=wrong)
-    assert code == 1 and "must-pass failed with the live model" in text and wrong.calls > 0
+    assert code == 1 and "must-pass cases failed" in text and wrong.calls > 0
     assert store.conn.execute("select status from proposals where id=?", (pid,)).fetchone()[0] == "rejected"
     run(make(env).submit(prompt_delta(make(env).champion())))
     pid2 = store.conn.execute("select max(id) from proposals").fetchone()[0]
@@ -120,6 +127,7 @@ def test_queued_apply_waits_for_the_running_agent(env):
 
 
 def test_crash_between_promote_and_save_is_reconciled(env):
+    """(Legacy) a promotion committed without its state: the next round watches it in probation."""
     store, root, clock = env
     ctl = make(env)
     run(ctl.submit(ctl.champion().make_delta("add", alias_fe())))
@@ -127,10 +135,29 @@ def test_crash_between_promote_and_save_is_reconciled(env):
     pbm.set_status(store, vid, "promoted")  # committed... then the process died: no state save, no file write
     assert Playbook.from_file(root).get("alias.fe_glued_4090") is None
     again = make(env)
+    assert again.phase == "shadow"  # construction is read-only
+    run(step(again, clock, 0.1))
     assert again.phase == "probation" and again.s["champion"] == vid  # never runs a version unprobated
     assert Playbook.from_file(root).get("alias.fe_glued_4090") is not None  # file brought in line
     kinds = {r["kind"] for r in store.conn.execute("select kind from health where source='improve'")}
-    assert {"state_mismatch", "file_reconciled"} <= kinds
+    assert "state_mismatch" in kinds
+
+
+def test_crash_between_commit_and_file_write_rewrites_the_file(env):
+    store, root, clock = env
+    ctl = started(env)
+    base = ctl.champion()
+    run(ctl.submit(ctl.champion().make_delta("add", Item("cadence.olx", "cadence", "olx", 15))))
+    assert ctl.phase == "probation"
+    # simulate the crash window: the commit happened, the file write did not, file_pending still recorded
+    base.activate(root)
+    ctl.s["file_pending"] = {"from": base.sha(), "to": ctl.champion().sha()}
+    store.conn.execute("update improve_state set value=?, rev=rev+1 where key='controller'", (json.dumps(ctl.s),))
+    store.conn.commit()
+    again = make(env)
+    run(step(again, clock, 0.1))
+    assert Playbook.from_file(root).get("cadence.olx") is not None and again.phase == "probation"
+    assert not [e for e in again.s["events"] if e["event"] == "owner_edit"]
 
 
 def test_restart_mid_probation_continues_it(env):
@@ -176,7 +203,7 @@ def Delta_add_query():
 
 def test_owner_rollback_during_a_long_round_is_applied_before_saving(env):
     store, root, clock = env
-    base = make(env).s["champion"]
+    base = started(env).s["champion"]
 
     class SlowAdvisor(FakeLLM):
         async def chat_json(self, role, system, user, schema, max_tokens=600):
@@ -194,17 +221,17 @@ def test_owner_rollback_during_a_long_round_is_applied_before_saving(env):
     assert make(env).s["champion"] == ctl.s["champion"]  # the state saved by the round includes the rollback
 
 
-def test_state_save_is_compare_and_swap(env):
+def test_state_save_is_compare_and_swap_and_merges(env):
     store, root, clock = env
-    a, b = make(env), make(env)
+    a = started(env)
+    b = make(env)
     b.s["consecutive_rejections"] = 2
-    b._save()
-    a.s["consecutive_rejections"] = 1
-    with pytest.raises(StateConflict):
-        a._save()
-    assert make(env).s["consecutive_rejections"] == 2
-    run(step(a, clock, 0.5))  # a round reloads first, so it never overwrites b's change
-    assert make(env).s["consecutive_rejections"] == 2
+    b._commit()
+    a.s["maintenance"] = True  # a loaded before b saved: a different field
+    a._commit()
+    fresh = make(env)
+    assert fresh.s["consecutive_rejections"] == 2 and fresh.s["maintenance"] is True  # neither change is lost
+    assert any(e["event"] == "state_conflict" for e in fresh.s["events"])
 
 
 # ------------------------------------------------------------------ health rollback during probation
@@ -276,9 +303,9 @@ def test_no_proposal_stamps_the_cluster_and_cools_down(env):
 def test_weekly_review_due_in_a_cooldown_is_not_lost(env):
     store, root, clock = env
     llm = FakeLLM()
-    ctl = make(env, llm)
+    ctl = started(env, llm)
     ctl.s.update(cooldown_until_wh=200.0, last_review_wh=0.0)
-    ctl._save()
+    ctl._commit()
     clock.wh = 170
     run(step(ctl, clock, 0))
     assert advisor_calls(llm) == 0
@@ -290,7 +317,7 @@ def test_weekly_review_due_in_a_cooldown_is_not_lost(env):
 def test_health_events_are_consumed_per_state(env):
     store, root, clock = env
     llm = FakeLLM()
-    ctl = make(env, llm)
+    ctl = started(env, llm)
     base = ctl.s["champion"]
     run(ctl.submit(ctl.champion().make_delta("add", alias_fe())))
     health_alarm(store, 5)  # during shadow

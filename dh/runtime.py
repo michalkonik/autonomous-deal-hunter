@@ -387,6 +387,33 @@ def _log_repo(cfg) -> dict:
 # ------------------------------------------------------------------------------------------------ serve
 
 
+async def post_round(ctx, st, *, weekly: bool = True) -> None:
+    """Hooks that run after every round (`serve` and `dh round`): the self-improvement step, then (serve only) the
+    weekly report when 168 watched hours have passed. Neither can end the round loop: a failure becomes a health
+    event (`improve_error`, `weekly_error`); only cancellation (SIGTERM) propagates."""
+    from . import improve
+    try:
+        imp = ctx.cfg.get("improve")
+        limit = float((imp.to_dict() if imp is not None else {}).get("post_round_timeout_s", 300))
+        await asyncio.wait_for(improve.after_round(ctx, st), limit if limit > 0 else None)
+    except asyncio.TimeoutError:
+        log.error("improve.after_round exceeded %.0f s", limit)
+        ctx.store.add_health("improve", "improve_timeout", f"after_round cut after {limit:.0f}s (improve.post_round_timeout_s)")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001 - the improvement loop is optional; the rounds are not
+        log.exception("improve.after_round failed")
+        ctx.store.add_health("improve", "improve_error", f"{type(e).__name__}: {e}"[:500])
+    if weekly:
+        try:
+            await publish.publish_weekly(ctx.store, ctx.cfg, ctx.root)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("weekly report failed")
+            ctx.store.add_health("publish", "weekly_error", f"{type(e).__name__}: {e}"[:500])
+
+
 def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, no_llm: bool = False,
                   stop: asyncio.Event | None = None, frozen: dict | None = None) -> scheduler.RoundContext:
     """Everything a round needs, wired to the real modules (shared by `serve` and `dh round`)."""
@@ -477,6 +504,7 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
             try:
                 st = await scheduler.run_round(ctx)
                 log.info(scheduler.summary_line(st))
+                await post_round(ctx, st)
             except asyncio.CancelledError:
                 raise
             except FrozenChanged as e:

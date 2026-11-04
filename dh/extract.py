@@ -6,6 +6,8 @@ Rules flags are sticky: the LLM can never clear box_only / wanted_ad / for_parts
 """
 from __future__ import annotations
 
+import hashlib
+
 import re
 from dataclasses import replace
 from pathlib import Path
@@ -82,6 +84,11 @@ async def _confirm(listing: Listing, key: str, client: Client, root: Path) -> di
     return await client.chat_json("senior", system, f"{user}\n\nCandidate key: {key}", CONFIRM_SCHEMA, max_tokens=300)
 
 
+def prompt_sha(text: str) -> str:
+    """Identity of a prompt text (same as dh.improve.playbook.prompt_sha)."""
+    return hashlib.sha256(str(text).encode()).hexdigest()[:16]
+
+
 async def extract(listing: Listing, rules: Extraction, client: Client, root: Path = ROOT) -> Extraction:
     """`rules` unchanged when its certainty >= 0.9, or when the rules already saw a box-only / wanted ad.
 
@@ -107,7 +114,7 @@ async def extract(listing: Listing, rules: Extraction, client: Client, root: Pat
     defects = sorted(set(rules.defects) | {_short(d) for d in out["defects"] if _short(d)})
     bundle = sorted(set(rules.bundle_items) | {_short(b).lower() for b in out["bundle_items"] if _short(b)})
     condition = "for_parts" if for_parts else (out["condition"] if out["condition"] != "unknown" else rules.condition)
-    notes = list(rules.notes)
+    notes = [*rules.notes, f"prompt_sha:{prompt_sha(system)}"]  # store.save_extraction persists it (prompt epochs)
 
     key = cat = None
     cert = 0.0

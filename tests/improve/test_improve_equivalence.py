@@ -6,6 +6,7 @@ unavailable, nothing is pushed). It also goes through `replay.Judge.judge`. Both
 seeded from each case's market) with the same fixed FX. The key, the exclusion and the tier band must agree.
 """
 import asyncio
+import dataclasses
 import random
 from datetime import timedelta
 from decimal import Decimal
@@ -24,11 +25,27 @@ NOW = gates.EVAL_NOW
 class FakeAd:
     domain, enabled, via_mailbox = "example.invalid", True, False
 
+    def __init__(self, alive_ok: bool = False):
+        self.alive_ok = alive_ok
+
     async def detail(self, l, fetcher):
         return l
 
     async def alive(self, l, fetcher):
+        if self.alive_ok:
+            return True, l.price  # alive at the same price: "verified now"
         raise AdapterError("no live re-check offline")
+
+
+class FakeLLM:
+    """A deterministic worker: a 4090 when the title says 4090, otherwise no key (never confident enough to confirm)."""
+
+    async def chat_json(self, role, system, user, schema, max_tokens=600):
+        if "same" in schema.get("properties", {}):
+            return {"same": True, "key": None, "certainty": 0.9}
+        key = "gpu:rtx-4090:24" if "4090" in user.split("Description:")[0] else None
+        return {"key": key, "certainty": 0.8 if key else 0.0, "condition": "used", "defects": [], "box_only": False,
+                "for_parts": False, "wanted_ad": False, "bundle_items": []}
 
 
 async def _no_photos(*a, **kw):
@@ -66,23 +83,24 @@ def store(tmp_path):
     s.close()
 
 
-def test_offline_judge_matches_the_production_round(store, tmp_path):
+@pytest.mark.parametrize("llm,alive_ok", [(None, False), (FakeLLM(), True)], ids=["rules-unverified", "llm-verified"])
+def test_offline_judge_matches_the_production_round(store, tmp_path, llm, alive_ok):
     cases = gates.load_cases(gates.MUST_PASS)
     seed_market(store, cases)
     cfg = config.load(REPO)
     ctx = scheduler.RoundContext(
-        cfg=cfg, root=REPO, store=store, fetcher=None, adapters={}, llm=None, fx=replay.TableFx(gates.EVAL_FX),
+        cfg=cfg, root=REPO, store=store, fetcher=None, adapters={}, llm=llm, fx=replay.TableFx(gates.EVAL_FX),
         customs=None, bandit=None, rng=random.Random(0), cards_root=tmp_path / "cards", shots_root=tmp_path / "shots",
         dry=True, now=lambda: NOW, push=_false, screenshot=_false, photo_check=_no_photos)
     rnd = scheduler._Round(ctx)
     judge = replay.Judge(seed_playbook(), store, cfg=cfg, fx=replay.TableFx(gates.EVAL_FX), now=NOW)
     arm = scheduler.Arm("olx:eq", "olx", Query(text="eq", arm_id="olx:eq"), "query.eq")
-    ad = FakeAd()
+    ad = FakeAd(alive_ok)
     diffs = []
 
     async def go():
         for c in cases:
-            l = gates.case_listing(c)
+            l = dataclasses.replace(gates.case_listing(c), seller_hash=c["id"])  # one seller each: no dedupe
             lid = store.upsert_listing(l)
             before = dict(rnd.stats.dropped)
             await rnd._evaluate(l, lid, arm, ad)
@@ -91,9 +109,15 @@ def test_offline_judge_matches_the_production_round(store, tmp_path):
             ex = store.conn.execute("select key from extractions where listing_id=?", (lid,)).fetchone()
             prod = (ex["key"] if ex else None, band(ev["tier"]),
                     bool(dropped & {"bait_or_parts", "no_key", "price_range", "hard_exclude"}))
-            o = await judge.judge(l, lid=lid)
+            # the judge reads what production stored: the cached LLM output (if still current) and the verification
+            o = await judge.judge(l, lid=lid, cached=replay.cached_extraction(store, lid, l.title),
+                                  verified_age_s=0.0 if lid in replay.verified_listings(store) else None)
             off = (o.key, band(o.tier), o.excluded)
             if prod != off:
                 diffs.append((c["id"], prod, off, ev["note"], sorted(dropped), o.reason))
     asyncio.run(go())
     assert not diffs, diffs
+    if llm is not None:  # the branches were really exercised
+        n_llm = store.conn.execute("select count(*) from extractions where method='llm'").fetchone()[0]
+        n_ver = store.conn.execute("select count(*) from deals where verified_at is not null").fetchone()[0]
+        assert n_llm > 0 and n_ver > 0, (n_llm, n_ver)  # LLM path and verified (re-checked) path both compared

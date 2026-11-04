@@ -147,6 +147,39 @@ async def _deliver(payload: dict, store, cfg, root: Path, client, smtp_send, sec
         return err + f"; email: {e!r}"
 
 
+def build_payload(deal, card_url: str, prio: str, *, store=None, listing_url: str = "", source: str | None = None,
+                  city: str | None = None) -> dict:
+    try:
+        ttl = title(deal, source, city)
+        body = f"{ttl}\nConservative net ${Decimal(deal.cons_net_usd):.0f}, confidence {deal.confidence}"
+    except Exception as e:  # a bad deal field must not lose the push: fall back to a plain title
+        _health(store, "title_error", repr(e))
+        ttl = _clean(f"T{getattr(deal, 'tier', '?')} deal {getattr(deal, 'id', '?')}")
+        body = ttl
+    click, card = _safe_url(listing_url or card_url), _safe_url(card_url)
+    return {
+        "headers": {"Title": ttl, "Priority": prio, "Tags": "moneybag", "Click": click,
+                    "Actions": f"view, Card, {card}"},
+        "body": body,
+    }
+
+
+def queue_push(deal, card_url: str, *, store, cfg=None, root: Path | None = None, listing_url: str = "",
+               source: str | None = None, city: str | None = None, reason: str = "queued",
+               now: datetime | None = None) -> None:
+    """Put a tier-1 push straight into the retry queue (no network, no await): used when the sender was cancelled
+    mid-flight (SIGTERM), so a reserved push is delivered by the next run's retry instead of being lost."""
+    try:
+        _, prio = _ntfy_cfg(cfg or config.load(Path(root or ".")))
+    except Exception:  # noqa: BLE001 - a broken config must not lose the push either
+        prio = "urgent"
+    payload = build_payload(deal, card_url, prio, store=store, listing_url=listing_url, source=source, city=city)
+    store.ensure_table(PENDING_SQL)
+    store.conn.execute("insert into pending_pushes (payload, created_at, last_error) values (?,?,?)",
+                       (json.dumps(payload), (now or datetime.now(timezone.utc)).isoformat(), reason))
+    store.conn.commit()
+
+
 async def push_tier1(deal, card_url: str, *, store=None, cfg=None, root: Path | None = None,
                      listing_url: str = "", source: str | None = None, city: str | None = None,
                      client: httpx.AsyncClient | None = None,
@@ -160,19 +193,7 @@ async def push_tier1(deal, card_url: str, *, store=None, cfg=None, root: Path | 
     except Exception as e:
         _health(store, "config_error", repr(e))
         return False
-    try:
-        ttl = title(deal, source, city)
-        body = f"{ttl}\nConservative net ${Decimal(deal.cons_net_usd):.0f}, confidence {deal.confidence}"
-    except Exception as e:  # a bad deal field must not lose the push: fall back to a plain title
-        _health(store, "title_error", repr(e))
-        ttl = _clean(f"T{getattr(deal, 'tier', '?')} deal {getattr(deal, 'id', '?')}")
-        body = ttl
-    click, card = _safe_url(listing_url or card_url), _safe_url(card_url)
-    payload = {
-        "headers": {"Title": ttl, "Priority": prio, "Tags": "moneybag", "Click": click,
-                    "Actions": f"view, Card, {card}"},
-        "body": body,
-    }
+    payload = build_payload(deal, card_url, prio, store=store, listing_url=listing_url, source=source, city=city)
     err = await _deliver(payload, store, cfg, root, client, smtp_send, secret_fn)
     if err is None:
         return True

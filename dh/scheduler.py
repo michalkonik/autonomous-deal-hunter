@@ -88,13 +88,20 @@ DEAL_INDEX_SQL = "create unique index if not exists idx_deals_listing on deals(l
 REQUEUE_NOTES = ("deferred", "llm_pending")
 
 
+_INDEX_WARNED = False  # the deal_index health event is recorded once per process, not once per round
+
+
 def ensure_deal_index(store) -> bool:
-    """One deal per listing (the scheduler updates it on re-evaluation). False when old duplicates prevent it."""
+    """One deal per listing (the scheduler updates it on re-evaluation). False when old duplicates prevent it
+    (reported once per process)."""
+    global _INDEX_WARNED
     try:
         store.ensure_table(DEAL_INDEX_SQL)
         return True
     except sqlite3.IntegrityError:
-        store.add_health("scheduler", "deal_index", "duplicate deals per listing exist: unique index not created")
+        if not _INDEX_WARNED:
+            _INDEX_WARNED = True
+            store.add_health("scheduler", "deal_index", "duplicate deals per listing exist: unique index not created")
         return False
 
 
@@ -394,6 +401,7 @@ class _Round:
         self.save_lock = asyncio.Lock()  # final dedupe re-check + save/update, with no await in between
         self.mail_arms: list[Arm] = []
         self.task_sem = asyncio.Semaphore(64)
+        self.revalued: dict[int, Listing] = {}  # listing id -> the listing at the live price read at verification
         self.shipping = economics.load_shipping()
         self.repo_web_url = str((ctx.cfg.get("publish").to_dict() if ctx.cfg.get("publish") is not None else {})
                                 .get("repo_web_url") or "").rstrip("/")
@@ -687,7 +695,7 @@ class _Round:
 
     async def _evaluate(self, l: Listing, lid: int, arm: Arm, ad) -> None:
         self.stats.processed += 1
-        rules = rules_extract(l.title, l.description, (l.country or "pl").lower())
+        rules = rules_extract(l.title, l.description, (l.country or "pl").lower(), root=self.root)
         if rules.wanted_ad or rules.box_only or rules.for_parts:
             self.store.save_extraction(lid, rules)
             self._mark_eval(lid, l, note="bait")
@@ -734,7 +742,9 @@ class _Round:
         self.stats.candidates += 1
         self.keys_seen.add(ex.key)
         tier = await self._deal_path(l, lid, ex, arm, price_pln, ad)
-        self._mark_eval(lid, l, tier=tier, note="llm_pending" if pending else "")
+        # re-valued at the live price after verification: record THAT price, or the next sweep (which reads the same
+        # live price) would see a price change and evaluate the listing again
+        self._mark_eval(lid, self.revalued.pop(lid, l), tier=tier, note="llm_pending" if pending else "")
 
     # ------------------------------------------------------------ valuation / economics / risk / tier
     def _estimate(self, key: str, cond: str | None, ch: str, lid: int):
@@ -926,7 +936,7 @@ class _Round:
                 self.stats.errors.append(f"photos {l.url}: {type(e).__name__}: {e}"[:200])
             stock = photos.FLAG in pflags
             self.stats.photo_reuse += int(stock)
-            r2 = rules_extract(l.title, l.description, (l.country or "pl").lower())
+            r2 = rules_extract(l.title, l.description, (l.country or "pl").lower(), root=self.root)
             ex = dataclasses.replace(ex, for_parts=ex.for_parts or r2.for_parts, wanted_ad=ex.wanted_ad or r2.wanted_ad,
                                      box_only=ex.box_only or r2.box_only,
                                      defects=sorted(set(ex.defects) | set(r2.defects)),
@@ -949,6 +959,7 @@ class _Round:
                     if changed:  # live price differs: the deal is re-valued at the price that is on offer now
                         self.stats.price_changed += 1
                         l = dataclasses.replace(l, price=now_price, seen_at=self.ctx.now())
+                        self.revalued[lid] = l  # the evaluation is recorded at this price (see _evaluate)
                         ledger.observe(self.store, l.source, [l], self.ctx.now())  # sighting, no arm
                         price_pln = await self._price_pln(l)
                     verified = True  # alive, and the price just read is the one the deal is valued at
@@ -1041,8 +1052,16 @@ class _Round:
         if push:
             day = deal.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d")
             card_url = f"{self.repo_web_url}/blob/log/deals/{day}/{path.name}" if self.repo_web_url else ""
-            await self.ctx.push(deal, card_url, store=self.store, cfg=self.cfg, root=self.root, listing_url=l.url,
-                                source=l.source, city=l.city)
+            try:
+                await self.ctx.push(deal, card_url, store=self.store, cfg=self.cfg, root=self.root,
+                                    listing_url=l.url, source=l.source, city=l.city)
+            except asyncio.CancelledError:
+                # SIGTERM / round cancel while the push was in flight: the reservation stays (never sent twice), the
+                # push goes to the retry queue so the next run delivers it (a duplicate beats a lost tier-1 push)
+                with contextlib.suppress(Exception):
+                    notify.queue_push(deal, card_url, store=self.store, cfg=self.cfg, root=self.root,
+                                      listing_url=l.url, source=l.source, city=l.city, reason="cancelled in flight")
+                raise
         return tier
 
     # ------------------------------------------------------------ after the sweeps
@@ -1118,6 +1137,12 @@ class _Round:
         except asyncio.TimeoutError:
             self.stats.sweep_timeouts.append(source)
             self.store.add_health(source, "sweep_timeout", f"sweep cut after {limit:.0f}s")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - one source's broken sweep is reported; the other sources go on
+            log.exception("sweep %s", source)
+            self.stats.errors.append(f"sweep {source}: {type(e).__name__}: {e}"[:300])
+            self.store.add_health(source, "sweep_error", f"{type(e).__name__}: {e}"[:500])
 
     async def _drain(self, deadline: float, grace: float) -> None:
         """Wait for the evaluation tasks until the round deadline; past it, started work gets `grace` seconds more,

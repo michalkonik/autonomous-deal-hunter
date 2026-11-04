@@ -29,6 +29,25 @@ class FrozenChanged(RuntimeError):
     pass
 
 
+class PolicyViolation(ValueError):
+    """A config key that would circumvent a site's access controls is set (no-circumvention ruling)."""
+
+
+# Policy keys: they exist so the rule is visible and greppable, and they can only ever be false.
+NO_CIRCUMVENTION_KEYS = ("proxies", "solve_captcha", "logged_in")
+
+
+def check_policy(data: dict[str, Any]) -> None:
+    fetch = ((data.get("sources") or {}).get("fetch")) or {}
+    bad = [k for k in NO_CIRCUMVENTION_KEYS if fetch.get(k)]
+    if bad:
+        raise PolicyViolation(
+            "refusing to start: sources.fetch." + ", sources.fetch.".join(bad) + " set. Deal Hunter fetches logged out, "
+            "from the home IP, with an honest User-Agent, and never solves challenges or rotates proxies "
+            "(no bot-check circumvention); sites that block polite requests are reached only via official APIs, RSS or "
+            "the alert mailbox.")
+
+
 class Config:
     """Dict wrapper with attribute access."""
 
@@ -82,6 +101,7 @@ def load(root: Path) -> Config:
     if local.is_dir():
         for f in sorted(local.glob("*.yaml")):
             data[f.stem] = deep_merge(data.get(f.stem, {}), _read_yaml(f))
+    check_policy(data)
     return Config(data, root)
 
 

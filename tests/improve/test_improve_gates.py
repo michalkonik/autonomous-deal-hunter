@@ -290,3 +290,40 @@ def test_install_baseline_records_the_manual_edits(store):
     vid = pbm.ensure_baseline(store, REPO)
     note = store.conn.execute("select note from playbook_versions where id=?", (vid,)).fetchone()["note"]
     assert "manual trim at install" in note and "sprzedam/samo/tylko pudelko po" in note
+
+
+def test_llm_extractions_carry_their_prompt_sha(store):
+    """m1: dh.extract stamps the prompt sha in the notes, store.save_extraction persists it; re-saving a cached result
+    keeps it, a rules result clears it; the sentinel's cache check prefers the stamped sha over prompt epochs."""
+    from datetime import datetime, timezone
+
+    from dh import extract as extractmod
+    from dh import scheduler
+    from dh.models import Extraction
+    from dh.improve.playbook import prompt_sha
+    from improve_fix import listing
+
+    class Worker:
+        async def chat_json(self, role, system, user, schema, max_tokens=600):
+            return {"key": None, "certainty": 0.0, "condition": "used", "defects": [], "box_only": False,
+                    "for_parts": False, "wanted_ad": False, "bundle_items": []}
+    l = listing("s1", "Gigabyte RTX 3060 Gaming", "900")
+    lid = store.upsert_listing(l)
+    ex = run(extractmod.extract(l, rules_extract(l.title, "", "pl"), Worker(), REPO))
+    sha = prompt_sha(seed_playbook())
+    assert f"prompt_sha:{sha}" in ex.notes
+    assert extractmod.prompt_sha(seed_playbook().get("prompt.extract").value) == sha
+    store.save_extraction(lid, ex)
+    row = lambda: store.conn.execute("select prompt_sha, extracted_at from extractions where listing_id=?", (lid,)).fetchone()
+    assert row()["prompt_sha"] == sha and row()["extracted_at"]
+    store.save_extraction(lid, Extraction(None, None, 0.0, "used", method="llm"))  # the scheduler re-saving a cache hit
+    assert row()["prompt_sha"] == sha
+    store.ensure_table(scheduler.EVAL_SQL)
+    store.conn.execute("insert into evaluations (listing_id, price, title_hash, at, tier, note) values (?,?,?,?,?,?)",
+                       (lid, "900", replay.title_hash(l.title), NOW.isoformat(), None, ""))
+    replay.record_prompt_epoch(store, "someOtherPromptSha", datetime(2026, 1, 1, tzinfo=timezone.utc))
+    store.conn.commit()
+    assert replay.cached_extraction(store, lid, l.title, sha) is not None  # the row's own sha wins over the epoch
+    assert replay.cached_extraction(store, lid, l.title, "someOtherPromptSha") is None
+    store.save_extraction(lid, rules_extract(l.title, "", "pl"))
+    assert row()["prompt_sha"] is None
