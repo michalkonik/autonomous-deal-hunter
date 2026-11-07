@@ -53,7 +53,8 @@ def migrate(store) -> None:
 
 
 def record(store, round_id: int, watched_h: float, version: int | None, champion_n: int, sentinel_n: int,
-           candidates: int = 0, *, deals_n: int | None = None, health: dict | None = None) -> None:
+           candidates: int = 0, *, deals_n: int | None = None, health: dict | None = None,
+           commit: bool = True) -> None:
     """One row per round: champion_n (tier 1-4, the CUSUM's dense signal), deals_n (tier 1-3, the MDE's outcome),
     sentinel_n, and the round's new health events per 'source|kind'."""
     migrate(store)
@@ -62,7 +63,8 @@ def record(store, round_id: int, watched_h: float, version: int | None, champion
                        (round_id, float(watched_h), version, int(champion_n), int(sentinel_n), int(candidates),
                         datetime.now(timezone.utc).isoformat(), int(champion_n if deals_n is None else deals_n),
                         json.dumps(health or {})))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
 
 
 def health_between(store, lo_wh: float, hi_wh: float) -> dict[str, int]:

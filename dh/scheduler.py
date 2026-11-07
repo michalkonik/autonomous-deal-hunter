@@ -67,15 +67,18 @@ log = logging.getLogger(__name__)
 DEFAULTS = {
     "round_interval_s": 600, "budget": 60, "budget_max": 120, "budget_boost": 1.5, "max_searches_per_source": 12,
     "max_llm_items": 200, "alive_confirm_per_source": 5, "reeval_hours": 24, "round_timeout_s": 1500,
-    "ebay_comp_keys": 10, "ebay_insights_keys": 10, "maintenance_hours": 24, "retention_days": 90,
+    "ebay_comp_keys": 10, "ebay_insights_keys": 10, "maintenance_hours": 24,
     "price_range": [0.15, 3.0], "min_prices_for_range": 3, "min_estimate_comps": 3,
     "feed_sources": ["pepper_pl", "hotukdeals", "retail"], "requeue_hours": 48, "requeue_max": 500,
     "timeout_grace_s": 60,
+    "bandit": {"gamma": 0.98, "floor": 0.10, "prior": [1.0, 10.0], "new_pulls": 3},
+    "trend": {"min_30d": 0.15, "min_cons_net_usd": 0},
 }
 SWEEP_TIMEOUT_S = 300  # default of sources.sweep_timeout_s
 CATEGORY_FOR_ECONOMICS = {"gpu": "gpu", "gpu-mobile": "gpu", "ram": "ram", "ram-sodimm": "ram", "ssd": "ssd", "pc": "pc"}
 PC_KEY = "pc:bundle"
-KRAKOW = (50.0647, 19.9450)
+DEFAULT_ORIGIN = (50.0647, 19.9450)  # Krakow: only used when config/pickup.yaml has no `origin`
+DEFAULT_RETENTION_DAYS = 90
 _HW = re.compile("|".join(rx for kind, rx in KIND_PATTERNS if kind in ("gpu", "ram", "disk")), re.I)
 _SYSTEM_WORDS = re.compile(r"komputer|zestaw|(?<![a-z])pc(?![a-z])|laptop|notebook|desktop|rechner|počítač|pocitac|"
                            r"számítógép|szamitogep|macbook|konsol|playstation|xbox", re.I)
@@ -112,6 +115,50 @@ def is_mail_source(ad) -> bool:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def pickup_origin(cfg) -> tuple[float, float]:
+    """Where personal pickups start: config/pickup.yaml `origin: {lat, lon}`."""
+    try:
+        o = cfg.pickup.origin
+        return float(o.lat), float(o.lon)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return DEFAULT_ORIGIN
+
+
+def retention_days(cfg) -> tuple[int, int]:
+    """(photo-hash days, raw snapshot / saved-mail days): config/sources.yaml `retention`. The old
+    `scheduler.retention_days` is kept as an alias for BOTH when `sources.retention` does not set them."""
+    s = cfg.get("scheduler") if cfg is not None else None
+    alias = (s.to_dict() if s is not None else {}).get("retention_days")
+    src = cfg.get("sources") if cfg is not None else None
+    r = ((src.to_dict() if src is not None else {}).get("retention")) or {}
+    base = int(alias) if alias is not None else DEFAULT_RETENTION_DAYS
+    return int(r.get("photos_days", base)), int(r.get("snapshots_days", base))
+
+
+def bandit_kwargs(cfg) -> dict:
+    """Bandit(store, **kwargs) from config/scheduler.yaml `bandit:` (gamma, floor, prior, new_pulls)."""
+    b = {**DEFAULTS["bandit"], **(sched_cfg(cfg).get("bandit") or {})}
+    return {"gamma": float(b["gamma"]), "floor": float(b["floor"]), "prior": (float(b["prior"][0]), float(b["prior"][1])),
+            "new_pulls": int(b["new_pulls"])}
+
+
+def trend_signal(trend: float | None, cons_usd: Any, capital_usd: Any, conf: str, rules: Any, sc: dict,
+                 floor_usd: Any = 0) -> tiering.TierResult | None:
+    """Tier 4 with reason "trend": a rising market makes holding attractive even below the floor. Needs the key's
+    30-day trend >= scheduler.trend.min_30d (+0.15), a conservative net >= scheduler.trend.min_cons_net_usd (0),
+    a listing that is not hard-excluded, and capital within the cap. tiering.assign (frozen) is untouched."""
+    t = {**DEFAULTS["trend"], **(sc.get("trend") or {})}
+    if trend is None or conf == "excluded" or trend < float(t["min_30d"]):
+        return None
+    if Decimal(str(cons_usd)) < Decimal(str(t["min_cons_net_usd"])):
+        return None
+    if Decimal(str(capital_usd)) > Decimal(str(rules.capital_cap_usd)):
+        return None
+    return tiering.TierResult(4, False, Decimal(str(floor_usd)),
+                              [f"trend: the key's 30-day trend is {trend:+.0%} (>= {float(t['min_30d']):+.0%}) and the "
+                               f"conservative net {Decimal(str(cons_usd)):.0f} USD is not negative"])
 
 
 def sched_cfg(cfg) -> dict:
@@ -329,6 +376,10 @@ class RoundContext:
         self.usage["completion_tokens"] += int(completion_tokens)
         self.usage["seconds"] += float(seconds)
 
+    def on_paid(self, role: str, usd: float) -> None:
+        """llm.Client(on_paid=ctx.on_paid): paid-API spend of this round (USD) for the books."""
+        self.usage["paid_usd"] = float(self.usage.get("paid_usd", 0.0)) + float(usd)
+
 
 class _CountingLLM:
     def __init__(self, inner, stats: RoundStats):
@@ -405,6 +456,7 @@ class _Round:
         self.shipping = economics.load_shipping()
         self.repo_web_url = str((ctx.cfg.get("publish").to_dict() if ctx.cfg.get("publish") is not None else {})
                                 .get("repo_web_url") or "").rstrip("/")
+        self.origin = pickup_origin(ctx.cfg)
         self.store.ensure_table(EVAL_SQL)
         self.store.ensure_table(MARK_COMPS_SQL)
         self.store.ensure_table(MAINT_SQL)
@@ -635,27 +687,27 @@ class _Round:
             self.stats.requeued += len(self.inflight) - before
 
     def _maintenance(self) -> None:
-        """Daily: photo hashes, raw snapshots and saved alert mails older than the retention (90 days) are deleted."""
+        """Daily: photo hashes, raw snapshots and saved alert mails older than the retention (sources.retention, 90 days) are deleted."""
         now = self.ctx.now()
         r = self.store.conn.execute("select at from maintenance where task='daily'").fetchone()
         if r is not None and now - datetime.fromisoformat(r["at"]) < timedelta(hours=float(self.sc["maintenance_hours"])):
             return
-        days = int(self.sc["retention_days"])
+        photo_days, snap_days = retention_days(self.cfg)
         out = {}
         try:
-            out["photo_hashes"] = photos.purge(self.store, now)
+            out["photo_hashes"] = photos.purge(self.store, now, days=photo_days)
         except Exception as e:  # noqa: BLE001
             self.stats.errors.append(f"photos.purge: {e}"[:200])
         for n, ad in self.ctx.adapters.items():
             if is_mail_source(ad) and hasattr(ad, "purge"):
                 try:
-                    out[f"{n}_eml"] = ad.purge(older_than_days=days)
+                    out[f"{n}_eml"] = ad.purge(older_than_days=snap_days)
                 except Exception as e:  # noqa: BLE001
                     self.stats.errors.append(f"{n}.purge: {e}"[:200])
         purge = getattr(self.ctx.fetcher, "purge_snapshots", None)
         if purge is not None:
             try:
-                out["snapshot_files"] = purge(days)
+                out["snapshot_files"] = purge(snap_days)
             except Exception as e:  # noqa: BLE001
                 self.stats.errors.append(f"purge_snapshots: {e}"[:200])
         self.store.conn.execute("insert or replace into maintenance (task, at) values ('daily', ?)", (now.isoformat(),))
@@ -762,7 +814,7 @@ class _Round:
         if l.pickup_only or l.ships is False:
             if l.lat is None or l.lon is None:
                 return None
-            return Decimal("0"), outbound, round(haversine_km(KRAKOW, (l.lat, l.lon)), 1)
+            return Decimal("0"), outbound, round(haversine_km(self.origin, (l.lat, l.lon)), 1)
         inb = self.shipping.get("inbound_pln") or {}
         key = "PL" if origin == "PL" else ("EU" if origin in economics.EU else "non_EU")
         return Decimal(str(inb.get(key, 0))), outbound, None
@@ -900,6 +952,8 @@ class _Round:
         effort = tiering.effort_class(l, ch, net.flags, est, extraction=ex)
         conf, why = tiering.confidence(ex, est, rk2, verified_age_s, cap_usd, cfg.rules)
         tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules)
+        if tr.tier is None:  # below the floor and not within 20%: a rising market can still make it a tier-4 watch
+            tr = trend_signal(est.trend_30d, cons_usd, cap_usd, conf, cfg.rules, self.sc, tr.floor_usd) or tr
         return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr)
 
     def _deal(self, a: Appraisal, evidence: str = "{}") -> Deal:
@@ -909,7 +963,22 @@ class _Round:
                     breakdown_json=cards.breakdown_json(a.net), evidence_json=evidence,
                     reasons=list(a.tier.reasons) + [f"confidence: {w}" for w in a.why], created_at=self.ctx.now())
 
+    def _verifier(self, l: Listing, ad):
+        """The adapter that may detail-fetch / verify `l`: its own adapter, or, for a listing that arrived through the
+        alert mailbox, the platform's REAL adapter when that one may be read politely (Kleinanzeigen) or through an
+        API (eBay with keys). OLX and Allegro mail listings have none: the e-mail is all we may read (unverifiable,
+        capped at medium confidence)."""
+        if not is_mail_source(ad):
+            return ad
+        real = self.ctx.adapters.get(l.source)
+        if real is None or is_mail_source(real) or getattr(real, "enabled", True) is False:
+            return None
+        if l.source == "kleinanzeigen" or l.source.startswith("ebay"):
+            return real
+        return None
+
     async def _deal_path(self, l: Listing, lid: int, ex: Extraction, arm: Arm, price_pln, ad) -> int | None:
+        vad = self._verifier(l, ad)
         a = await self._appraise(l, lid, ex, price_pln)
         if a is None or a.tier.tier is None:
             if a is not None:
@@ -920,9 +989,9 @@ class _Round:
             return a.tier.tier
         verified = False
         if a.tier.tier <= 3:
-            if not is_mail_source(ad):  # mailbox (Allegro/OLX) listings: the e-mail is all we may read
+            if vad is not None:  # mailbox Allegro/OLX listings have none: the e-mail is all we may read
                 try:
-                    l = await ad.detail(l, self.ctx.fetcher)
+                    l = await vad.detail(l, self.ctx.fetcher)
                     self.arm_fetches[arm.id] += 1
                     self.store.upsert_listing(l)
                 except AdapterError as e:
@@ -947,7 +1016,9 @@ class _Round:
                 return None
             if a.tier.tier <= 2:
                 try:
-                    alive, now_price = await ad.alive(l, self.ctx.fetcher)
+                    if vad is None:
+                        raise AdapterError("not verifiable: alert e-mail only")
+                    alive, now_price = await vad.alive(l, self.ctx.fetcher)
                     self.arm_fetches[arm.id] += 1
                 except AdapterError:
                     alive, now_price = None, None  # unverifiable: keep the deal, unverified
@@ -1229,9 +1300,13 @@ class _Round:
         cost = books.record_round(self.store, rid, self.cfg, seconds=st.seconds, gpu_watts=watts,
                                   llm={**ctx.usage, "calls": st.llm_calls}, fetches=st.fetches)
         st.energy_pln = str(cost["energy_pln"])
+        booked = float(ctx.usage.get("paid_usd", 0.0))  # now in the books' month-to-date: no longer "unbooked"
+        ctx.usage["paid_usd"] = 0.0
+        if booked and ctx.llm is not None and hasattr(ctx.llm, "paid_booked"):
+            ctx.llm.paid_booked(booked)
         executed = {a.id for a in arms if a.id in self.arm_fetches}
         for aid in executed:
-            ctx.bandit.update(aid, value_units(self.arm_value.get(aid, [])), int(self.arm_fetches[aid]))
+            ctx.bandit.update(aid, max(0.0, value_units(self.arm_value.get(aid, []))), int(self.arm_fetches[aid]))
         ctx.bandit.discount()
         self._adapt_budget()
         self.store.conn.execute("update rounds set notes=? where id=?", (json.dumps(st.to_dict(), default=str), rid))

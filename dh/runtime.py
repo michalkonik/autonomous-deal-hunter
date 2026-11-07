@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config as dhconfig
-from . import ledger, notify, publish, scheduler
+from . import books, ledger, notify, publish, scheduler
 from .bandit import Bandit
 from .config import FrozenChanged
 from .store import Store
@@ -65,6 +65,62 @@ def state_path(root: Path) -> Path:
 
 def round_pid_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "round.pid"
+
+
+def agent_lock_path(root: Path) -> Path:
+    return Path(root) / "var" / "run" / "agent.lock"
+
+
+AGENT_LOCK_WAIT_S = 30.0  # serve waits this long for the lock (the CLI may hold it briefly for a queued command)
+AGENT_LOCK_STEP_S = 1.0
+
+
+class AgentLock:
+    """THE single-writer lock of the agent (flock on var/run/agent.lock): held for its whole life by `serve` and by a
+    foreground `dh round`, and briefly by the CLI when it applies queued owner commands with no agent running
+    (`improve.apply_queued_now`). Only the holder mutates the improvement loop's state. The kernel drops the lock
+    when the process dies, so a crash never leaves it stale."""
+
+    def __init__(self, root: Path):
+        self.path = agent_lock_path(root)
+        self.fd: int | None = None
+
+    def acquire(self) -> bool:
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode())
+        self.fd = fd
+        return True
+
+    def release(self) -> None:
+        if self.fd is not None:
+            import fcntl
+            with contextlib.suppress(OSError):
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def agent_lock_held(root: Path) -> bool:
+    """True when another process holds the agent lock (a probe: acquired and released at once)."""
+    lock = AgentLock(root)
+    if lock.acquire():
+        lock.release()
+        return False
+    return True
 
 
 def round_running(root: Path) -> int | None:
@@ -231,6 +287,10 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     if rp is not None:
         print(f"dh start refused: a foreground `dh round` is running (pid {rp}); let it finish or stop it first",
               file=out)
+        return 1
+    if agent_lock_held(root):
+        print(f"dh start refused: another process holds the agent lock ({agent_lock_path(root)}): a foreground "
+              "`dh round`, a serve outside the unit, or an owner command being applied; retry when it ends", file=out)
         return 1
     reasons, running, warnings = preflight(cfg, http_get=http_get, meminfo=meminfo)
     for w in warnings:
@@ -430,12 +490,13 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     cards_dir = cards_dir if cards_dir.is_absolute() else root / cards_dir
     ctx = scheduler.RoundContext(
         cfg=cfg, root=root, store=store, fetcher=fetcher, adapters=registry(cfg, root), llm=None, fx=Fx(store),
-        customs=Customs(store), bandit=Bandit(store), rng=random.Random(), cards_root=cards_dir.parent,
+        customs=Customs(store), bandit=Bandit(store, **scheduler.bandit_kwargs(cfg)), rng=random.Random(), cards_root=cards_dir.parent,
         shots_root=root / "var" / "screenshots", dry=dry, stop=stop, frozen_digest=frozen,
         insights=EbayInsights(store=store))
     if not no_llm:
         from .llm import Client
-        ctx.llm = Client(cfg, on_usage=ctx.on_usage)
+        ctx.llm = Client(cfg, on_usage=ctx.on_usage, on_paid=ctx.on_paid,
+                         paid_spend=lambda: books.paid_month_usd(store))
 
         async def foreign_models() -> list[str]:
             running = await asyncio.to_thread(llama_running, cfg)
@@ -472,6 +533,15 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
     db_path(root).parent.mkdir(parents=True, exist_ok=True)
+    agent_lock = AgentLock(root)
+    deadline = time.monotonic() + AGENT_LOCK_WAIT_S
+    while not agent_lock.acquire():  # single writer: another serve, a foreground `dh round` or the CLI holds it
+        if time.monotonic() >= deadline or stop.is_set():
+            log.error("another agent process holds %s (waited %.0f s); not serving", agent_lock.path,
+                      AGENT_LOCK_WAIT_S)
+            return 1
+        with contextlib.suppress(asyncio.TimeoutError):  # the CLI applying a queued command holds it for a moment
+            await asyncio.wait_for(stop.wait(), AGENT_LOCK_STEP_S)
     frozen = dhconfig.frozen_digest(cfg._root) if getattr(cfg, "_root", None) else None
     store = Store(db_path(root))
     n = ledger.close_all_windows(store, _now())  # recovery: a crash may have left windows open
@@ -496,7 +566,10 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         server = _QuietServer(uvicorn.Config(create_app(db_path(root), cfg, root), host=str(w.get("host", "0.0.0.0")),
                                              port=int(w.get("port", 8711)), log_level="warning", lifespan="off"))
         tasks.append(asyncio.create_task(server.serve(), name="web"))
-    tasks.append(asyncio.create_task(publish.run_loop(store, cfg, root, stop), name="publish"))
+    # the publisher runs concurrently with the rounds: its OWN connection, so its commits can never end a
+    # transaction of the rounds' connection (an improvement step) half-way
+    pub_store = Store(db_path(root))
+    tasks.append(asyncio.create_task(publish.run_loop(pub_store, cfg, root, stop), name="publish"))
 
     async def rounds() -> None:
         while not stop.is_set():
@@ -536,7 +609,9 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         if ctx.llm is not None:
             with contextlib.suppress(Exception):
                 await ctx.llm.aclose()
+        pub_store.close()
         store.close()
+        agent_lock.release()
     return 0
 
 

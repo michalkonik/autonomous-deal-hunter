@@ -518,12 +518,12 @@ def active_version(store) -> int | None:
     return None if r is None else int(r["id"])
 
 
-def ensure_baseline(store, root: Path = ROOT, note: str = INSTALL_NOTE) -> int:
+def ensure_baseline(store, root: Path = ROOT, note: str = INSTALL_NOTE, commit: bool = True) -> int:
     """The active version id; on first use the file is stored as version v1 with status 'baseline' and a note."""
     vid = active_version(store)
     if vid is not None:
         return vid
-    return Playbook.from_file(root).save_version(store, status="baseline", note=note)
+    return Playbook.from_file(root).save_version(store, status="baseline", note=note, commit=commit)
 
 
 def set_status(store, version: int, status: str, *, commit: bool = True) -> None:

@@ -13,3 +13,11 @@ price_range: [0.15, 3.0]       # cheap filter: a keyed price outside this x the 
 min_prices_for_range: 3        # ...only when at least this many prices of the key are known
 feed_sources: [pepper_pl, hotukdeals, retail]   # one query-less sweep per round; never ledger-swept
 min_estimate_comps: 3             # an exit estimate needs at least this many comparables (one stray ask is no price)
+bandit:                        # fetch-budget bandit (dh/bandit.py): a discounted Gamma posterior per source x query arm
+  gamma: 0.98                  # per-round discount of old evidence
+  floor: 0.10                  # share of each round's arms reserved for uniform exploration
+  prior: [1.0, 10.0]           # Gamma(shape, rate): optimistic enough that a new arm is tried
+  new_pulls: 3                 # guaranteed trial pulls of a new arm
+trend:                         # tier-4 "trend" signal (scheduler.trend_signal; tiering.assign stays frozen)
+  min_30d: 0.15                # the key's 30-day trend (recent / older median - 1) at least this
+  min_cons_net_usd: 0          # ... and a conservative net of at least this (0: not losing money)

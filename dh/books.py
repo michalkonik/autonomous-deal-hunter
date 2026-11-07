@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from statistics import mean
 
@@ -116,6 +117,15 @@ def energy_pln(seconds: float, gpu_watts_samples: list[float], tariff_pln_kwh: f
     return q2(Decimal(str(kwh)) * Decimal(str(tariff_pln_kwh)))
 
 
+def paid_month_usd(store, now: datetime | None = None) -> float:
+    """Paid-API spend (USD, the `units` of the paid_api cost rows) of the calendar month so far (UTC)."""
+    now = now or datetime.now(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    r = store.conn.execute("select coalesce(sum(c.units),0) from costs c join rounds r on r.id=c.round_id "
+                           "where c.kind='paid_api' and r.started_at >= ?", (start,)).fetchone()
+    return float(r[0])
+
+
 def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[float], llm: dict,
                  fetches: int) -> dict:
     """Write this round's cost rows. `llm` = {calls, prompt_tokens, completion_tokens, seconds}."""
@@ -123,12 +133,17 @@ def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[f
     kwh = energy_kwh(seconds, gpu_watts, b)
     e_pln = energy_pln(seconds, gpu_watts, tariff(cfg), b)
     tokens = int(llm.get("prompt_tokens", 0)) + int(llm.get("completion_tokens", 0))
-    paid = Decimal("0.00")  # paid APIs are off (models.paid_api.enabled: false); nothing else spends money yet
+    paid_usd = float(llm.get("paid_usd", 0.0))  # 0 unless a paid role ran (models.paid_api, capped per month)
+    try:
+        pln_usd = Decimal(str(cfg.models.paid_api.get("pln_per_usd", 4.0)))
+    except AttributeError:
+        pln_usd = Decimal("4.0")
+    paid = q2(Decimal(str(paid_usd)) * pln_usd)
     # amount kept to 6 dp (a short round costs fractions of a grosz: q2 per row would sum to 0); summaries round
     store.add_cost(round_id, "energy", Decimal(str(round(kwh * tariff(cfg), 6))), round(kwh, 6))
     store.add_cost(round_id, "llm", Decimal("0.00"), tokens)
     store.add_cost(round_id, "fetch", Decimal("0.00"), int(fetches))
-    store.add_cost(round_id, "paid_api", paid, 0)
+    store.add_cost(round_id, "paid_api", paid, round(paid_usd, 6))
     return {"energy_pln": e_pln, "kwh": kwh, "gpu_w_mean": mean(gpu_watts) if gpu_watts else None,
             "llm_tokens": tokens, "llm_calls": int(llm.get("calls", 0)), "fetches": int(fetches), "paid_api_pln": paid}
 

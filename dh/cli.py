@@ -161,6 +161,10 @@ async def _round(args) -> int:
     if runtime.round_running(root) is not None:
         print("refused: another foreground `dh round` is running")
         return 1
+    agent_lock = runtime.AgentLock(root)
+    if not agent_lock.acquire():  # single writer of the agent's state (serve, `dh round`, queued owner commands)
+        print(f"refused: another agent process holds {agent_lock.path}")
+        return 1
     pid_file = runtime.round_pid_path(root)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
     pid_file.write_text(str(os.getpid()))  # `dh start` refuses while this exists and the process lives
@@ -214,6 +218,7 @@ async def _round(args) -> int:
         store.close()
         with contextlib.suppress(OSError):
             pid_file.unlink()
+        agent_lock.release()
     return rc
 
 

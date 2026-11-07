@@ -5,10 +5,13 @@ The owner starts and stops the agent by hand. Nothing starts at boot.
 | Command | What it does |
 |---|---|
 | `dh start` | Checks free RAM (>= `models.min_free_ram_gb`, 12 GB) and that llama-swap runs no model outside the configured roles, then starts the transient user unit `deal-hunter` (rounds + web page on :8711 + log publisher). Refuses, and says why, instead of evicting another workload. Also refuses while a foreground `dh round` runs. |
-| `dh status [--json]` | Running?, uptime, rounds, last round, deals today, health, llama-swap, ntfy topic, log repo. |
+| `dh status [--json]` | Running?, uptime, rounds, last round, deals today, health, llama-swap, ntfy topic, log repo, and the improvement loop (phase, cooldown, owner reviews; read-only). |
 | `dh stop` | Stops the unit, closes observation windows, unloads the role models only if nothing else is loaded and they were not already loaded before `dh start`, then checks that no process is left. |
 | `dh round --once [--dry] [--no-llm]` | One round in the foreground (testing). `--dry`: no push. `--no-llm`: rules only, llama-swap untouched. |
 | `dh deals`, `dh show <id>`, `dh verify <id>`, `dh books` | Read the results. |
+| `dh playbook` | The active playbook items and every version. Owner actions on the improvement loop, one at a time: `--rollback N`, `--maintenance on\|off`, `--pending` (what waits for you), `--label ID TRUTH` (`deal`, `not_deal`, `key:<key>`), `--apply ID` (a prompt proposal; needs the running agent, refused otherwise). While the agent runs these are **queued** and applied at its next round; while it is stopped they apply at once (except `--apply`). |
+| `dh eval [--version N]` | Must-pass and golden scores of the active (or a given) playbook; exit 1 if a must-pass case fails. `--add-from-marks` extends the golden set from verified marks (owner only; refused while the agent runs). |
+| `dh report --weekly [--publish]` | The weekly report as Markdown. `--publish` writes it into the log repo clone (refused while the agent runs, which publishes it itself every 168 watched hours). |
 
 ## Sharing the rig with another workload
 

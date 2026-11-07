@@ -11,6 +11,7 @@ marked *(built-in default)*.
 - **Local overrides:** `config/local/<name>.yaml` is deep-merged over the shipped file (nested maps merge, lists
   and scalars are replaced). `config/local/` is gitignored, so put machine-specific and secret-free settings
   there. A local file for a section that has no shipped file creates the section.
+- **No-circumvention policy.** `sources.fetch.proxies`, `solve_captcha` and `logged_in` must stay `false`. If any of them is truthy, in the shipped file or in `config/local/`, `dh/config.py` raises `PolicyViolation` and every command that loads the configuration (`dh start`, `dh round`, `dh status`...) refuses to run, with a message naming the key.
 - The configuration is read when a process starts. After editing, run `dh stop` and `dh start`.
 - **Frozen files.** `config/rules.yaml`, `config/economics.yaml`, their local overrides and everything in `data/`
   are part of the frozen layer. If one changes while the agent runs, the rounds stop with a `frozen_changed`
@@ -40,7 +41,11 @@ Which LLM does which job. All calls go through one OpenAI-compatible endpoint (l
 | `roles.worker` | `gemma-4-26b-a4b-pool` | Extraction of the product from an unclear title, the part-out parts step |
 | `roles.senior` | `qwen3.8-flash-next-uncensored` | The second-pass confirmation of an LLM match, the round reflection |
 | `roles.advisor` | `qwen3.8-flash-next-uncensored` | Drafting playbook proposals (self-improvement library) |
-| `paid_api.enabled` | `false` | **Paid APIs are off.** No code path calls a paid API; the flag only makes the books record 0 PLN of paid spend |
+| `paid_api.enabled` | `false` | **Paid API off.** When on, only the roles listed in `paid_api.roles` use the paid endpoint; every other role stays local |
+| `paid_api.monthly_cap_usd` | `0` | Hard monthly cap. With `0` (default) no paid call is ever made: the LLM client raises `PaidCapReached` before any request leaves the machine. Otherwise it refuses a paid call once this calendar month's paid spend (UTC, from the books) plus the client's own session spend reaches the cap |
+| `paid_api.base_url`, `api_key_secret` | `null`, `null` | OpenAI-compatible endpoint, and a `bw-secret item#field` reference for its key (never stored in the repo or the DB) |
+| `paid_api.roles` | `{}` | Role -> model name on the paid endpoint, e.g. `{advisor: some-model}` |
+| `paid_api.usd_per_mtok_in`, `usd_per_mtok_out`, `pln_per_usd` | `0`, `0`, `4.0` | Price per million tokens (USD) used to cost each call, and the rate used to show the spend in PLN. The books record it as a `paid_api` row per round (USD in `units`) and `dh books` shows it |
 | `min_free_ram_gb` | `12` | `dh start` and `dh round` refuse below this much free RAM |
 | `timeouts.connect_s`, `read_s` | `5`, `60` | LLM HTTP timeouts |
 | `breaker.failures`, `cooldown_s` | `3`, `120` | After 3 consecutive transport errors the client refuses calls for 120 s and the round continues on rules |
@@ -122,7 +127,7 @@ Pickup-only listings (no shipping) count only inside a radius, and cost a trip.
 |---|---|---|
 | `max_km` | `60` | Maximum distance from the origin |
 | `countries` | `[PL]` | Countries where pickup is allowed |
-| `origin` | Krakow, 50.0647 / 19.9450 | **Not read.** The distance is measured from the constant `KRAKOW` in `dh/scheduler.py`; change it there |
+| `origin` | Krakow, 50.0647 / 19.9450 | `{name, lat, lon}`: the point pickup distances are measured from (haversine). Change it in `config/local/pickup.yaml` |
 | `pln_per_km`, `pln_per_trip` | `1.2`, `40` | Trip cost = `pln_per_km` x 2 x km + `pln_per_trip` |
 
 ## scheduler.yaml
@@ -147,7 +152,13 @@ Owner-tunable pacing and limits (not frozen). See [`TUNING.md`](TUNING.md) for w
 | `min_estimate_comps` | `3` | An exit estimate needs at least this many comparables |
 | `ebay_insights_keys` | `10` *(built-in default)* | Keys per round for eBay sold comps |
 | `maintenance_hours` | `24` *(built-in default)* | Interval of the daily purge |
-| `retention_days` | `90` *(built-in default)* | Age at which raw snapshots and saved alert mails are deleted |
+| `retention_days` | not set | Deprecated alias: used for both retention values only if `sources.retention` is removed. Use `sources.retention` |
+| `bandit.gamma` | `0.98` | Per-round discount of old evidence ([TUNING.md](TUNING.md#bandit-gamma-floor-and-prior)) |
+| `bandit.floor` | `0.10` | Share of each round's arms reserved for uniform exploration |
+| `bandit.prior` | `[1.0, 10.0]` | Gamma prior (shape, rate) of value per fetch |
+| `bandit.new_pulls` | `3` | Guaranteed trial pulls of a new arm |
+| `trend.min_30d` | `0.15` | Tier-4 "trend" signal: the key's 30-day trend must be at least this (+15%) |
+| `trend.min_cons_net_usd` | `0` | ...and the conservative net at least this (not losing money). The tier-4 row is only logged when the listing is below its floor and not within 20% of it |
 | `requeue_hours`, `requeue_max` | `48`, `500` *(built-in defaults)* | Window and cap for re-queuing unevaluated listings |
 | `timeout_grace_s` | `60` *(built-in default)* | Extra time for started evaluations after `round_timeout_s` |
 
@@ -161,7 +172,7 @@ Owner-tunable pacing and limits (not frozen). See [`TUNING.md`](TUNING.md) for w
 | `fetch.disable_after_blocks` | `3` | Consecutive blocks that disable a domain for the session |
 | `fetch.robots_ttl_s`, `max_crawl_delay_s` | `86400`, `60` | robots.txt cache and the longest Crawl-delay honoured |
 | `fetch.timeout_s` | `30` | Request timeout |
-| `fetch.proxies`, `solve_captcha`, `logged_in` | `false` | Declarations only: the fetcher does not read them, and there is no proxy, captcha or login code |
+| `fetch.proxies`, `solve_captcha`, `logged_in` | `false` | Policy keys. They exist so the rule is visible; the loader **refuses to start** if any is truthy (see above). There is no proxy, captcha or login code |
 | `sweep_timeout_s` | `300` *(built-in default)* | One source's sweep is cut after this |
 | `adapters.<name>.enabled` | per source | Turns an adapter on or off; an adapter not listed is enabled. See [`SOURCES.md`](SOURCES.md) |
 | `adapters.<name>.reason` | | Free text; record why a source is off |
@@ -171,7 +182,8 @@ Owner-tunable pacing and limits (not frozen). See [`TUNING.md`](TUNING.md) for w
 | `adapters.mailbox.image_hosts` | platform CDNs | Mail photos are kept only from these https hosts |
 | `retail.drop_pct` | `0.10` | A shop price fall of this much emits a listing |
 | `retail.watch` | 6 pages | List of `{shop, url}` pages with JSON-LD prices |
-| `retention.photos_days`, `snapshots_days` | `90`, `90` | **Not read by any code.** Use `scheduler.retention_days` (see [OPERATIONS.md](OPERATIONS.md#retention)) |
+| `retention.photos_days` | `90` | Age at which photo hashes are deleted by the daily purge ([OPERATIONS.md](OPERATIONS.md#retention)) |
+| `retention.snapshots_days` | `90` | Age at which raw page snapshots and saved alert mails (.eml) are deleted |
 
 The `via:` keys (`mailbox`, `api`, `rss`) are documentation only. The `allegro` and `olx` entries do not name
 adapters; those platforms arrive through the mailbox.
@@ -202,7 +214,7 @@ adapters; those platforms arrive through the mailbox.
 | `ntfy.topic` | `null` | Filled on first use in `config/local/notify.yaml` |
 | `ntfy.tier1_priority` | `urgent` | ntfy priority of tier-1 pushes |
 | `email_fallback.enabled` | `true` | Use `dh-mail#smtp` when ntfy fails |
-| `quiet_hours` | `null` | **Not read by any code.** Tier-1 pushes are never delayed |
+| `quiet_hours` | `null` | `null` = pushes at any time. Or `{start: "23:00", end: "07:00", tz: Europe/Warsaw}` (an overnight window wraps; `tz` defaults to `Europe/Warsaw`). A tier-1 push that falls inside the window is queued (`pending_pushes.not_before`) and sent by the first retry after it ends; its 6-hour retry life starts then. A malformed value is ignored (no quiet hours), never silences a push |
 
 Push title format: `T1 <star> +$640 <product key> · <source> <city>`.
 
@@ -236,6 +248,12 @@ Energy per round = (mean GPU power + `base_w`) x hours x tariff. Without `rocm-s
 
 The page has no login: anyone on the LAN can read it and post marks. Do not expose port 8711 beyond a trusted
 network.
+
+## improve.yaml
+
+| Key | Default | Meaning |
+|---|---|---|
+| `post_round_timeout_s` | `300` | The improvement step that runs after each round (`improve.after_round`) is cut after this many seconds, with an `improve_timeout` health event; `0` = no limit. An error in that step is an `improve_error` health event and never stops the rounds. The gates themselves are frozen (`dh/improve/gates.py`) and are not configuration |
 
 ## The playbook
 

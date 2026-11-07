@@ -776,7 +776,7 @@ async def test_tier1_push_is_queued_when_the_round_is_cancelled_after_reservatio
     rows = ctx.store.conn.execute("select payload from pending_pushes").fetchall()
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload"])
-    assert payload["headers"]["Click"].startswith("https://fake.test/oferta/5") and "rtx-3060" in payload["headers"]["Title"]
+    assert payload["headers"]["Click"].startswith("https://fake.test/oferta/5") and "RTX 3060 12GB" in payload["headers"]["Title"]
     assert ctx.store.conn.execute("select count(*) from deal_pushes").fetchone()[0] == 1
 
 
@@ -835,3 +835,130 @@ def test_rules_extract_gets_the_round_root(tmp_path, monkeypatch):
     seed_comps(ctx.store)
     asyncio.run(scheduler.run_round(ctx))
     assert seen and all(r == ctx.root for r in seen)
+
+
+# ------------------------------------------------------------------------------------------------ fix wave A
+
+
+def _with(ctx, **sections):
+    data = ctx.cfg.to_dict()
+    for k, v in sections.items():
+        data[k] = {**data.get(k, {}), **v}
+    ctx.cfg = config.Config(data, REPO)
+    return ctx
+
+
+def test_pickup_origin_comes_from_config(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    l = Listing(**{**listing().__dict__, "pickup_only": True, "lat": 50.0647, "lon": 19.9450})
+    assert scheduler._Round(ctx)._shipping(l, "gpu")[2] == 0.0  # default origin: Krakow
+    _with(ctx, pickup={"origin": {"name": "Warszawa", "lat": 52.2297, "lon": 21.0122}})
+    km = scheduler._Round(ctx)._shipping(l, "gpu")[2]
+    assert 245 < km < 260
+
+
+async def test_retention_keys_drive_the_daily_purge(tmp_path):
+    ad = FakeAdapter([])
+    ctx = make_ctx(tmp_path, ad, None)
+    _with(ctx, sources={"retention": {"photos_days": 30, "snapshots_days": 45}})
+    from dh import photos
+    photos.ensure_schema(ctx.store)
+    for i, days in enumerate((40, 20)):  # 40 d old: purged at 30; 20 d old: kept
+        ctx.store.conn.execute("insert into photo_hashes (listing_id, seller_hash, phash, seen_at) values (?,?,?,?)",
+                               (i, "s", f"{i:04x}", (NOW - timedelta(days=days)).isoformat()))
+    ctx.store.conn.commit()
+    s = await scheduler.run_round(ctx)
+    assert s.maintenance["photo_hashes"] == 1 and ctx.fetcher.purges == [45]
+    assert ctx.store.conn.execute("select count(*) from photo_hashes").fetchone()[0] == 1
+
+
+def test_retention_alias_and_defaults():
+    base = config.load(REPO)
+    assert scheduler.retention_days(base) == (90, 90)
+    d = base.to_dict()
+    d["sources"] = {k: v for k, v in d["sources"].items() if k != "retention"}
+    d["scheduler"] = {**d["scheduler"], "retention_days": 60}  # the old key: an alias when sources.retention is absent
+    assert scheduler.retention_days(config.Config(d, REPO)) == (60, 60)
+
+
+def test_bandit_settings_come_from_scheduler_config(tmp_path):
+    from dh import runtime
+    base = config.load(REPO)
+    assert scheduler.bandit_kwargs(base) == {"gamma": 0.98, "floor": 0.10, "prior": (1.0, 10.0), "new_pulls": 3}
+    d = base.to_dict()
+    d["scheduler"] = {**d["scheduler"], "bandit": {"gamma": 0.9, "floor": 0.2, "prior": [2, 5]}}
+    c = config.Config(d, REPO)
+    ctx = runtime.build_context(c, tmp_path, Store(tmp_path / "b.db"), fetcher=None, no_llm=True)
+    b = ctx.bandit
+    assert (b.gamma, b.floor, b.prior, b.new_pulls) == (0.9, 0.2, (2.0, 5.0), 3)
+
+
+def test_trend_signal_rules():
+    rules = config.load(REPO).rules
+    sc = scheduler.sched_cfg(config.load(REPO))
+    t = scheduler.trend_signal(0.20, "10", "1000", "high", rules, sc, 50)
+    assert t.tier == 4 and not t.star and "trend" in t.reasons[0]
+    assert scheduler.trend_signal(0.149, "10", "1000", "high", rules, sc) is None  # below +15%
+    assert scheduler.trend_signal(None, "10", "1000", "high", rules, sc) is None
+    assert scheduler.trend_signal(0.3, "-1", "1000", "high", rules, sc) is None  # losing money
+    assert scheduler.trend_signal(0.3, "10", "1000", "excluded", rules, sc) is None
+    assert scheduler.trend_signal(0.3, "10", "99999", "high", rules, sc) is None  # over the capital cap
+
+
+async def test_rising_market_makes_a_below_floor_listing_a_tier_4_trend_deal(tmp_path, monkeypatch):
+    ad = FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1380")])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    s0 = await scheduler.run_round(ctx)
+    assert ctx.store.deals() == [], s0.dropped  # below the floor: not logged
+    ctx2 = make_ctx(tmp_path / "b", FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1380")]),
+                    FakeLLM(LLM_3060))
+    seed_comps(ctx2.store)
+    _with(ctx2, scheduler={"trend": {"min_30d": 0.15, "min_cons_net_usd": -100000}})
+    import dataclasses
+    real = scheduler._Round._estimate
+
+    def rising(self, *a, **kw):
+        e = real(self, *a, **kw)
+        return None if e is None else dataclasses.replace(e, trend_30d=0.3)
+    monkeypatch.setattr(scheduler._Round, "_estimate", rising)
+    await scheduler.run_round(ctx2)
+    ds = ctx2.store.deals()
+    assert [d.tier for d in ds] == [4] and any(r.startswith("trend:") for r in ds[0].reasons)
+
+
+class KleinanzeigenFake(FakeAdapter):
+    name, domain = "kleinanzeigen", "ka.test"
+
+
+async def test_mailbox_kleinanzeigen_listing_is_detailed_and_verified_by_the_real_adapter(tmp_path):
+    ka = Listing(**{**listing("m1", "RX 6800 używana", "900").__dict__, "source": "kleinanzeigen",
+                    "url": "https://www.kleinanzeigen.de/s-anzeige/m1"})
+    olx = Listing(**{**listing("m2", "RX 6800 używana", "900").__dict__, "source": "olx",
+                     "url": "https://www.olx.pl/d/oferta/m2"})
+    real = KleinanzeigenFake([], alive=(True, Decimal("900")))
+    ctx = make_ctx(tmp_path, real, None, items=[])
+    mail = FakeMail([ka], ctx.store)
+    ctx.adapters["mailbox"] = mail
+    for i in range(10):
+        ctx.store.add_comp(RX, "used", "olx", Decimal("1400") + i, NOW - timedelta(days=1 + i), "owner_sale", f"r:{i}")
+    real_detail_calls = []
+    orig = real.detail
+
+    async def spy(listing, fetcher):
+        real_detail_calls.append(listing.source)
+        return await orig(listing, fetcher)
+    real.detail = spy
+    await scheduler.run_round(ctx)
+    d = ctx.store.deals()[0]
+    assert real_detail_calls == ["kleinanzeigen"] and real.alive_calls == 1
+    assert d.verified_at is not None  # verified through the real adapter
+    # an OLX alert stays unverifiable: no detail, no alive, never verified
+    ctx2 = make_ctx(tmp_path / "o", real, None, items=[])
+    mail2 = FakeMail([olx], ctx2.store)
+    ctx2.adapters["mailbox"] = mail2
+    for i in range(10):
+        ctx2.store.add_comp(RX, "used", "olx", Decimal("1400") + i, NOW - timedelta(days=1 + i), "owner_sale", f"r:{i}")
+    real_detail_calls.clear()
+    await scheduler.run_round(ctx2)
+    assert real_detail_calls == [] and ctx2.store.deals()[0].verified_at is None

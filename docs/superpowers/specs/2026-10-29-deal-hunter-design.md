@@ -236,7 +236,7 @@ In order of trust:
   - account age;
   - rating count and score.
 
-  It keeps no names, phone numbers or free-text profile data. Photos and descriptions are kept only for live deals, for evidence, and deleted after a retention period (config, default 90 days). They are never republished.
+  It keeps no names, phone numbers or free-text profile data. Photos: **only perceptual hashes (pHash) are stored**; the image bytes are dropped right after hashing, and the hashes are deleted after the retention period (`sources.retention.photos_days`, default 90 days). Descriptions and raw page snapshots are kept for evidence and deleted after `sources.retention.snapshots_days` (default 90 days). Nothing is republished.
 
 ---
 
@@ -423,7 +423,7 @@ The weekly report is published to the log repo.
 
 Other rules:
 - **Plain code does the bulk work.** Collectors, ledger and economics are code, so LLM tokens go only to listings that survive cheap filters. The design target is under 5% of new listings reaching the LLM.
-- **One headless browser at a time.** A RAM guard refuses to start a second browser or any extra model when free memory is below 8 GB.
+- **One headless browser at a time.** A RAM guard: `dh start` (and a foreground `dh round`) refuses to start when free RAM is below 12 GB (`models.min_free_ram_gb`), or when llama-swap already runs a model outside the configured roles; it says why and never evicts another workload. Only one headless browser runs at a time.
 - **Full capacity whenever running.** The worker queue is kept full: the bandit gets extra fetch budget when the LLM queue is empty, and fetching throttles when the queue backs up. The builder measures and tunes slot counts and queue depth. [builder]
 - **Cost tracking:** energy is measured from GPU power (rocm-smi) plus an estimate for CPU and the rest of the system, times the owner's tariff (config, PLN/kWh).
 
@@ -534,7 +534,7 @@ Also:
    - Self-improvement counts rounds, not calendar days. Probation, cooldowns and backoff are measured in rounds or watched hours.
    - The always-on collector idea is dropped. It contradicts the owner's wish to control when the agent works.
 2. **Platform-risk appetite** (unknown). Defaults:
-   - OLX: **TLS impersonation (curl_cffi) at slow rates, allowed**. Falls back to the browser only if that fails.
+   - OLX: **alert mailbox only** (amended 2026-10-29: no TLS impersonation / curl_cffi, no stealth browser; see §6.4). OLX blocks polite polling, so saved-search alert e-mails are its only channel.
    - Allegro.pl: **alert mailbox only**, no stealth-browser scraping, until the owner says yes.
    - eBay: **official API only**, no logged-in Product Research.
    - Vinted: **off**.

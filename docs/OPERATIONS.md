@@ -98,8 +98,15 @@ to the `log` branch only. It also imports `outcome:` edits you made to a card's 
 marks. A git or network failure is a health event, never a crash; local state is kept and the next cycle pushes
 again.
 
-This needs the private repo `deal-hunter-log`, which **you must create** (see the README checklist), with a `log`
-branch, and `publish.remote` set. Without it, `dh status` shows `clone=False` and `/health` shows `no_clone`.
+This needs the private repo `deal-hunter-log`, which **you must create** (see the README checklist), and
+`publish.remote` set. The repo may be empty or hold only `main`: if the remote has no `log` branch the publisher
+clones what exists, creates `log` locally (`checkout -B log`), commits and pushes `log`. It never pushes `main`.
+Without a remote, `dh status` shows `clone=False` and `/health` shows `no_clone`.
+
+**Weekly report.** Every 168 watched hours, `serve` writes the weekly report (scoreboard, the week's proposals and
+the prediction ledger) to `weekly/YYYY-MM-DD.md` in the clone; the next sync commits and pushes it. With no clone yet
+it waits (`weekly_no_clone` health event) and tries again each round. `dh report --weekly` prints it on demand;
+`dh report --weekly --publish` also writes it into the clone, and refuses while the agent runs.
 
 ## Backups
 
@@ -123,13 +130,13 @@ Deleted by the daily maintenance pass (at most every `scheduler.maintenance_hour
 
 | What | Kept | Setting |
 |---|---|---|
-| Raw page snapshots, `var/snapshots/` | 90 days | `scheduler.retention_days` |
-| Saved alert mails (.eml) | 90 days | `scheduler.retention_days` |
-| Photo hashes | 90 days | a constant in `dh/photos.py` (`WINDOW_DAYS`) |
+| Raw page snapshots, `var/snapshots/` | 90 days | `sources.retention.snapshots_days` |
+| Saved alert mails (.eml) | 90 days | `sources.retention.snapshots_days` |
+| Photo hashes | 90 days | `sources.retention.photos_days` |
 
 Photos are never stored: the picture is downloaded, hashed and discarded, and only the 64-bit hash is kept (for
-the photo-reuse scam check). The `retention.photos_days` and `retention.snapshots_days` keys in `sources.yaml`
-exist but no code reads them.
+the photo-reuse scam check). `scheduler.retention_days` is a deprecated alias, used only if `sources.retention`
+is removed.
 
 Not deleted: deal cards, evidence screenshots in `var/screenshots/`, and the database rows. Delete old
 screenshots by hand if the disk fills. Seller names and phone numbers are never stored (only a salted hash of the
@@ -156,7 +163,10 @@ If the process or the rig dies, the agent leaves no unsafe state:
   window open; the next `dh start` (startup recovery), `dh stop`, or `dh round` closes it at the last observation
   (`dh start` also records a `recovery` health event). Listings that disappeared during the gap are *not* counted as sold.
 - **Pushes.** Queued pushes are in the database and retried each round for up to 6 hours. A tier-1 deal is
-  pushed at most once.
+  pushed at most once. The queue keeps the push's inputs (deal numbers, links), not finished headers: every retry
+  rebuilds the notification with the current code, so a fix to the push format also fixes pushes already queued.
+  The `Click` link and the `Card` button are sent only for valid http(s) URLs (an empty card URL would make ntfy
+  reject the whole push).
 - **Alert mail.** Mails are marked read only after their listings are saved, so a crash re-delivers them (the
   save is idempotent).
 - **A stale unit.** `dh start` runs `systemctl --user reset-failed deal-hunter` first. If `dh status` shows

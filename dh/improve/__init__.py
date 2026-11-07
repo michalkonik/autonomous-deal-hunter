@@ -6,9 +6,10 @@ Wiring (done by the controller after Task 19; this package never edits dh/cli.py
 - CLI:                   cli_playbook_show, cli_eval, cli_rollback, cli_status, cli_maintenance, cli_pending,
                          cli_label, cli_apply, cli_weekly; `dh eval --add-from-marks` -> evals.marks.add_from_marks
                          (owner only; refused while the agent runs)
-Every cli_* function returns (text, exit_code). Owner commands that change the loop (rollback, maintenance, label,
-apply) are QUEUED (improve_commands): the running agent applies them at its next round; when the agent is not
-running the CLI applies them at once (`running=None` asks systemd).
+Every cli_* function returns (text, exit_code). SINGLE WRITER: only the holder of the agent lock
+(runtime.AgentLock: serve, a foreground `dh round`, or `apply_queued_now`) mutates the loop's state. Owner commands
+(rollback, maintenance, label, apply) are always QUEUED (improve_commands); the running agent applies them at its
+next round; with no agent running the CLI applies them under the lock (`apply_queued_now`).
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from . import gates, monitor, report, shadow
 from .controller import Controller, InFlight, command_result, enqueue
 from .playbook import ROOT, Playbook, active_version, versions
 
-__all__ = ["after_round", "Controller", "InFlight", "cli_playbook_show", "cli_eval", "cli_rollback", "cli_status",
+__all__ = ["after_round", "apply_queued_now", "Controller", "InFlight", "cli_playbook_show", "cli_eval", "cli_rollback", "cli_status",
            "cli_maintenance", "cli_pending", "cli_label", "cli_apply", "cli_weekly"]
 
 
@@ -96,22 +97,46 @@ def cli_eval(version: int | None = None, *, root: Path, store) -> tuple[str, int
     return "\n".join(lines), 1 if bad or not mp else 0
 
 
-def agent_running() -> bool:
+def agent_running(root: Path | None = None) -> bool:
+    """The systemd unit is active, a foreground `dh round` runs, or a `dh.runtime serve` process runs outside the
+    unit (pgrep) (belt and braces: a process started before the agent lock existed holds no lock)."""
     try:
-        from ..runtime import is_active
-        return bool(is_active())
+        from .. import runtime
+        return (bool(runtime.is_active()) or (root is not None and runtime.round_running(root) is not None)
+                or bool(runtime.serve_processes()))
     except Exception:  # noqa: BLE001 - no systemd (tests, other OS): treat as not running
         return False
 
 
+def apply_queued_now(store, root: Path, *, llm=None, cfg=None) -> int | None:
+    """One-shot single writer for when no agent runs: take the agent lock, apply the queued owner commands (the
+    controller's command step, in one transaction), release. None when another process holds the lock (the agent
+    applies them at its next round). Without `llm` a queued apply is NOT consumed: it stays queued for the running
+    agent, and every other command still applies in queue order. Returns the number applied."""
+    from ..runtime import AgentLock
+    lock = AgentLock(root)
+    if not lock.acquire():
+        return None
+    try:
+        return asyncio.run(Controller(store, root=root, llm=llm, cfg=cfg).process_commands())
+    finally:
+        lock.release()
+
+
 def _queue(store, root: Path, cmd: str, running: bool | None, llm=None, **args) -> tuple[str, int]:
+    """The CLI never applies a command itself: it is always queued; with no agent running, it is then applied
+    under the agent lock by `apply_queued_now`."""
     cid = enqueue(store, cmd, **args)
     if running is None:
-        running = agent_running()
-    if running:
-        return f"queued as command {cid}: the running agent applies it at its next round", 0
-    asyncio.run(Controller(store, root=root, llm=llm).process_commands())
-    res = command_result(store, cid) or {}
+        running = agent_running(root)
+    queued = (f"queued as command {cid}: the running agent applies it at its next round", 0)
+    if running or apply_queued_now(store, root, llm=llm) is None:
+        return queued
+    res = command_result(store, cid)
+    if res is None:  # left queued: an owner apply needs the live model (other commands never wait behind it)
+        why = ("apply waits for the running agent (it needs the live model)" if cmd == "apply"
+               else "the running agent applies it at its next round")
+        return f"queued as command {cid}: {why}", 0
     return json.dumps(res, default=str), 0 if res.get("ok") else 1
 
 
@@ -158,7 +183,7 @@ def cli_label(disagreement_id: int, truth: str, *, root: Path, store, running: b
 def cli_apply(proposal_id: int, *, root: Path, store, running: bool | None = None, llm=None) -> tuple[str, int]:
     """Owner: apply a prompt proposal waiting for review. It first runs the must-pass set with the LIVE model; on
     success the change is promoted and enters probation. Needs the model (the running agent, or `llm`)."""
-    if llm is None and not (agent_running() if running is None else running):
+    if llm is None and not (agent_running(root) if running is None else running):
         from .. import config as dhconfig
         from ..llm import Client
         llm = Client(dhconfig.load(root))

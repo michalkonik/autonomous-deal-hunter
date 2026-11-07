@@ -81,11 +81,11 @@ says so ([What is and is not wired yet](#what-is-and-is-not-wired-yet)).
    3. **Valuation** for every enabled exit channel. A channel needs at least `min_estimate_comps` (3) comparables.
    4. **Economics** for every channel, then the best exit by conservative net.
    5. **Risk** (hard excludes, scam score) and **tiering** (effort class, confidence, tier).
-   6. For tiers 1-3: fetch the detail page (not for mailbox listings), run the photo-reuse check, re-run the
+   6. For tiers 1-3: fetch the detail page (not for Allegro or OLX mailbox listings; a Kleinanzeigen or eBay one goes to its real adapter), run the photo-reuse check, re-run the
       flags on the full description, re-appraise. For tiers 1-2: **live re-check** (listing alive and at the same
       price). A gone listing is dropped; a changed price is re-valued at the new price; a confirmed re-check marks
-      the deal "verified now" and may lift it to tier 1. Mailbox listings can never be re-checked, so they stay
-      unverified and top out at tier 2.
+      the deal "verified now" and may lift it to tier 1. Allegro and OLX mailbox listings can never be re-checked, so
+      they stay unverified and top out at tier 2.
    7. **Save**: one deal per listing (a unique index), the card is written, and for tier 1 a discovery
        screenshot is taken and a push is reserved (at most one push per deal, ever).
 9. **After the sweeps:** wait for the evaluations (round deadline `round_timeout_s`, 1500 s, plus
@@ -161,14 +161,17 @@ The owner starts and stops the agent by hand, so nothing is installed as a servi
 
 Checked against the code at the time of writing:
 
-- **Self-improvement is a library, not yet part of the running agent.** `dh/improve/` implements the playbook
-  deltas, gates, replay, shadow mode, CUSUM, probation and the weekly report, with tests. But `dh/scheduler.py` and
-  `dh/runtime.py` do not call `improve.after_round`, and the CLI commands `dh replay`, `dh eval` and `dh playbook`
-  are stubs that print "not implemented yet". The package says the controller wires them after its task. Until
-  that happens the playbook changes only when you edit `playbook/items.yaml` yourself, and only the bandit adapts.
-  The bandit and the sentinel arms do run every round.
-- **Trend-signal tier 4** (a price gap opening, a model falling) is not produced. Tier 4 is only the "within 20%
-  under the floor" case.
-- **Paid LLM APIs** have no code path. `models.paid_api` only makes the books record 0 PLN of spend.
-- **`notify.quiet_hours`** is present in the file but nothing reads it.
+- **Self-improvement is wired.** `runtime.post_round` calls `improve.after_round` after every round of `serve` and
+  of `dh round`, under `improve.post_round_timeout_s`; an error or a timeout there is a health event
+  (`improve_error`, `improve_timeout`) and never stops the rounds. `serve` also writes the weekly report into the
+  log repo every 168 watched hours. `dh playbook`, `dh eval` and `dh report --weekly` are real commands
+  ([`RUNNING.md`](RUNNING.md)). Only `dh replay` is still a stub that prints "not implemented yet". Prompt changes
+  always wait for the owner (`dh playbook --pending`, `--apply`).
+- **Trend-signal tier 4** is produced by `scheduler.trend_signal` (a rising 30-day trend on a non-losing listing
+  below its floor), not by the frozen `tiering.assign`; thresholds are `scheduler.trend.*`.
+- **Paid LLM APIs** exist behind `models.paid_api` and are off: the monthly cap defaults to 0, which makes the LLM
+  client refuse every paid call; the books track paid spend per month.
+- **`notify.quiet_hours`** delays tier-1 pushes inside the configured window until it ends (default: none).
+- **Mailbox listings** from Kleinanzeigen (and eBay with keys) are verified through that platform's real adapter;
+  Allegro and OLX ones stay unverifiable.
 - **The Pedro `/deal-hunter` skill** from the spec lives outside this repository.

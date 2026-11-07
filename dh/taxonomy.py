@@ -107,3 +107,44 @@ def canonical(category: str, fields: dict) -> str:
     if category == "ssd":
         return _ssd_key(fields)
     raise ValueError(f"unknown category {category!r}")
+
+
+_UPPER_TOKENS = {"rtx", "gtx", "rx", "xt", "xtx", "gre", "fe", "oc"}
+_WORD_TOKENS = {"ti": "Ti", "super": "Super", "titan": "Titan", "arc": "Arc", "radeon": "Radeon", "pro": "Pro",
+                "quadro": "Quadro", "tesla": "Tesla"}
+
+
+def _model_name(model_id: str) -> str:
+    out = []
+    for tok in model_id.split("-"):
+        if tok in _WORD_TOKENS:
+            out.append(_WORD_TOKENS[tok])
+        elif tok in _UPPER_TOKENS or any(c.isdigit() for c in tok):
+            out.append(tok.upper())
+        else:
+            out.append(tok.capitalize())
+    return " ".join(out)
+
+
+def display_name(key: str | None) -> str:
+    """A human name for a product key (push titles and bodies): gpu:rtx-4090:24 -> "RTX 4090 24GB",
+    ram:ddr5:32:2x16 -> "DDR5 32GB (2x16GB)", ssd:nvme:2tb -> "NVMe SSD 2TB". Anything else is returned as is."""
+    if not key:
+        return ""
+    parts = str(key).split(":")
+    try:
+        if parts[0] in GPU_CATEGORIES and len(parts) == 3:
+            laptop = " Laptop" if parts[0] == "gpu-mobile" else ""
+            return f"{_model_name(parts[1])}{laptop} {int(parts[2])}GB"
+        if parts[0] in RAM_CATEGORIES and len(parts) == 4:
+            count, size = parts[3].lower().split("x")
+            so = " SO-DIMM" if parts[0] == "ram-sodimm" else ""
+            return f"{parts[1].upper()}{so} {int(parts[2])}GB ({int(count)}x{int(size)}GB)"
+        if parts[0] == "ssd" and len(parts) == 3:
+            iface = {"nvme": "NVMe", "sata": "SATA"}.get(parts[1].lower(), parts[1].upper())
+            return f"{iface} SSD {parts[2].upper()}"
+        if str(key) == "pc:bundle":
+            return "PC bundle"
+    except ValueError:
+        pass
+    return str(key)

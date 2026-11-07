@@ -3,7 +3,17 @@ roles:
   worker: gemma-4-26b-a4b-pool
   senior: qwen3.8-flash-next-uncensored
   advisor: qwen3.8-flash-next-uncensored
-paid_api: {enabled: false}
+# Paid endpoint for chosen roles. OFF by default and capped: with monthly_cap_usd 0 (default) no paid call is ever made;
+# otherwise the LLM client refuses a paid call once this calendar month's paid spend (books, UTC) reaches the cap.
+paid_api:
+  enabled: false
+  monthly_cap_usd: 0
+  base_url: null              # OpenAI-compatible endpoint, e.g. https://api.example.com/v1
+  api_key_secret: null        # bw-secret reference, e.g. "paid-llm#api_key"; never stored in the repo or DB
+  roles: {}                   # role -> model name on that endpoint, e.g. {advisor: some-model}; unlisted roles stay local
+  usd_per_mtok_in: 0
+  usd_per_mtok_out: 0
+  pln_per_usd: 4.0            # only to show the spend in PLN in the books
 min_free_ram_gb: 12
 timeouts: {connect_s: 5, read_s: 60}
 breaker: {failures: 3, cooldown_s: 120}

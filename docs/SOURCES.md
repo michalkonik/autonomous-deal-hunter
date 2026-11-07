@@ -100,7 +100,7 @@ ban risk falls on the owner's account.
 
 Both block polite polling (Allegro.pl uses DataDome; OLX uses CloudFront). The only legitimate route is the
 platforms' own saved-search alert e-mails. The mailbox adapter reads those mails. It never fetches an Allegro, OLX
-or eBay page, so these listings are **never re-checked live** and cannot reach tier 1. They can reach tier 2.
+or eBay page, so Allegro and OLX listings are **never re-checked live** and cannot reach tier 1. They can reach tier 2.
 The human acting on a deal opens the link and checks it by hand.
 
 ## Alert mailbox set-up
@@ -142,4 +142,4 @@ How mail is handled:
   (`tests/fixtures/mailbox/README.md`). They have not yet met a real alert. Expect to adjust them after your first
   real mails: if `alert_parse_empty` appears, send a sample to a developer.
 - Kleinanzeigen mails are enriched through the polite fetcher when its robots rules allow it. Allegro, OLX and eBay
-  mails never are. Every mailbox listing, Kleinanzeigen included, is unverifiable and tops out at tier 2.
+  mails never are. Allegro and OLX mailbox listings are unverifiable and top out at tier 2. A Kleinanzeigen mail listing is routed to the real `kleinanzeigen` adapter for its detail page and its live re-check (when that adapter is enabled), and an eBay one to the eBay API adapter when keys exist; verified, they can reach tier 1.

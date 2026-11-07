@@ -8,6 +8,7 @@ before anything can fail.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -470,7 +471,11 @@ async def run_loop(store, cfg, root: Path, stop: asyncio.Event) -> None:
         try:
             await sync(store, cfg, root)
         except Exception as e:  # the round must never die because of the publisher
-            health_once(store, "publish", "sync_error", repr(e)[:500])
+            try:  # its own connection (serve): a busy database must not end the loop either
+                health_once(store, "publish", "sync_error", repr(e)[:500])
+            except Exception:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    store.conn.rollback()
         try:
             await asyncio.wait_for(stop.wait(), interval)
         except asyncio.TimeoutError:

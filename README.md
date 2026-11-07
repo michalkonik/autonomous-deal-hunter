@@ -51,14 +51,20 @@ export PATH="$PWD/.venv/bin:$PATH"          # puts `dh` on the PATH
 dh round --once --dry                        # one foreground round, no push (needs models, or add --no-llm)
 dh deals                                     # list what it found
 dh start                                     # start the agent as the systemd user unit `deal-hunter`
-dh status                                    # running?, rounds, health, ntfy topic, log repo
+dh status                                    # running?, rounds, health, ntfy topic, log repo, improvement loop
+dh playbook                                  # active playbook; --pending, --rollback N, --maintenance on|off ...
+dh eval                                      # must-pass and golden scores of the active playbook
+dh report --weekly                           # the weekly report
 dh stop                                      # stop everything, release the models it loaded
 ```
 
 - The web page is on **http://&lt;rig&gt;:8711** while the agent runs (`config/web.yaml`). Deals, deal cards with
   Bought / Skipped / Sold buttons, rounds, playbook, books and health.
 - Push notifications: install the **ntfy** app and subscribe to the topic that `dh status` prints (a random
-  24-character topic, generated on first use and kept in `config/local/notify.yaml`).
+  24-character topic, generated on first use and kept in `config/local/notify.yaml`). A tier-1 push is titled
+  `T1 ★ +$640 RTX 4090 24GB · OLX Kraków`; its body has the buy price, the exit range (P25-median and channel),
+  the conservative and expected net and the confidence. Tapping it opens the listing; the "Card" button opens the
+  deal card in the log repo, and is left out when `publish.repo_web_url` is not set.
 - There is no autostart: no boot service, timer or cron. The owner starts and stops the agent by hand.
 - `dh start` refuses, and says why, when free RAM is below `models.min_free_ram_gb` (12 GB) or llama-swap runs a
   model outside the configured roles. It never evicts another workload.
@@ -81,9 +87,9 @@ Spec section 15, updated for what was built. Items marked **gated** switch a fea
 stays off and the rest of the agent still works.
 
 1. **Create the private GitHub log repo `deal-hunter-log` (gated: log publishing).** The automated creation was
-   denied by the permission system, so you must create it. It must contain a branch named `log` (the publisher
-   clones `--branch log` and pushes only to it); simplest is to create the repo with an initial commit on a branch
-   called `log`. Then set the clone URL in `config/local/publish.yaml`:
+   denied by the permission system, so you must create it. An empty repo, or one with only `main`, is fine: the
+   publisher creates the `log` branch itself on its first sync and pushes only `log`, never `main`. Set the clone
+   URL in `config/local/publish.yaml`:
    ```yaml
    remote: git@github.com:<you>/deal-hunter-log.git
    repo_web_url: https://github.com/<you>/deal-hunter-log   # optional: makes push links point at the card
@@ -103,7 +109,7 @@ stays off and the rest of the agent still works.
 8. **Check the model roles** in `config/models.yaml` against `curl -s localhost:8080/running`, or map them to
    already-loaded models in `config/local/models.yaml` ([`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#modelsyaml)).
 9. **Decisions still open.** Vinted (no adapter exists, off), logged-in eBay Product Research (not implemented),
-   and whether to allow paid LLM APIs (off; no code path uses them yet).
+   and whether to allow paid LLM APIs (off; `models.paid_api.monthly_cap_usd` is 0, so no paid call is ever made).
 
 ## Documentation
 
