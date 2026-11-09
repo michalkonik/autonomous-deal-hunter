@@ -283,3 +283,15 @@ def test_remote_with_only_main_gets_log_branch_and_main_is_untouched(tmp_path):
     assert git(tmp_path / "clone", "symbolic-ref", "HEAD").strip() == "refs/heads/log"
     r2 = asyncio.run(publish.sync(st, cfg, tmp_path))  # second cycle: log now exists remotely; plain pull path
     assert r2["pulled"] and not r2["committed"]
+
+
+def test_index_shows_gone_deals_after_live_ones(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    a = add_deal(st, tmp_path, tier=1, net="900")
+    b = add_deal(st, tmp_path, tier=3, net="100")
+    st.conn.execute("update deals set status='gone' where id=?", (a,))
+    st.conn.commit()
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    idx = (tmp_path / "clone/INDEX.md").read_text()
+    line = next(l for l in idx.splitlines() if f"deal-{a}" in l)
+    assert "gone" in line and idx.index(f"deal-{b}") < idx.index(f"deal-{a}")

@@ -36,6 +36,14 @@ time. They are computed as the union of the ledger's observation windows (`dh/im
 | `query` | `rtx 5070 ti` on `all` sources | arm: schema and must-pass, then probation. The bandit's trial budget and the CUSUM judge it, because replay cannot score a query nobody ran (research §3.3) |
 | `cadence` | minutes between searches of one source | arm: as above |
 
+How the scheduler uses them: `prompt.extract` is the worker's extraction prompt; `prompt.triage` is the senior
+model's **finalist triage** prompt (every candidate that reaches tier 1 or 2 is reviewed before the live re-check
+and the push: ok keeps the tier, suspicious caps it at tier 3, scam excludes it; with no answer the confidence is
+capped at medium, so there is no tier-1 push without a triage). A `cadence` item of C minutes for a source, with
+rounds every R minutes (`scheduler.round_interval_s`): when C > R the source's bandit arms run only in a round at
+least C minutes after the last round that searched them; when C < R its per-round cap
+(`max_searches_per_source`) is multiplied by R / C, up to the budget. Sentinel and feed arms are never affected.
+
 Queries and cadences are never *removed* by a delta: the bandit retires weak arms into its cold pool.
 Every prompt must keep its prompt-injection guard (`<listing>` and "untrusted"). Caps: at most 400 items, a prompt
 at most 1500 characters, other values at most 120.

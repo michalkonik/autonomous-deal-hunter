@@ -1,6 +1,7 @@
 {% extends "base.html" %}{% block title %}Deal {{deal.id}}{% endblock %}
 {% block body %}
-<h1>T{{c.tier}}{% if c.star %} <span class="star">&#9733;</span>{% endif %} {{c.key or "deal"}}</h1>
+<h1>T{{c.tier}}{% if c.star %} <span class="star">&#9733;</span>{% endif %} {{c.key or "deal"}}{% if c.status == "gone" %} <span class="bad">(gone)</span>{% endif %}</h1>
+{% if c.status == "gone" %}<p class="bad" role="status"><b>Gone:</b> {{c.get("gone_reason") or "the listing is gone or failed re-verification"}}</p>{% endif %}
 <p class="mut">{{c.listing.get("title","")}}{% if c.listing.get("city") %} &middot; {{c.listing.city}}{% endif %}{% if c.listing.get("country") %}, {{c.listing.country}}{% endif %}
 {% set u = c.listing.get("url","") %}{% if u.startswith(("http://","https://")) %} &middot; <a href="{{u}}" rel="noopener noreferrer">listing</a>{% endif %}</p>
 <div class="card"><table>
@@ -30,7 +31,7 @@
 {% for name,rows in (("Conservative (exit at P25)",c.breakdown.cons),("Expected (exit at median)",c.breakdown.exp)) %}
 <h2>Net: {{name}}</h2><div class="tbl"><table><tr><th>Line</th><th class="n">PLN</th><th>Note</th></tr>
 {% for r in rows %}<tr><td>{{r.label}}</td><td class="n">{{r.pln}}</td><td class="mut">{{r.note}}</td></tr>{% endfor %}</table></div>{% endfor %}
-{% if c.fx %}<p class="mut">FX: {{c.fx.rate}} PLN per {{c.fx.currency}} (NBP mid, {{c.fx.date}})</p>{% endif %}
+{% if c.fx %}<p class="mut">FX: {{c.fx.rate}} PLN per {{c.fx.currency}} (NBP mid, {{c.fx.date}}){% if c.fx_usd %}; USD figures at {{c.fx_usd.rate}} PLN per USD (NBP mid, {{c.fx_usd.date}}){% endif %}</p>{% endif %}
 
 <h2>Evidence</h2>
 <p>Screenshots: discovery {{c.screenshots.get("discovery") or "none"}}, verification {{c.screenshots.get("verification") or "none"}}</p>
@@ -40,6 +41,7 @@
 <td>{% if (x.url or "").startswith(("http://","https://")) %}<a href="{{x.url}}" rel="noopener noreferrer">link</a>{% else %}{{x.url or ""}}{% endif %}</td></tr>{% endfor %}</table></div>{% else %}<p class="mut">none</p>{% endif %}
 
 <h2>Risk</h2><p>p_scam {{c.risk.p_scam}}; flags: {{c.risk.flags|join(", ") or "none"}}</p>
+<p>Triage (senior model, finalists only): {% if c.triage %}<b>{{c.triage.verdict}}</b>{% if c.triage.reasons %}: {{c.triage.reasons|join("; ")}}{% endif %}{% else %}<span class="mut">not run (tier 3 or below)</span>{% endif %}</p>
 <h2>Why this tier</h2><ul>{% for r in c.reasons %}<li>{{r}}</li>{% else %}<li class="mut">n/a</li>{% endfor %}</ul>
 <h2>How to buy safely</h2><ul>{% for r in c.checklist %}<li>{{r}}</li>{% endfor %}</ul>
 {% endblock %}

@@ -169,3 +169,42 @@ def summary(store, since: str | None = None, cfg=None) -> dict:
     total = sum((v["pln"] for v in by.values()), Decimal(0))
     return {"rounds": rounds, "total_pln": str(q2(total)),
             "by_kind": {k: {"pln": str(q2(v["pln"])), "units": v["units"], "rows": v["rows"]} for k, v in by.items()}}
+
+
+# ---------------------------------------------------------------- realised net of a sold deal
+
+
+def _completed_sale_cfg(cfg):
+    """The config for a COMPLETED sale: no returns reserve (the sale happened; a later return is a new event)."""
+    from .config import Config
+    data = cfg.to_dict()
+    return Config({**data, "economics": {**data["economics"], "returns_reserve": 0}}, getattr(cfg, "_root", None))
+
+
+def bought_price_pln(store, deal_id: int) -> Decimal | None:
+    """The price of the owner's latest Bought mark (PLN), None when there is none with a price."""
+    r = store.conn.execute("select price_pln from marks where deal_id=? and status='bought' and price_pln is not null "
+                           "order by id desc limit 1", (deal_id,)).fetchone()
+    return Decimal(r["price_pln"]) if r else None
+
+
+async def realised_net(store, deal, sold_pln: Decimal, cfg, fx, customs=None):
+    """economics.NetResult of a SOLD deal (the books page and the weekly report):
+    - the stored net inputs, exit = the sold price;
+    - buy = the owner's Bought mark price when there is one (PLN: buy currency PLN, no second FX conversion), else the
+      listing price in its own currency;
+    - FX replayed at the rates the deal was valued with (evidence `fx_rates`; the live `fx` only for anything else);
+    - no risk haircut (p_scam 0) and no returns reserve: the sale is completed."""
+    from dataclasses import replace
+
+    from . import economics
+    from .cards import inputs_from_json
+    from .money import FixedFx
+    ev = json.loads(deal.evidence_json or "{}")
+    inp = inputs_from_json(ev["net_inputs"])
+    price = Decimal(sold_pln)
+    inp = replace(inp, exit_price_cons_pln=price, exit_price_exp_pln=price, p_scam=0.0)
+    paid = bought_price_pln(store, deal.id)
+    if paid is not None:
+        inp = replace(inp, buy_price=paid, buy_ccy="PLN")
+    return await economics.net(inp, _completed_sale_cfg(cfg), FixedFx.from_evidence(ev, fallback=fx), customs)

@@ -14,8 +14,9 @@ marked *(built-in default)*.
 - **No-circumvention policy.** `sources.fetch.proxies`, `solve_captcha` and `logged_in` must stay `false`. If any of them is truthy, in the shipped file or in `config/local/`, `dh/config.py` raises `PolicyViolation` and every command that loads the configuration (`dh start`, `dh round`, `dh status`...) refuses to run, with a message naming the key.
 - The configuration is read when a process starts. After editing, run `dh stop` and `dh start`.
 - **Frozen files.** `config/rules.yaml`, `config/economics.yaml`, their local overrides and everything in `data/`
-  are part of the frozen layer. If one changes while the agent runs, the rounds stop with a `frozen_changed`
-  health event. Edit them only while stopped. See [`ARCHITECTURE.md`](ARCHITECTURE.md#the-frozen-layer).
+  are part of the frozen layer. If one changes while the agent runs, the rounds PAUSE: a `frozen_changed`
+  health event, `dh status` shows "PAUSED: frozen file changed (<path>)" and you get one ntfy push. Undo the
+  change and the rounds resume; to keep it, `dh stop` and `dh start`. Edit them only while stopped. See [`ARCHITECTURE.md`](ARCHITECTURE.md#the-frozen-layer).
 
 ## Secrets
 
@@ -27,6 +28,10 @@ takes `item#field`:
 | `bw-secret ebay#client_id`, `ebay#client_secret` | eBay Browse and Marketplace Insights | eBay developer keys | eBay adapters disable themselves and record one `no_keys` health event |
 | `bw-secret dh-mail#imap` | The alert mailbox | JSON `{"host","port","user","password","folder"}`; `folder` defaults to `INBOX` | The mailbox adapter disables itself, one `no_credentials` health event |
 | `bw-secret dh-mail#smtp` | Email fallback for tier-1 pushes | JSON `{"host","port","user","password","to"}` (STARTTLS) | A failed ntfy push is queued and retried for 6 h |
+
+**Adding or changing a secret needs a restart.** The eBay keys and the IMAP login are read once per process (a
+missing one is remembered as missing): after you store `ebay#client_id` / `ebay#client_secret` or `dh-mail#imap`,
+run `dh stop` and `dh start`. Only `dh-mail#smtp` is read at each fallback e-mail.
 
 The ntfy topic is not a secret in Bitwarden: a random 24-character string is generated on first use and written to
 `config/local/notify.yaml`. Anyone who knows the topic can read your pushes, so keep it private.
@@ -265,8 +270,8 @@ network.
 | `query` | `all` or comma-separated source names | Search text. Optional `min_pln` / `max_pln` |
 | `alias` | `match` | `from => to` rewrite before matching |
 | `scam_kw` | `risk` | A soft scam phrase, matched without diacritics. Each hit adds `risk.weights.scam_kw` |
-| `prompt` | `llm.<role>` | An LLM system prompt (`prompt.extract`, `prompt.triage`, `prompt.confirm`, `prompt.reflect`, `prompt.propose`) |
-| `cadence` | a source | Minutes between searches of that source |
+| `prompt` | `llm.<role>` | An LLM system prompt (`prompt.extract`, `prompt.triage`, `prompt.confirm`, `prompt.reflect`, `prompt.propose`). `prompt.triage` is the senior model's finalist review of every tier 1-2 candidate; its reply keeps the `p_scam` / `verdict` (ok, suspicious, scam) / `reasons` format the gates check |
+| `cadence` | a source | Minutes between searches of that source (10 to 1440). With rounds every R minutes: a cadence C > R runs the source's bandit arms only in rounds at least C minutes apart; C < R raises its per-round cap to `max_searches_per_source` x R / C (at most the budget). Sentinel and feed arms always run |
 
 The seed has 3 sentinel queries (`sentinel.rtx_4090`, `sentinel.rtx_3090`, `sentinel.ddr5_32gb`, on
 kleinanzeigen, hardverapro and allegro_lokalnie), 42 normal queries for GPUs, RAM, NVMe and gaming PCs, and

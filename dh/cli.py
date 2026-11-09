@@ -68,6 +68,10 @@ def cmd_status(args) -> int:
     up = f", up {s['uptime_s'] // 60} min" if s.get("uptime_s") else ""
     print(f"deal-hunter: {'RUNNING' if s['running'] else 'stopped'} (unit {s['unit']}, state {s['state']}"
           f"{', pid ' + str(s['pid']) if s.get('pid') else ''}{up})")
+    if s.get("paused"):
+        p = s["paused"]
+        print(f"  PAUSED: {p.get('reason', 'paused')} ({', '.join(p.get('paths') or [])}): undo the change to resume, "
+              "or `dh stop` and `dh start` to accept it")
     if s.get("processes"):
         print("  processes: " + "; ".join(s["processes"]))
     print(f"  rounds: {s.get('rounds_total', 0)} total, {s.get('rounds_since_start', 0)} since start; "
@@ -298,13 +302,14 @@ async def _verify(args) -> int:
         if store.get_deal(args.id) is None:
             print(f"no deal {args.id}", file=sys.stderr)
             return 1
-        res = await verify.verify_deal(store, args.id, cfg, Fx(store), Customs(store), registry(cfg, root), fetcher)
-        verify.record_verification(store, args.id, res.ok)
+        res = await verify.verify_and_record(store, args.id, cfg, Fx(store), Customs(store), registry(cfg, root),
+                                             fetcher, cards_root=_cards_root(cfg, root))
     finally:
         await fetcher.aclose()
         store.close()
     out = {"deal_id": args.id, "ok": res.ok, "alive": res.alive, "price_now": res.price_now,
-           "net_now_cons_pln": res.net_now_cons_pln, "net_stored_cons_pln": res.net_stored_cons_pln, "diffs": res.diffs}
+           "net_now_cons_pln": res.net_now_cons_pln, "net_stored_cons_pln": res.net_stored_cons_pln, "diffs": res.diffs,
+           "gone": res.gone}
     if args.json:
         _dump(out)
     else:
@@ -312,7 +317,19 @@ async def _verify(args) -> int:
               f"net now {res.net_now_cons_pln} PLN vs stored {res.net_stored_cons_pln} PLN")
         for d in res.diffs:
             print(f"  - {d}")
+        if res.gone:
+            print("  deal marked gone (the card and the log repo show it)")
     return 0 if res.ok else 1
+
+
+def _cards_root(cfg, root):
+    """Where cards.write puts `deals/<day>/...` (the parent of publish.cards_dir), as build_context does."""
+    from pathlib import Path
+    try:
+        cd = Path(str(cfg.publish.cards_dir))
+    except AttributeError:
+        cd = Path("var/cards/deals")
+    return (cd if cd.is_absolute() else Path(root) / cd).parent
 
 
 def cmd_verify(args) -> int:

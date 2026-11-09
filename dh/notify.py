@@ -379,6 +379,19 @@ async def retry_pending(store, cfg, root: Path, *, client=None, smtp_send: Calla
     return done
 
 
+async def push_owner(cfg, root: Path, title_text: str, body: str, *, store=None, priority: str = "default",
+                     tags: str = "warning", client=None, smtp_send: Callable = _send_smtp,
+                     secret_fn: Callable = bw_secret) -> bool:
+    """A notice to the owner (not a deal): the same header builder and delivery path (ntfy, then e-mail) as a
+    tier-1 push, at `priority` (default). Not queued. Never raises; True when delivered."""
+    try:
+        payload = {"headers": ntfy_headers(title_text, priority=priority, tags=tags), "body": body}
+        return await _deliver(payload, store, cfg, Path(root), client, smtp_send, secret_fn) is None
+    except Exception as e:  # noqa: BLE001
+        _health(store, "owner_push_failed", repr(e))
+        return False
+
+
 async def send_test(cfg, root: Path, client=None) -> None:
     """A test notification through the SAME header builder and POST path as a real push (no priority, no links)."""
     server, _ = _ntfy_cfg(cfg)

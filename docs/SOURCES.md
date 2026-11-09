@@ -62,7 +62,8 @@ The HTML search page `/q/<query>/` is allowed and embeds the listings in `__NEXT
 `pages` pages (20 ads each) of the matching category (for example `pc.bazos.cz/graficka/`) and filters locally.
 The Bazos dataset can also seed price history (`python -m dh.seed bazos`).
 
-**eBay (DE, PL).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`.
+**eBay (DE, PL).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`
+(read once per run: restart the agent after adding them).
 eBay web pages are never fetched. eBay's terms ban AI shopping agents and scrapers since February 2026, so the API
 is the only route. The API client is a documented exception to the web fetcher (it needs a POST token call and does
 not serve robots.txt): it still sends the honest User-Agent, paces calls, backs off 60 s doubling to 1 h on 429 or
@@ -113,7 +114,8 @@ This is **gated on you**: until you do it, Allegro.pl, OLX.pl and the other aler
    ```json
    {"host": "imap.example.com", "port": 993, "user": "alerts@example.com", "password": "...", "folder": "INBOX"}
    ```
-   Check it with `bw-secret dh-mail#imap`. `folder` is optional (default `INBOX`).
+   Check it with `bw-secret dh-mail#imap`. `folder` is optional (default `INBOX`). The login is read once per run:
+   if the agent is running, `dh stop` and `dh start` after storing it.
 3. **Sign up** on Allegro, OLX, Kleinanzeigen and (optionally) eBay with that address.
 4. **Save narrow searches** on each platform and turn on e-mail alerts for them, at the most frequent setting the
    platform offers. Good searches mirror the playbook queries: one per product, for example "rtx 4090", with a

@@ -40,6 +40,7 @@ class CardFile:
     star: bool
     cons_net_usd: Decimal
     created_at: datetime
+    status: str = "new"
 
 
 # ---------- outcome blocks ----------
@@ -208,7 +209,7 @@ def scan_cards(store, cards_dir: Path) -> list[CardFile]:
             d = store.get_deal(deal_id)
             if d is None:
                 continue
-            out.append(CardFile(md, js, deal_id, d.tier, d.star, d.cons_net_usd, d.created_at))
+            out.append(CardFile(md, js, deal_id, d.tier, d.star, d.cons_net_usd, d.created_at, d.status or "new"))
         except Exception as e:
             health_once(store, "publish", "bad_card", f"{js}: {e!r}")
     return out
@@ -254,20 +255,23 @@ def write_cards(store, log_dir: Path, cards: list[CardFile], protect: set[int] =
 
 
 def index_order(cards: list[CardFile]) -> list[CardFile]:
-    """Star and tier 1 first, then by tier, then conservative net (desc)."""
-    return sorted(cards, key=lambda c: (not (c.star or c.tier == 1), c.tier, -c.cons_net_usd, c.deal_id))
+    """Live deals first (gone ones last), then star and tier 1, then by tier, then conservative net (desc)."""
+    return sorted(cards, key=lambda c: (c.status == "gone", not (c.star or c.tier == 1), c.tier, -c.cons_net_usd,
+                                        c.deal_id))
 
 
 def _line(c: CardFile, log_dir: Path) -> str:
     rel = _card_dest(log_dir, c).relative_to(log_dir).as_posix()
     star = "★ " if c.star else ""
-    return f"- {star}T{c.tier} +${c.cons_net_usd:.0f} · [{c.path_md.stem}]({rel}) · {c.created_at:%Y-%m-%d}"
+    gone = " · **gone**" if c.status == "gone" else ""
+    return f"- {star}T{c.tier} +${c.cons_net_usd:.0f} · [{c.path_md.stem}]({rel}) · {c.created_at:%Y-%m-%d}{gone}"
 
 
 def write_reports(store, log_dir: Path, cards: list[CardFile]) -> None:
     ordered = index_order(cards)
     (log_dir / "INDEX.md").write_text(
-        "# Deal Hunter index\n\nStar and tier-1 first, then by tier and conservative net.\n\n"
+        "# Deal Hunter index\n\nStar and tier-1 first, then by tier and conservative net; deals marked **gone** (the "
+        "listing is gone or failed re-verification) come last.\n\n"
         + ("\n".join(_line(c, log_dir) for c in ordered) or "_no deals yet_") + "\n")
     days: dict[str, list[CardFile]] = {}
     weeks: dict[str, list[CardFile]] = {}

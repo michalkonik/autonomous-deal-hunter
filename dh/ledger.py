@@ -37,6 +37,7 @@ Observations: one row on first sighting and one on every price change (first pri
 """
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import sqlite3
 import weakref
@@ -332,21 +333,73 @@ def _price_at(store: Store, listing_id: int, t: datetime, fallback: str) -> Deci
 
 
 def _median_ask(store: Store, key: str, currency: str, t: datetime, window: timedelta) -> tuple[Decimal | None, int]:
-    """Median of one ask per listing (its price at t) for listings of `key` in `currency` live during [t-window, t]."""
+    """Median of one ask per listing (its price at t) for listings of `key` in `currency` live during [t-window, t].
+    The reference computation (one query per listing); `median_ask` serves the same result from an index."""
+    lo = t - window
     rows = store.conn.execute(
         f"""select l.id, l.price, l.first_seen_at, l.last_seen_at from listings l
             join extractions e on e.listing_id=l.id
-            where e.key=? and upper(l.currency)=? and {_SALEABLE}""", (key, currency.upper())).fetchall()
-    lo = t - window
+            where e.key=? and upper(l.currency)=? and {_SALEABLE}
+            and l.first_seen_at <= ? and l.last_seen_at >= ?""",
+        (key, currency.upper(), _iso(t), _iso(lo))).fetchall()
     asks = [_price_at(store, r["id"], t, r["price"]) for r in rows
             if _t(r["first_seen_at"]) <= t and _t(r["last_seen_at"]) >= lo]
     return (median(asks) if asks else None), len(asks)
 
 
+class _AskIndex:
+    """Every saleable listing of one key in one currency with its price history, loaded once (two queries), so the
+    median ask at any time t is computed in memory (I5: the per-listing queries made clears_at quadratic)."""
+
+    def __init__(self, store: Store, key: str, currency: str):
+        args = (key, currency.upper())
+        where = f"e.key=? and upper(l.currency)=? and {_SALEABLE}"
+        self.listings = [(r["id"], _t(r["first_seen_at"]), _t(r["last_seen_at"]), r["price"]) for r in store.conn.execute(
+            f"select l.id, l.price, l.first_seen_at, l.last_seen_at from listings l "
+            f"join extractions e on e.listing_id=l.id where {where}", args)]
+        self.obs: dict[int, tuple[list[datetime], list[str]]] = {}
+        for r in store.conn.execute(
+                f"select o.listing_id, o.seen_at, o.price from observations o join listings l on l.id=o.listing_id "
+                f"join extractions e on e.listing_id=l.id where {where} order by o.listing_id, o.seen_at, o.id", args):
+            times, prices = self.obs.setdefault(r["listing_id"], ([], []))
+            times.append(_t(r["seen_at"]))
+            prices.append(r["price"])
+
+    def price_at(self, lid: int, t: datetime, fallback: str) -> Decimal:
+        """As `_price_at`: the latest observation at or before t (ties: the later row), else the listing price."""
+        times, prices = self.obs.get(lid, ((), ()))
+        i = bisect.bisect_right(times, t) - 1
+        return Decimal(prices[i] if i >= 0 else fallback)
+
+    def median(self, t: datetime, window: timedelta) -> tuple[Decimal | None, int]:
+        lo = t - window
+        asks = [self.price_at(lid, t, price) for lid, first, last, price in self.listings
+                if first is not None and last is not None and first <= t and last >= lo]
+        return (median(asks) if asks else None), len(asks)
+
+
+def median_ask(store: Store, key: str, currency: str, t: datetime, window: timedelta,
+               cache: dict | None = None) -> tuple[Decimal | None, int]:
+    """`_median_ask` from an index built once per (key, currency) and memoised per (key, currency, t) in `cache`
+    (pass one dict per round to share it across calls; None = a fresh index for this call)."""
+    cache = {} if cache is None else cache
+    ccy = currency.upper()
+    mk = ("median", key, ccy, t, window)
+    if mk not in cache:
+        ik = ("index", key, ccy)
+        if ik not in cache:
+            cache[ik] = _AskIndex(store, key, ccy)
+        cache[mk] = cache[ik].median(t, window)
+    return cache[mk]
+
+
 def clears_at(store: Store, key: str, condition: str | None, since: datetime, *,
               channel_of: Callable[[str], str] = lambda s: s, max_age: timedelta = PROBABLY_SOLD_MAX_AGE,
-              ask_window: timedelta = ASK_WINDOW, min_asks: int = MIN_ASKS) -> list[CompRow]:
-    """Probably-sold comparables for `key` (and `condition`, None = any) that disappeared at or after `since`."""
+              ask_window: timedelta = ASK_WINDOW, min_asks: int = MIN_ASKS,
+              ask_cache: dict | None = None) -> list[CompRow]:
+    """Probably-sold comparables for `key` (and `condition`, None = any) that disappeared at or after `since`.
+    `ask_cache`: a dict shared by the calls of one round (median-ask index per key and currency)."""
+    ask_cache = {} if ask_cache is None else ask_cache
     migrate(store)
     sql = f"""select l.*, e.condition as cond from listings l join extractions e on e.listing_id=l.id
               where e.key=? and l.disappeared_at is not null and l.disappeared_at>=? and {_SALEABLE}"""
@@ -363,7 +416,7 @@ def clears_at(store: Store, key: str, condition: str | None, since: datetime, *,
         if age > max_age:
             continue
         price = _price_at(store, r["id"], gone, r["price"])
-        med, n = _median_ask(store, key, r["currency"], gone, ask_window)
+        med, n = median_ask(store, key, r["currency"], gone, ask_window, cache=ask_cache)
         if med is None or n < min_asks or price > med:
             continue
         out.append(CompRow(key=key, condition=r["cond"], channel=channel_of(r["source"]), kind="probably_sold",

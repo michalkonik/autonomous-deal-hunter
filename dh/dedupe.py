@@ -1,8 +1,9 @@
 """Cross-platform dedupe (Review Focus 4): one physical item = one deal = one push.
 
 A new deal is a duplicate of a stored deal when it is the same listing, or when the key matches, prices are within 5% (PLN),
-it is <= 7 days apart, and the seller hash matches (same platform) or the normalised city matches (cross-platform:
-seller hashes include the source, so they never match across platforms).
+it is <= 7 days apart, and the seller hash matches (same platform) or the normalised city matches AND the titles
+are similar (rapidfuzz token_set_ratio >= 85) (cross-platform: seller hashes include the source, so they never
+match across platforms; a big city alone has many sellers of one model).
 """
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from decimal import Decimal
 
 PRICE_TOLERANCE = Decimal("0.05")
 WINDOW = timedelta(days=7)
+TITLE_SIMILARITY = 85  # rapidfuzz token_set_ratio, on lowercased titles without diacritics or punctuation
 
 
 def _buy_pln(deal) -> Decimal | None:
@@ -51,7 +53,13 @@ def norm_city(city: str | None) -> str | None:
 
 
 def _listing(store, listing_ref: int):
-    return store.conn.execute("select seller_hash, city from listings where id=?", (listing_ref,)).fetchone()
+    return store.conn.execute("select seller_hash, city, title from listings where id=?", (listing_ref,)).fetchone()
+
+
+def similar_titles(a: str | None, b: str | None) -> bool:
+    from rapidfuzz import fuzz, utils
+    na, nb = norm_city(a), norm_city(b)  # the same folding: lowercase, no diacritics, whitespace collapsed
+    return bool(na and nb) and fuzz.token_set_ratio(na, nb, processor=utils.default_process) >= TITLE_SIMILARITY
 
 
 def _close(a: Decimal | None, b: Decimal | None) -> bool:
@@ -60,7 +68,8 @@ def _close(a: Decimal | None, b: Decimal | None) -> bool:
 
 def is_duplicate(store, deal) -> bool:
     """Same listing; or same key, buy price within 5% (PLN) and created within 7 days, plus either
-    (A) the same seller hash, or (B) on any platform, the same normalised city (missing city never matches)."""
+    (A) the same seller hash, or (B) on any platform, the same normalised city (missing city never matches) and
+    similar titles (token_set_ratio >= 85)."""
     mine = _listing(store, deal.listing_ref)
     seller = mine["seller_hash"] if mine else None
     city = norm_city(mine["city"]) if mine else None
@@ -82,6 +91,6 @@ def is_duplicate(store, deal) -> bool:
             continue
         if seller and theirs["seller_hash"] == seller:
             return True
-        if city and norm_city(theirs["city"]) == city:
+        if city and norm_city(theirs["city"]) == city and similar_titles(mine["title"], theirs["title"]):
             return True
     return False

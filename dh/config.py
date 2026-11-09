@@ -26,7 +26,9 @@ LOCAL_FROZEN_PATHS = ["config/local/rules.yaml", "config/local/economics.yaml"]
 
 
 class FrozenChanged(RuntimeError):
-    pass
+    def __init__(self, msg: str = "", paths: list[str] | tuple[str, ...] = ()):
+        super().__init__(msg)
+        self.paths = list(paths)
 
 
 class PolicyViolation(ValueError):
@@ -127,8 +129,13 @@ def frozen_digest(root: Path) -> dict[str, str]:
     return out
 
 
-def assert_frozen_unchanged(cfg: Config, digest: dict[str, str]) -> None:
+def frozen_changes(cfg: Config, digest: dict[str, str]) -> list[str]:
+    """Frozen files whose SHA-256 differs from `digest` (added, removed or edited)."""
     now = cfg.frozen_digest()
-    changed = sorted(k for k in set(now) | set(digest) if now.get(k) != digest.get(k))
+    return sorted(k for k in set(now) | set(digest) if now.get(k) != digest.get(k))
+
+
+def assert_frozen_unchanged(cfg: Config, digest: dict[str, str]) -> None:
+    changed = frozen_changes(cfg, digest)
     if changed:
-        raise FrozenChanged(f"frozen files changed: {', '.join(changed)}")
+        raise FrozenChanged(f"frozen files changed: {', '.join(changed)}", changed)

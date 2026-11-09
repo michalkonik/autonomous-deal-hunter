@@ -151,8 +151,8 @@ def test_books_realised_net_from_sold_deals(tmp_path):
     d, res, _ = make_deal(st)
     d2, _, _ = make_deal(st, sid="2", seller="s2", key="OPEN-ONE")
     assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
-    inp = replace(net_inputs(), exit_price_cons_pln=Decimal("3000"), exit_price_exp_pln=Decimal("3000"))
-    want = asyncio.run(economics.net(inp, cfg, FakeFx(), FakeCustoms())).cons_net_pln
+    inp = replace(net_inputs(), exit_price_cons_pln=Decimal("3000"), exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms())).cons_net_pln
     assert want != res.cons_net_pln
     t = c.get("/books").text
     assert f"{want:.2f} PLN" in t and "Realised net" in t and "Forecast: expected net" in t
@@ -286,15 +286,15 @@ def test_pagination(tmp_path):
 def test_books_realised_net_margin_scheme_hand_computed(tmp_path):
     """Private PL seller, no VAT invoice, PLN, allegro exit: margin scheme. Sold at 3000, hand computation:
     fees 8% x 3000 + 1 = 241.00; VAT due 23/123 x (3000 - 2000) = 186.99; input VAT on services
-    23/123 x (241 + 25) = 45.07 + 4.67 = 49.74; returns reserve 5% x 3000 = 150; risk haircut 0.02 x 2000 = 40;
-    pre-tax = 3000 - 241 - 2000 - 20 - 186.99 + 49.74 - 25 - 150 - 40 = 386.75; tax 23.9% = 92.43;
-    realised net = 294.32 PLN."""
+    23/123 x (241 + 25) = 45.07 + 4.67 = 49.74. A completed sale has NO returns reserve and NO risk haircut
+    (final review minor): pre-tax = 3000 - 241 - 2000 - 20 - 186.99 + 49.74 - 25 = 576.75; tax 23.9% = 137.84;
+    realised net = 438.91 PLN."""
     st, c, _ = build(tmp_path)
     d, _, lst = make_deal(st)
     assert lst.is_business is False and not json.loads(d.evidence_json)["net_inputs"]["has_vat_invoice"]
     post(c, d.id, status="sold", price_pln="3000")
     t = c.get("/books").text
-    assert 'class="n">294.32</td>' in t and "294.32 PLN" in t
+    assert 'class="n">438.91</td>' in t and "438.91 PLN" in t
 
 
 def test_existing_card_only_touched_via_set_outcome(tmp_path, monkeypatch):
@@ -316,3 +316,75 @@ def test_pagination_links_urlencoded(tmp_path):
     st.conn.commit()
     t = c.get("/?source=kleinanzeigen&since=2026-01-01").text
     assert 'href="/?page=2&amp;source=kleinanzeigen&amp;since=2026-01-01"' in t
+
+
+# ------------------------------------------------------------------ final review I2 + minor: realised net
+
+
+def no_reserve(cfg):
+    data = cfg.to_dict()
+    return config.Config({**data, "economics": {**data["economics"], "returns_reserve": 0}})
+
+
+def test_books_realised_net_uses_the_bought_price(tmp_path):
+    """The owner's Bought mark price (PLN) replaces the listing price; no haircut, no returns reserve."""
+    st, c, cfg = build(tmp_path)
+    d, _, _ = make_deal(st)
+    assert post(c, d.id, status="bought", price_pln="1800").status_code == 303
+    assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
+    inp = replace(net_inputs(), buy_price=Decimal("1800"), buy_ccy="PLN", exit_price_cons_pln=Decimal("3000"),
+                  exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms()))
+    assert all(l.pln == 0 for l in want.lines_cons if l.label in ("returns reserve", "risk haircut"))
+    t = c.get("/books").text
+    assert f'class="n">{want.cons_net_pln:.2f}</td>' in t
+
+
+def test_books_realised_net_replays_the_recorded_fx_and_handles_the_buy_currency(tmp_path):
+    """A EUR purchase is replayed at the rate the deal was valued with (evidence fx_rates), not today's; a Bought
+    price in PLN replaces the EUR price (buy currency PLN, no second FX conversion)."""
+    from dh.money import FixedFx
+    st, c, cfg = build(tmp_path)
+    d, _, _ = make_deal(st)
+    ev = json.loads(d.evidence_json)
+    ev["net_inputs"].update(buy_price="470", buy_ccy="EUR")
+    day = ev["net_inputs"]["day"]
+    ev["fx_rates"] = [{"currency": "EUR", "day": day, "rate": "4.10", "effective_date": day},
+                      {"currency": "USD", "day": day, "rate": "3.60", "effective_date": day}]
+    st.conn.execute("update deals set evidence_json=? where id=?", (json.dumps(ev), d.id))
+    st.conn.commit()
+    post(c, d.id, status="sold", price_pln="3000")
+    inp = replace(cards.inputs_from_json(ev["net_inputs"]), exit_price_cons_pln=Decimal("3000"),
+                  exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    fixed = FixedFx.from_evidence(ev)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), fixed, FakeCustoms())).cons_net_pln
+    live = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms())).cons_net_pln
+    assert want != live  # FakeFx (the web's live FX here) has EUR 4.3951
+    assert f'class="n">{want:.2f}</td>' in c.get("/books").text
+    post(c, d.id, status="bought", price_pln="2050")
+    post(c, d.id, status="sold", price_pln="3000")
+    inp2 = replace(inp, buy_price=Decimal("2050"), buy_ccy="PLN")
+    want2 = asyncio.run(economics.net(inp2, no_reserve(cfg), fixed, FakeCustoms())).cons_net_pln
+    assert f'class="n">{want2:.2f}</td>' in c.get("/books").text
+
+
+def test_gone_deal_is_shown_as_gone(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    st.conn.execute("update deals set status='gone' where id=?", (d.id,))
+    st.conn.commit()
+    assert "gone" in c.get("/").text
+    assert "gone" in c.get(f"/deal/{d.id}").text.lower()
+
+
+def test_deal_page_shows_usd_rate_and_triage(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    ev = json.loads(d.evidence_json)
+    ev["fx_usd"] = {"rate": "3.7012", "date": "2026-10-28"}
+    ev["triage"] = {"verdict": "demote", "reasons": ["<b>stock photos</b>"]}
+    st.conn.execute("update deals set evidence_json=? where id=?", (json.dumps(ev), d.id))
+    st.conn.commit()
+    t = c.get(f"/deal/{d.id}").text
+    assert "3.7012 PLN per USD (NBP mid, 2026-10-28)" in t and "<b>demote</b>" in t
+    assert "<b>stock photos</b>" not in t and "&lt;b&gt;stock photos" in t  # model output is escaped

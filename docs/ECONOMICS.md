@@ -417,8 +417,13 @@ Capital 120000 + 300 = **120300.00** PLN = 120300 / 3.65 = **32958.90 USD** > 30
 ## Risk score (`dh/risk.py`, weights in `config/economics.yaml` under `risk`)
 
 `p_scam = 1 / (1 + exp(-(bias + sum of weight x feature)))`, features 0 or 1. A hard-excluded listing
-(box only, wanted ad, for parts, off-platform contact, transfer request from a new account) is never
-tiered: `tiering.confidence` returns `excluded` and `tiering.assign` returns tier None at any net.
+(box only, wanted ad, for parts, off-platform contact: WhatsApp, Telegram, wa.me / t.me, an external link,
+PayPal Friends & Family; "przelew na konto" from a new account) is never tiered: `tiering.confidence` returns
+`excluded` and `tiering.assign` returns tier None at any net.
+
+A bare **phone number or e-mail address** in the text (or one the adapter redacted before storage) is NOT a hard
+exclude (controller ruling, final review I3): on the phone-first classifieds (Bazos, HardverApró, Sprzedajemy,
+Marktplaats) every seller writes one. It is the score feature `contact_in_text`, weight 1.2.
 
 A deep discount alone must not block tier 1 (stale-priced listings from established sellers are the core
 play in a rising market); a deep discount plus a weak-seller signal is a scam until proven otherwise.
@@ -433,5 +438,15 @@ median), new_account 2.6, no_ratings 2.4:
 | too cheap + 0 ratings | -0.7 | 33.2% |
 | extreme price + new account | 2.0 | 88% |
 | extreme price + 0 ratings (lowest weak signal 2.0) | >= 1.4 | >= 80% |
+| phone or e-mail in the text | -3.3 | 3.6% (can still be tier 1) |
+| phone + too cheap, established seller | -1.9 | 13.0% (never high confidence) |
+| phone + too cheap + new account | 0.7 | 66.8% |
 
 Each row is pinned by a test in `tests/test_risk.py`.
+
+**How to buy safely** (the card checklist) depends on the platform. Where the platform has a protected checkout
+(eBay; Allegro Lokalnie, Kleinanzeigen "Sicher bezahlen" and Przesyłka OLX when the item is shipped) the first line
+is "pay only through the platform's protected checkout". On the phone-first classifieds (Bazos, HardverApró,
+Sprzedajemy, Marktplaats), and for a pickup where the platform's protection does not apply, it is "meet in person,
+test before paying (GPU-Z, VRAM test), pay cash or instant transfer only after testing; never pay in advance". The
+GPU, RAM and SSD checks and the seller warnings follow.

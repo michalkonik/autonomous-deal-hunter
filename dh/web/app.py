@@ -10,7 +10,6 @@ import difflib
 import json
 import re
 import socket
-from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
@@ -23,7 +22,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.routing import Route
 
-from .. import cards, economics, ledger, playbook_io, publish
+from .. import cards, ledger, playbook_io, publish
+from ..books import realised_net
 from ..customs import Customs
 from ..money import Fx
 from ..store import Store
@@ -296,9 +296,7 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) 
                 row = {"id": deal.id, "key": deal.key, "sold": _q2(price), "cons": _q2(deal.cons_net_pln),
                        "net_pln": None, "net_usd": None, "error": None}
                 try:
-                    inp = cards.inputs_from_json(json.loads(deal.evidence_json or "{}")["net_inputs"])
-                    res = await economics.net(replace(inp, exit_price_cons_pln=price, exit_price_exp_pln=price),
-                                              cfg, fx, cu)
+                    res = await realised_net(st, deal, price, cfg, fx, cu)
                     usd = await fx.pln_to_usd(res.cons_net_pln, date.fromisoformat(str(m["created_at"])[:10]))
                     row.update(net_pln=_q2(res.cons_net_pln), net_usd=_q2(usd))
                     realised_pln += res.cons_net_pln

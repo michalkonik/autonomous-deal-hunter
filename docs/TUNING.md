@@ -118,6 +118,7 @@ Scam probability is `1 / (1 + exp(-(bias + sum of weight x feature)))` over 0/1 
 | `origin_cn_hk` | 2.0 | ships from CN or HK, high-end RTX card |
 | `no_photos_flagship` | 2.0 | no photos on a 4090 or 5090 class card |
 | `scam_kw` | 0.8 | per scam-keyword hit, capped at `scam_kw_max_hits` (2) |
+| `contact_in_text` | 1.2 | a phone number or e-mail in the text, or one the adapter redacted: 3.6% alone; with a too-cheap price and a new account above 50% |
 
 By design, a deep discount alone from an established seller stays under 5% (it can still be tier 1), but a deep
 discount plus a weak-seller signal rises above 30%. Lower a weight to accept more risk; raise it to be stricter.
@@ -132,7 +133,9 @@ Calibrate against your Skipped marks and reasons.
 - `deals by tier` and `forecast conservative net`: the sum of the conservative net of all deals found (an
   expectation, not income).
 - The web page also computes **realised** profit from your Sold marks, re-running the net with the price you
-  actually got. Compare realised with forecast to calibrate `ask_to_sale_ratio`. The agent pays for itself when
+  actually got. It uses the price of your Bought mark as the buy price when you entered one (in PLN, so no second
+  FX conversion), the FX rates the deal was valued with, and no risk haircut or returns reserve, since the sale is
+  completed. Compare realised with forecast to calibrate `ask_to_sale_ratio`. The agent pays for itself when
   realised profit exceeds the cost lines.
 
 **`dh status`:** rounds total and since start, the last round (listings, candidates, LLM calls, deals by tier),
@@ -162,7 +165,7 @@ Health kinds you will meet: `blocked`, `disabled`, `soft_backoff`, `robots_error
 | `llm_deferred` is high | More uncertain titles than `max_llm_items` | Raise `max_llm_items`, or improve the rules matcher so fewer titles need the LLM |
 | Rounds say "rules-only" or `foreign_model` | Another model is loaded in llama-swap | Unload it, or map roles to loaded models (see [CONFIGURATION.md](CONFIGURATION.md#modelsyaml)) |
 | `dh start` refuses on RAM | Another workload holds the memory | Stop it; do not lower the guard casually |
-| Rounds stopped, `frozen_changed` | A frozen file was edited while running | `dh stop`, `dh start` |
+| Rounds paused, `frozen_changed` | A frozen file was edited while running | Undo it, or `dh stop`, `dh start` |
 | Same deal pushed twice | Should not happen: one push per deal is enforced | Check `deal_pushes`; report it as a bug |
 | Costs exceed value | Rounds too frequent, or nothing clears the floors | Increase `round_interval_s`, shrink `budget`, or fix the cause upstream (coverage, valuation) |
 | Too many false tier-1 | Scam score too lax, or comps wrong | Raise the scam weights or lower `confidence.p_scam_max`; mark Skipped with reasons; check the comps on the card |

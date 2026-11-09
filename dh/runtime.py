@@ -15,12 +15,15 @@ Guards (`dh start` and a foreground `dh round` refuse and say why, they never ev
 the models: `GET /unload` (POST answers 405 on this llama-swap build) ONLY when `/running` shows nothing but role
 models AND none of them was already loaded before `dh start` (recorded in var/run/state.json): `/unload` unloads
 everything, so a model somebody else was using is never touched. Finally it checks that nothing is left
-(`systemctl --user is-active` and `pgrep -f "dh.runtime serve"`).
+(`systemctl --user is-active` and `pgrep -af -- "-m dh.runtime serve"`, minus this process and its ancestors).
 
 `serve` = rounds loop (pacing `scheduler.round_interval_s`, start to start) + the web page (uvicorn on web.host:port,
 default 0.0.0.0:8711) + the log publisher loop, in one asyncio process. Startup recovery closes windows a crash left
 open. SIGTERM/SIGINT: the current round is cancelled, the web server and publisher stop, windows are closed, exit 0.
-A changed frozen file stops the rounds (health event `frozen_changed`), as dh/config.py requires.
+A changed frozen file PAUSES the rounds, as dh/config.py requires: health event `frozen_changed`, var/run/paused.json
+(`dh status` prints "PAUSED: frozen file changed (<path>)") and ONE ntfy push (default priority) to the owner. The
+web page and the publisher keep running. The rounds resume when the frozen files are back as they were at start
+(health event `frozen_restored`); to accept a deliberate change, `dh stop` and `dh start`.
 """
 from __future__ import annotations
 
@@ -61,6 +64,18 @@ def db_path(root: Path) -> Path:
 
 def state_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "state.json"
+
+
+def paused_path(root: Path) -> Path:
+    """Written while the rounds are paused because a frozen file changed (read by `dh status`)."""
+    return Path(root) / "var" / "run" / "paused.json"
+
+
+def frozen_changes(cfg, frozen: dict) -> list[str]:
+    return dhconfig.frozen_changes(cfg, frozen)
+
+
+PAUSE_CHECK_MAX_S = 60.0
 
 
 def round_pid_path(root: Path) -> Path:
@@ -214,13 +229,49 @@ def is_active(run=subprocess.run) -> bool:
         return False
 
 
-def serve_processes(run=subprocess.run) -> list[str]:
+def _ppid(pid: int, run=subprocess.run) -> int | None:
+    """Parent pid from /proc (Linux), else from `ps`; None when unknown."""
     try:
-        r = _sys(run, "pgrep", "-af", SERVE_PATTERN)
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])  # the command name may contain spaces and parentheses
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        r = run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def own_lineage(pid: int | None = None) -> set[int]:
+    """This process and all its ancestors: a shell or wrapper whose command line happens to contain the serve
+    pattern (`bash -c '... -m dh.runtime serve'`) is the caller, not an agent."""
+    out: set[int] = set()
+    p: int | None = pid or os.getpid()
+    while p and p not in out and len(out) < 128:
+        out.add(p)
+        p = _ppid(p)
+    return out
+
+
+def serve_processes(run=subprocess.run) -> list[str]:
+    """`pid cmdline` of every `python -m dh.runtime serve` process except this one and its ancestors. The pattern
+    goes after `--`: it starts with "-m", which pgrep would otherwise parse as options (exit 2, nothing found)."""
+    try:
+        r = _sys(run, "pgrep", "-af", "--", SERVE_PATTERN)
     except (OSError, subprocess.SubprocessError):
         return []
-    me = str(os.getpid())
-    return [ln for ln in r.stdout.splitlines() if ln.strip() and ln.split()[0] != me]
+    if r.returncode not in (0, 1):
+        log.warning("pgrep failed (%s): %s", r.returncode, (r.stderr or "").strip()[:200])
+        return []
+    mine = own_lineage()
+    out = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split(None, 1)
+        if not parts or not parts[0].isdigit() or int(parts[0]) in mine:
+            continue
+        out.append(ln.strip())
+    return out
 
 
 def release_models(cfg, before: list[str] | None, *, http_get=default_http_get, out=sys.stdout) -> bool:
@@ -331,6 +382,7 @@ def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=
               + (f" ({r.stderr.strip()})" if r.returncode and r.stderr.strip() else ""), file=out)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"systemctl stop failed: {e}", file=out)
+    paused_path(root).unlink(missing_ok=True)  # a pause marker left by a crash
     if db_path(root).is_file():  # serve closes them on SIGTERM; this covers a crash
         st = Store(db_path(root))
         try:
@@ -374,6 +426,9 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
             out["uptime_s"] = round((_now() - datetime.fromisoformat(stt["started_at"])).total_seconds())
     except (OSError, ValueError):
         out["started_at"] = None
+    out["paused"] = None
+    with contextlib.suppress(OSError, ValueError):
+        out["paused"] = json.loads(paused_path(root).read_text())
     out["llama_swap"] = {"url": swap_url(cfg), "running": llama_running(cfg, http_get), "roles": sorted(role_models(cfg))}
     out["ntfy_topic"] = notify.topic(root)
     if db_path(root).is_file():
@@ -533,6 +588,7 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
     db_path(root).parent.mkdir(parents=True, exist_ok=True)
+    paused_path(root).unlink(missing_ok=True)  # a pause belongs to the run that saw the change
     agent_lock = AgentLock(root)
     deadline = time.monotonic() + AGENT_LOCK_WAIT_S
     while not agent_lock.acquire():  # single writer: another serve, a foreground `dh round` or the CLI holds it
@@ -571,6 +627,35 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
     pub_store = Store(db_path(root))
     tasks.append(asyncio.create_task(publish.run_loop(pub_store, cfg, root, stop), name="publish"))
 
+    async def pause_for_frozen(e: FrozenChanged) -> None:
+        """Pause until the frozen files match the start digest again (or stop). One owner push per pause."""
+        paths = list(getattr(e, "paths", []) or []) or [str(e)]
+        store.add_health("runtime", "frozen_changed", str(e)[:500])
+        log.error("frozen layer changed, rounds PAUSED: %s", e)
+        paused_path(root).parent.mkdir(parents=True, exist_ok=True)
+        paused_path(root).write_text(json.dumps({"reason": "frozen file changed", "paths": paths,
+                                                 "since": _now().isoformat()}))
+        await notify.push_owner(cfg, root, "Deal Hunter PAUSED: frozen file changed",
+                                "The rounds are paused because a frozen file changed while the agent runs: "
+                                + ", ".join(paths) + ". Undo the change to resume, or `dh stop` and `dh start` to "
+                                "accept it.", store=store, priority="default")
+        check = min(PAUSE_CHECK_MAX_S, max(0.05, float(sc["round_interval_s"])))
+        while not stop.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), check)
+            if stop.is_set():
+                return
+            try:
+                still = frozen_changes(cfg, frozen) if frozen is not None else []
+            except Exception as err:  # noqa: BLE001 - cannot tell: stay paused
+                log.warning("frozen check failed: %s", err)
+                continue
+            if not still:
+                paused_path(root).unlink(missing_ok=True)
+                store.add_health("runtime", "frozen_restored", "frozen files are back as at start: rounds resume")
+                log.info("frozen files restored, rounds resume")
+                return
+
     async def rounds() -> None:
         while not stop.is_set():
             t0 = time.monotonic()
@@ -581,9 +666,8 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
             except asyncio.CancelledError:
                 raise
             except FrozenChanged as e:
-                store.add_health("runtime", "frozen_changed", str(e)[:500])
-                log.error("frozen layer changed, rounds stopped: %s", e)
-                return
+                await pause_for_frozen(e)
+                continue
             except Exception as e:  # noqa: BLE001 - a broken round is logged; the next one runs
                 log.exception("round failed")
                 store.add_health("runtime", "round_failed", f"{type(e).__name__}: {e}"[:500])
@@ -611,6 +695,7 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
                 await ctx.llm.aclose()
         pub_store.close()
         store.close()
+        paused_path(root).unlink(missing_ok=True)
         agent_lock.release()
     return 0
 

@@ -33,6 +33,11 @@ fiscal_cost_per_b2c_sale_pln: 0
 #   too_cheap + new account                -4.5+1.4+2.6=-0.5 -> 37.8% (> 30%)
 #   too_cheap + 0 ratings                  -4.5+1.4+2.4=-0.7 -> 33.2% (> 20%)
 #   extreme (< 35% of median) + any one weak signal: -4.5+1.4+2.5+(>=2.0) >= 1.4 -> >= 80% (> 50%)
+# contact_in_text (final review I3, controller ruling: a bare phone number or e-mail is a score feature, not a hard
+# exclude; this frozen-file change is authorised by that ruling). Weight 1.2:
+#   normal listing with a phone            -4.5+1.2 = -3.3          -> 3.6%  (< 5%: can still be tier 1)
+#   phone + too_cheap (established seller) -4.5+1.4+1.2 = -1.9      -> 13.0% (>= 5%: never "high" confidence)
+#   phone + new account + too cheap        -4.5+1.4+2.6+1.2 = 0.7   -> 66.8% (> 50%)
 risk:
   new_account_days: 30
   z_threshold: -2.5
@@ -49,3 +54,4 @@ risk:
     origin_cn_hk: 2.0      # ships from CN/HK, high-end RTX key (see risk._CN_HK_MODELS)
     no_photos_flagship: 2.0  # no photos at all, 4090/5090 family key
     scam_kw: 0.8           # per scam_kw playbook hit, capped at scam_kw_max_hits
+    contact_in_text: 1.2   # a phone number or e-mail in the text (or redacted by the adapter)

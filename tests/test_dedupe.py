@@ -68,3 +68,26 @@ def test_cross_platform_city_negative_cases(tmp_path):
     far, _, _ = make_deal(st, price="2600", seller="h4", sid="4", source="marktplaats")  # price +30%
     _city(st, far, "Krak\u00f3w")
     assert dedupe.is_duplicate(st, far) is False
+
+
+def _title(st, d, title):
+    st.conn.execute("update listings set title=? where id=?", (title, d.listing_ref))
+    st.conn.commit()
+
+
+def test_cross_platform_city_match_also_needs_similar_titles(tmp_path):
+    """Final review minor: two different 4090s for sale in one big city are not one item. A city match counts only
+    when the titles are similar too (rapidfuzz token_set_ratio >= 85); the same seller hash still needs no title."""
+    st = Store(tmp_path / "t.db")
+    a, _, _ = make_deal(st, price="2000", seller="h1", sid="1")
+    b, _, _ = make_deal(st, price="2040", seller="h2", sid="2", source="marktplaats", created=NOW + timedelta(days=1))
+    _city(st, a, "Warszawa")
+    _city(st, b, "warszawa")
+    _title(st, a, "Gigabyte RTX 4090 Gaming OC 24GB")
+    _title(st, b, "MSI GeForce RTX 4090 Suprim Liquid X")
+    assert dedupe.is_duplicate(st, b) is False
+    _title(st, b, "RTX 4090 Gaming OC 24GB Gigabyte, stan idealny")  # the same card relisted, words reordered
+    assert dedupe.is_duplicate(st, b) is True
+    c, _, _ = make_deal(st, price="2000", seller="h1", sid="3", source="kleinanzeigen")
+    _title(st, c, "Komplett anderer Titel")
+    assert dedupe.is_duplicate(st, c) is True  # same seller hash: the title does not matter

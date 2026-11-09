@@ -214,3 +214,173 @@ def test_context_checks_llama_swap_for_foreign_models(tmp_path, monkeypatch):
     ctx = runtime.build_context(cfg(), tmp_path, st, fetcher=None)
     assert asyncio.run(ctx.llm_check()) == ["qwen3.6-35b-a3b"]
     asyncio.run(ctx.llm.aclose())
+
+
+# ------------------------------------------------------------------ final review I1: pgrep -af -- PATTERN
+
+
+FAKE_PGREP = r"""#!/usr/bin/env python3
+# Fake pgrep: parses options like procps (a pattern starting with '-' is an option unless it follows '--') and
+# prints the lines listed in $FAKE_PGREP_OUT, one "<pid> <cmdline>" per line.
+import os, sys
+args, pattern, opts_done = sys.argv[1:], None, False
+for a in args:
+    if not opts_done and a == "--":
+        opts_done = True
+    elif not opts_done and a.startswith("-"):
+        if any(c not in "af" for c in a[1:]):
+            sys.stderr.write(f"pgrep: invalid option -- '{a[1]}'\n")
+            sys.exit(2)
+    else:
+        pattern = a
+if pattern is None:
+    sys.exit(2)
+lines = [l for l in open(os.environ["FAKE_PGREP_OUT"]).read().splitlines() if pattern in l]
+print("\n".join(lines))
+sys.exit(0 if lines else 1)
+"""
+
+
+@pytest.fixture
+def fake_pgrep(tmp_path, monkeypatch):
+    """A fake `pgrep` FIRST on PATH (only pgrep: systemctl is never run for real from these tests)."""
+    import os
+    import stat
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir()
+    exe = bindir / "pgrep"
+    exe.write_text(FAKE_PGREP)
+    exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
+    out = tmp_path / "pgrep.out"
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_PGREP_OUT", str(out))
+
+    def lines(*extra):
+        me, parent = os.getpid(), os.getppid()
+        out.write_text("\n".join([f"{me} python -m pytest -k x -m dh.runtime serve",  # ourselves
+                                  f"{parent} bash -c 'sleep 1; python -m dh.runtime serve'",  # an ancestor
+                                  *extra]) + "\n")
+    lines()
+    return lines
+
+
+def pgrep_only(sysfake):
+    """subprocess.run stand-in: pgrep runs for real (the fake on PATH), everything else goes to the Sys fake."""
+    def run(cmd, **kw):
+        if cmd[0] == "pgrep":
+            return subprocess.run(cmd, **kw)
+        return sysfake(cmd, **kw)
+    return run
+
+
+def test_serve_processes_passes_the_pattern_after_double_dash_and_skips_itself(fake_pgrep):
+    """I1: `pgrep -af "-m dh.runtime serve"` read the pattern as options (exit 2), so no process was ever seen."""
+    assert runtime.serve_processes() == []  # only ourselves and our parent match
+    fake_pgrep("4242 /venv/bin/python -m dh.runtime serve")
+    assert runtime.serve_processes() == ["4242 /venv/bin/python -m dh.runtime serve"]
+
+
+def test_stop_and_status_see_a_leftover_serve_through_real_pgrep(tmp_path, fake_pgrep):
+    fake_pgrep("4242 /venv/bin/python -m dh.runtime serve")
+    out = io.StringIO()
+    rc = runtime.stop(cfg(), tmp_path, run=pgrep_only(Sys(active=False)), http_get=Swap([]), out=out)
+    assert rc == 1 and "STILL RUNNING" in out.getvalue() and "4242" in out.getvalue()
+    s = runtime.status(cfg(), tmp_path, run=pgrep_only(Sys(active=False)), http_get=Swap([]))
+    assert s["processes"] == ["4242 /venv/bin/python -m dh.runtime serve"]
+    fake_pgrep()
+    out = io.StringIO()
+    assert runtime.stop(cfg(), tmp_path, run=pgrep_only(Sys(active=False)), http_get=Swap([]), out=out) == 0
+    assert "nothing left running" in out.getvalue()
+
+
+def test_agent_running_sees_a_serve_outside_the_unit(tmp_path, fake_pgrep, monkeypatch):
+    from dh.improve import agent_running
+    monkeypatch.setattr(runtime, "is_active", lambda run=None: False)  # never ask the real systemd from a test
+    assert agent_running(tmp_path) is False
+    fake_pgrep("4242 /venv/bin/python -m dh.runtime serve")
+    assert agent_running(tmp_path) is True
+
+
+# ------------------------------------------------------------------ final review minor: frozen change pauses
+
+
+def test_frozen_change_pauses_rounds_shows_in_status_and_pushes_once(tmp_path, monkeypatch):
+    """A frozen file changed while running: the rounds pause (no round runs while it differs), `dh status` says
+    "PAUSED: frozen file changed (<path>)", the owner gets ONE ntfy push (default priority); when the file is back
+    the rounds resume."""
+    from dh.config import FrozenChanged
+    from dh.scheduler import RoundStats
+    calls, pushes, seen_status = [], [], []
+
+    async def fake_round(ctx):
+        calls.append(1)
+        if len(calls) == 1:
+            raise FrozenChanged("frozen files changed: config/economics.yaml", ["config/economics.yaml"])
+        ctx.stop.set()
+        return RoundStats(round_id=len(calls))
+
+    checks = {"n": 0}
+
+    def changes(cfg_, frozen):
+        checks["n"] += 1
+        if checks["n"] == 2:
+            seen_status.append(runtime.status(cfg(), tmp_path, run=Sys(active=True), http_get=Swap([])))
+            assert len(calls) == 1  # paused: no round while the file differs
+        return ["config/economics.yaml"] if checks["n"] < 4 else []
+
+    async def fake_push(cfg_, root, title, body, **kw):
+        pushes.append((title, body, kw))
+        return True
+
+    async def fake_publish(store, cfg_, root, stop):
+        await stop.wait()
+
+    async def fake_warm(cfg_, **kw):
+        return {}
+    monkeypatch.setattr(runtime, "warm_models", fake_warm)
+    monkeypatch.setattr(runtime.scheduler, "run_round", fake_round)
+    monkeypatch.setattr(runtime.publish, "run_loop", fake_publish)
+    monkeypatch.setattr(runtime, "frozen_changes", changes)
+    monkeypatch.setattr(runtime.notify, "push_owner", fake_push)
+    data = cfg().to_dict()
+    data["scheduler"] = {**data.get("scheduler", {}), "round_interval_s": 0}
+    c = config.Config(data, REPO)
+    rc = asyncio.run(runtime.serve_async(c, tmp_path, stop=asyncio.Event(), install_signals=False, web=False))
+    assert rc == 0 and len(calls) == 2 and checks["n"] >= 4
+    assert len(pushes) == 1
+    title, body, kw = pushes[0]
+    assert "PAUSED" in title and "config/economics.yaml" in body and kw.get("priority") == "default"
+    p = seen_status[0]["paused"]
+    assert p["paths"] == ["config/economics.yaml"] and "frozen file changed" in p["reason"]
+    assert not runtime.paused_path(tmp_path).exists()  # resumed: the pause marker is gone
+    st = Store(tmp_path / "var" / "dh.db")
+    kinds = [r["kind"] for r in st.conn.execute("select kind from health where source='runtime'")]
+    assert kinds.count("frozen_changed") == 1 and kinds.count("frozen_restored") == 1
+
+
+def test_status_line_for_a_paused_agent(tmp_path, monkeypatch, capsys):
+    from dh import cli
+    monkeypatch.setenv("DH_ROOT", str(tmp_path))
+    monkeypatch.setattr(runtime, "status", lambda c, r: {
+        "running": True, "unit": "deal-hunter", "state": "active", "pid": 1, "uptime_s": 60, "processes": [],
+        "paused": {"reason": "frozen file changed", "paths": ["config/economics.yaml", "dh/tiering.py"]},
+        "health": {}, "llama_swap": {}, "log_repo": {}})
+    monkeypatch.setattr(cli, "_ctx", lambda: (tmp_path, cfg()))
+    assert cli.main(["status"]) == 0
+    assert "PAUSED: frozen file changed (config/economics.yaml, dh/tiering.py)" in capsys.readouterr().out
+
+
+def test_push_owner_uses_the_shared_header_builder_with_default_priority(tmp_path):
+    import httpx
+    from dh import notify
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "notify.yaml").write_text(
+        "ntfy: {server: 'https://ntfy.test', topic: null, tier1_priority: urgent}\nemail_fallback: {enabled: false}\n")
+    seen = []
+
+    def h(req):
+        seen.append(dict(req.headers))
+        return httpx.Response(200)
+    ok = asyncio.run(notify.push_owner(config.load(tmp_path), tmp_path, "Deal Hunter PAUSED", "body",
+                                       priority="default", client=httpx.AsyncClient(transport=httpx.MockTransport(h))))
+    assert ok and seen[0]["priority"] == "default" and "actions" not in seen[0] and seen[0]["title"] == "Deal Hunter PAUSED"

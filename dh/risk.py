@@ -3,6 +3,12 @@
 The off-platform contact patterns and the hard-exclude rules are code (frozen behaviour); the soft scam
 keyword lists are playbook items (kind scam_kw, target risk); the logistic weights are in
 config/economics.yaml under `risk` (frozen).
+
+Final review I3 (controller ruling; this frozen-behaviour change is authorised by it): a bare phone number or
+e-mail address is NOT a hard exclude. On phone-first classifieds (Bazos, HardverApró, Sprzedajemy, Marktplaats)
+every seller writes one. It is the scam-score feature `contact_in_text` (weight `risk.weights.contact_in_text`).
+Hard excludes stay: WhatsApp / Telegram (also wa.me / t.me links), external links, PayPal Friends & Family,
+and "przelew na konto" from a new account. The payment line of the checklist depends on the platform.
 """
 from __future__ import annotations
 
@@ -20,7 +26,7 @@ from .playbook_io import load_items
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-# Off-platform contact cues (hard exclude). Matched on the title and description.
+# Contact data in the text (the `contact_in_text` score feature, not an exclude). Matched on the title and description.
 # A phone number needs phone-like formatting: a +CC / 00CC prefix, spaced or dashed 3-3-3 groups, or a bare
 # 9-digit run right after a "tel"/"telefon"/"zadzwon"/"kontakt"/"call" cue. A bare digit run (serial, part
 # number) does not match.
@@ -36,6 +42,15 @@ _TELEGRAM = re.compile(r"\btelegram\b|\bt\.me/", re.I)
 _URL = re.compile(r"https?://|\bwww\.", re.I)
 _PAYPAL_FF = re.compile(r"paypal.{0,30}(friends|family|freunde|znajomi|rodzin)|(friends|family|freunde|znajomi|rodzin).{0,30}paypal", re.I)
 _TRANSFER = re.compile(r"przelew\w*\s+na\s+konto")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b", re.I)
+
+# Payment advice per platform (I3 ruling). Platforms with a protected checkout: pay only through it (Allegro Lokalnie
+# and Kleinanzeigen only when the item is shipped: their protection is a delivery service; eBay always). Phone-first
+# classifieds, and a pickup where the protection does not apply: meet, test, pay only after testing.
+_PROTECTED = {"allegro_lokalnie": "Allegro Lokalnie with delivery", "kleinanzeigen": "Kleinanzeigen \"Sicher bezahlen\"",
+              "olx": "Przesyłka OLX", "allegro": "Allegro checkout"}
+_PROTECTED_SHIPPED_ONLY = {"allegro_lokalnie", "kleinanzeigen", "olx"}
+_PHONE_FIRST = ("bazos", "hardverapro", "sprzedajemy", "marktplaats")
 
 _GPU_ID = re.compile(r"^gpu:([a-z0-9-]+):")
 # Desktop GPU ids the CN/HK-origin rule and the missing-photo rule apply to (taxonomy ids, explicit on purpose).
@@ -92,19 +107,48 @@ def _price_z(listing: Listing, estimate: Any, price_pln: Decimal | None, sigma_f
 
 
 def _offplatform(text: str) -> list[str]:
+    """Hard-exclude cues: the seller moves the deal off the platform (messenger, link, PayPal F&F)."""
     out = []
-    for flag, rx in (("offplatform_phone", _PHONE), ("offplatform_whatsapp", _WHATSAPP),
-                     ("offplatform_telegram", _TELEGRAM), ("offplatform_url", _URL),
-                     ("offplatform_paypal_ff", _PAYPAL_FF)):
+    for flag, rx in (("offplatform_whatsapp", _WHATSAPP), ("offplatform_telegram", _TELEGRAM),
+                     ("offplatform_url", _URL), ("offplatform_paypal_ff", _PAYPAL_FF)):
         if rx.search(text):
             out.append(flag)
     return out
 
 
+def _contact(listing: Listing, ntext: str, text: str) -> bool:
+    """A phone number or e-mail address in the text, or one the adapter redacted before storage."""
+    return bool(_PHONE.search(ntext) or _EMAIL.search(text) or getattr(listing, "contact_in_text", False))
+
+
+def payment_mode(listing: Listing) -> tuple[str, str | None]:
+    """("protected", checkout name) or ("in_person", None) for the listing's platform."""
+    src = (listing.source or "").lower()
+    if src.startswith("ebay"):
+        return "protected", "eBay checkout"
+    if src.startswith(_PHONE_FIRST):
+        return "in_person", None
+    if src in _PROTECTED:
+        shipped = not listing.pickup_only and listing.ships is not False
+        if src in _PROTECTED_SHIPPED_ONLY and not shipped:
+            return "in_person", None
+        return "protected", _PROTECTED[src]
+    return "protected", None  # shops, feeds, unknown: their own checkout
+
+
 def _checklist(extraction: Extraction, listing: Listing, flags: list[str]) -> list[str]:
-    items = ["Pay only through the platform's protected checkout, also for an in-person pickup; never transfer outside it.",
-             "Never move the chat to WhatsApp, Telegram or e-mail, and never open links the seller sends."]
     cat = extraction.category or ""
+    mode, name = payment_mode(listing)
+    if mode == "protected":
+        where = f" ({name})" if name else ""
+        items = [f"Pay only through the platform's protected checkout{where}; never transfer money outside it.",
+                 "Never move the chat to WhatsApp, Telegram or e-mail, and never open links the seller sends."]
+    else:
+        tests = " (GPU-Z, VRAM test)" if cat.startswith("gpu") else " (see the checks below)"
+        items = [f"Meet in person and test before paying{tests}; pay cash or instant transfer only after testing; "
+                 "never pay in advance, and never for shipping alone.",
+                 "Calling the seller is normal on this platform, but never switch to WhatsApp or Telegram, never open "
+                 "links the seller sends and never share codes or card details."]
     if cat.startswith("gpu"):
         items += ["At pickup run GPU-Z and check the device ID matches the claimed model.",
                   "Run a VRAM test (for example OCCT or memtestG80) and a short load test.",
@@ -121,7 +165,11 @@ def _checklist(extraction: Extraction, listing: Listing, flags: list[str]) -> li
     if "too_cheap" in flags:
         items.append("The price is far below the market: assume a scam until a live video call proves the item.")
     if "new_account" in flags or "no_ratings" in flags:
-        items.append("Seller account is new or unrated: test the item before paying, and pay only through the platform's protected checkout.")
+        items.append("Seller account is new or unrated: test the item before paying, and pay only through the "
+                     "platform's protected checkout." if mode == "protected" else
+                     "Seller account is new or unrated: see the item working in person before any money changes hands.")
+    if "contact_in_text" in flags and mode == "protected":
+        items.append("The listing shows a phone number or e-mail: keep the conversation and the payment on the platform.")
     return items
 
 
@@ -154,8 +202,6 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
     if (extraction.for_parts or extraction.condition == "for_parts") and not cfg.rules.repair.enabled:
         hard.append("for_parts")
     hard += _offplatform(ntext)  # normalised: lowercase, no diacritics
-    if getattr(listing, "contact_in_text", False) and "offplatform_phone" not in hard:
-        hard.append("offplatform_phone")  # the adapter redacted the contact before storage
     if _TRANSFER.search(ntext) and new_account:
         hard.append("transfer_new_account")
     flags += hard
@@ -173,6 +219,9 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
     if new_account:
         feats["new_account"] = 1.0
         flags.append("new_account")
+    if _contact(listing, ntext, text):  # a phone or e-mail (or one the adapter redacted): a feature, not an exclude
+        feats["contact_in_text"] = 1.0
+        flags.append("contact_in_text")
     if listing.seller_ratings == 0:
         feats["no_ratings"] = 1.0
         flags.append("no_ratings")

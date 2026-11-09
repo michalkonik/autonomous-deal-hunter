@@ -13,6 +13,7 @@ from dh import config, ledger, scheduler
 from dh.bandit import Bandit
 from dh.models import Listing
 from dh.money import Fx
+from dh.playbook_io import load_items
 from dh.sources.base import Adapter, AdapterError, Query
 from dh.store import Store
 
@@ -90,13 +91,24 @@ class FakeAdapter(Adapter):
         return ok, (listing.price if price is None and ok else price)
 
 
+TRIAGE_OK = {"verdict": "ok", "p_scam": 0.02, "reasons": []}
+
+
 class FakeLLM:
-    def __init__(self, reply, senior=None):
-        self.reply, self.senior, self.calls = reply, senior, []
+    """`reply` for extraction, `senior` for the senior confirm pass, `triage` for the finalist triage (a schema with a
+    `verdict`). Triage calls are kept apart (`triage_calls`) so extraction-call counts stay as they were."""
+
+    def __init__(self, reply, senior=None, triage=TRIAGE_OK):
+        self.reply, self.senior, self.triage, self.calls, self.triage_calls = reply, senior, triage, [], []
 
     async def chat_json(self, role, system, user, schema, max_tokens=600):
-        self.calls.append((role, user))
         assert "<listing>" in user
+        if "verdict" in (schema.get("properties") or {}):
+            self.triage_calls.append((role, user, system))
+            if isinstance(self.triage, Exception):
+                raise self.triage
+            return dict(self.triage)
+        self.calls.append((role, user))
         return dict(self.senior if role == "senior" and self.senior is not None else self.reply)
 
 
@@ -162,7 +174,8 @@ async def test_round_pipeline_with_fakes(tmp_path):
     assert ad.searches == ["rtx 3060"]
     assert stats.listings_seen == 1 and stats.candidates == 1
     assert len(llm.calls) == 1 and llm.calls[0][0] == "worker"  # rules certainty 0.7 -> LLM; 0.8 < 0.85: no confirm
-    assert stats.llm_calls == 1
+    assert len(llm.triage_calls) == 1 and llm.triage_calls[0][0] == "senior"  # tier 2: the finalist triage
+    assert stats.llm_calls == 2 and stats.triage == {"keep": 1}
     assert stats.deals_by_tier == {2: 1}, stats.deals
     d = st.deals()[0]
     assert d.tier == 2 and d.key == KEY and d.confidence == "medium" and d.effort == "easy"
@@ -506,9 +519,10 @@ async def test_rules_only_evaluation_is_redone_when_the_llm_is_back(tmp_path):
 
 # ------------------------------------------------------------------------------------------------ review fix round 1
 
-def tier1_ctx(tmp_path, ad, llm=None, **kw):
-    """Comps for a verified tier-1 RTX 3060 at 6400 PLN (see test_tier1_push_and_screenshot_when_not_dry)."""
-    ctx = make_ctx(tmp_path, ad, llm, dry=False, **kw)
+def tier1_ctx(tmp_path, ad, llm="fake", **kw):
+    """Comps for a verified tier-1 RTX 3060 at 6400 PLN (see test_tier1_push_and_screenshot_when_not_dry). The LLM
+    defaults to a fake whose finalist triage says ok: without a triage there is no tier 1 (final review I4)."""
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060) if llm == "fake" else llm, dry=False, **kw)
     for i in range(14):
         ctx.store.add_comp(KEY, "used", "olx", Decimal("9000") + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
     return ctx
@@ -549,7 +563,7 @@ async def test_retier_updates_the_deal_and_pushes_once(tmp_path):
     """Important 1: valued with the LLM off -> tier 3; the LLM confirms the key next round -> the SAME deal row
     becomes tier 1, is pushed once; later rounds never push it again."""
     ad = FakeAdapter([listing("5", "RTX 3060 używana", "6400")])  # rules certainty 0.7
-    ctx = tier1_ctx(tmp_path, ad)
+    ctx = tier1_ctx(tmp_path, ad, llm=None)
     s1 = await scheduler.run_round(ctx)
     d1 = ctx.store.deals()
     assert [d.tier for d in d1] == [3] and ctx.pushes == [], s1.deals
@@ -962,3 +976,317 @@ async def test_mailbox_kleinanzeigen_listing_is_detailed_and_verified_by_the_rea
     real_detail_calls.clear()
     await scheduler.run_round(ctx2)
     assert real_detail_calls == [] and ctx2.store.deals()[0].verified_at is None
+
+
+# ------------------------------------------------------------------------------------------------ final review I2
+
+
+class _Nbp:
+    """NBP fake whose table for `today` is published only when `published` is set (a different rate)."""
+
+    def __init__(self, today):
+        self.today, self.published = today, False
+        self.old = {"USD": "3.70", "EUR": "4.25"}
+        self.new = {"USD": "3.80", "EUR": "4.40"}
+
+    async def __call__(self, url: str):
+        ccy = url.split("/rates/a/")[1].split("/")[0].upper()
+        day = url.split("/rates/a/")[1].split("/")[1]
+        if day == self.today.isoformat():
+            if not self.published:
+                return 404, "Not Found"
+            return 200, json.dumps({"rates": [{"mid": self.new.get(ccy, RATES[ccy])}]})
+        return 200, json.dumps({"rates": [{"mid": self.old.get(ccy, RATES[ccy])}]})
+
+
+async def test_verify_replays_the_rates_the_deal_was_valued_with(tmp_path):
+    """I2: valued before NBP published today's table (yesterday's rate served, not pinned); after the table appears,
+    `dh verify` must still recompute the same net from the evidence's recorded rates."""
+    from datetime import date
+
+    from dh import cards, verify
+    eur = listing("7", "Gigabyte RTX 3060 Gaming OC używana", "165")
+    eur.currency = "EUR"
+    ad = FakeAdapter([eur])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    nbp2 = _Nbp(date.today())
+    ctx.fx = Fx(ctx.store, http=nbp2)
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    ev = json.loads(d.evidence_json)
+    assert json.loads(d.evidence_json)["net_inputs"]["buy_ccy"] == "EUR"
+    got = {(r["currency"], r["day"]): (r["rate"], r["effective_date"]) for r in ev["fx_rates"]}
+    t = date.today()
+    assert got[("EUR", t.isoformat())] == ("4.25", (t - timedelta(days=1)).isoformat())
+    assert got[("USD", t.isoformat())][0] == "3.70"
+    assert ev["fx_usd"] == {"rate": "3.70", "date": (t - timedelta(days=1)).isoformat()}
+    md, data = cards.from_deal(d)
+    assert "3.70 PLN per USD" in md and data["fx_usd"]["rate"] == "3.70"
+
+    nbp2.published = True  # NBP publishes today's table: live rates move
+    fresh = Fx(ctx.store, http=nbp2)
+    assert await fresh.rate("EUR", t) == Decimal("4.40")
+    res = await verify.verify_deal(ctx.store, d.id, ctx.cfg, fresh, None, {ad.name: ad}, ctx.fetcher)
+    assert res.ok, res.diffs
+    assert res.net_now_cons_pln == d.cons_net_pln
+
+
+def test_round_today_is_the_local_date_like_fx(tmp_path, monkeypatch):
+    """Minor: Fx pins by the LOCAL date (date.today()); the round's `today` must be the same local date, not UTC."""
+    import time as _time
+    monkeypatch.setenv("TZ", "Europe/Warsaw")
+    _time.tzset()
+    try:
+        ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+        ctx.now = lambda: datetime(2026, 10, 29, 23, 30, tzinfo=timezone.utc)  # 00:30 on the 30th in Warsaw
+        from datetime import date
+        assert scheduler._Round(ctx).today == date(2026, 10, 30)
+    finally:
+        monkeypatch.delenv("TZ")
+        _time.tzset()
+
+
+# ------------------------------------------------------------------------------------------------ final review I4
+
+
+async def test_finalist_triage_keep_demote_exclude(tmp_path):
+    """I4b: a tier <= 2 candidate is reviewed by the senior model (prompt.triage, listing in <listing>) BEFORE the live
+    re-check and the push: ok keeps the tier, suspicious caps it at 3, scam is a hard exclude with reason triage."""
+    for verdict, want in (("ok", 1), ("suspicious", 3), ("scam", None)):
+        ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+        llm = FakeLLM(LLM_3060, triage={"verdict": verdict, "p_scam": 0.4, "reasons": ["price far below market"]})
+        ctx = tier1_ctx(tmp_path / verdict, ad, llm)
+        st = await scheduler.run_round(ctx)
+        assert len(llm.triage_calls) == 1
+        role, user, system = llm.triage_calls[0]
+        assert role == "senior" and user.startswith("<listing>") and "RTX 3060 12GB" in user
+        assert system == next(i for i in load_items(REPO) if i["id"] == "prompt.triage")["value"]
+        deals = ctx.store.deals()
+        if want is None:
+            assert deals == [] and st.dropped.get("triage_exclude") == 1 and ctx.pushes == []
+            assert ad.alive_calls == 0  # excluded BEFORE the live re-check
+            continue
+        [d] = deals
+        assert d.tier == want, (verdict, d.tier, d.reasons)
+        assert len(ctx.pushes) == (1 if want == 1 else 0)
+        ev = json.loads(d.evidence_json)
+        assert ev["triage"]["verdict"] == {"ok": "keep", "suspicious": "demote"}[verdict]
+        from dh import cards
+        md, data = cards.from_deal(d)
+        assert "Triage" in md and data["triage"]["verdict"] == ev["triage"]["verdict"]
+        if want == 3:
+            assert any("triage" in r for r in d.reasons) and "price far below market" in md
+
+
+async def test_triage_unavailable_caps_confidence_at_medium(tmp_path):
+    """I4b: no triage (LLM error, no LLM) -> the tier stands but confidence is at most medium: never a tier-1 push."""
+    from dh.llm import LLMError
+    for name, llm in (("error", FakeLLM(LLM_3060, triage=LLMError("down"))), ("malformed", FakeLLM(LLM_3060, triage={"x": 1})),
+                      ("nollm", None)):
+        ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+        ctx = make_ctx(tmp_path / name, ad, llm, dry=False)
+        for i in range(14):
+            ctx.store.add_comp(KEY, "used", "olx", Decimal("9000") + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
+        await scheduler.run_round(ctx)
+        [d] = ctx.store.deals()
+        assert d.tier == 2 and d.confidence == "medium" and ctx.pushes == [], (name, d.tier, d.confidence)
+        assert json.loads(d.evidence_json)["triage"]["verdict"] == "unavailable"
+
+
+async def test_triage_result_is_reused_for_the_same_title_and_price(tmp_path):
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+    llm = FakeLLM(LLM_3060)
+    ctx = tier1_ctx(tmp_path, ad, llm, reeval_hours=0)
+    await scheduler.run_round(ctx)
+    await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 1
+
+
+def _cadence_items(minutes):
+    from dh.improve.playbook import Item, Playbook
+    q = [{"id": "q.rtx3060", "kind": "query", "target": "all", "value": "rtx 3060", "sentinel": False}]
+    if minutes is None:
+        return q
+    pb = Playbook.from_file(REPO)
+    pb = pb.apply(pb.make_delta("add", Item(f"cadence.allegro_lokalnie", "cadence", "allegro_lokalnie", minutes)))
+    return q + [i for i in pb.as_dicts() if i["kind"] == "cadence"]
+
+
+async def test_promoted_cadence_item_spaces_the_sources_searches(tmp_path):
+    """I4a: a cadence item (minutes between searches of a source) makes the plan skip the source's bandit arms until
+    that many minutes passed since its last searched round."""
+    t0 = datetime.now(timezone.utc)
+    clock = {"t": t0}
+    for minutes, expected in ((None, [1, 1, 1]), (30, [1, 0, 1])):
+        ad = FakeAdapter([])
+        ctx = make_ctx(tmp_path / str(minutes), ad, None, items=_cadence_items(minutes))
+        ctx.now = lambda: clock["t"]
+        ran = []
+        for dt in (0, 10, 31):
+            clock["t"] = t0 + timedelta(minutes=dt)
+            before = len(ad.searches)
+            st = await scheduler.run_round(ctx)
+            ran.append(len(ad.searches) - before)
+        assert ran == expected, (minutes, ran)
+        if minutes:
+            assert st.cadence == {"allegro_lokalnie": {"minutes": 30, "due": True, "cap": 10}}
+
+
+async def test_fast_cadence_raises_the_sources_per_round_cap(tmp_path):
+    """I4a: a cadence shorter than the round interval multiplies the source's per-round search cap."""
+    qs = [{"id": f"q{i}", "kind": "query", "target": "all", "value": f"rtx 30{i:02d}", "sentinel": False} for i in range(30)]
+    for minutes, want in ((None, 10), (5, 20)):  # round_interval_s 600 = 10 min: cadence 5 min -> x2
+        items = qs + ([] if minutes is None else [{"id": "cadence.al", "kind": "cadence", "target": "allegro_lokalnie",
+                                                   "value": minutes}])
+        ad = FakeAdapter([])
+        ctx = make_ctx(tmp_path / str(minutes), ad, None, items=items, budget=40, budget_max=40)
+        await scheduler.run_round(ctx)
+        assert len(ad.searches) == want, (minutes, len(ad.searches))
+
+
+# ------------------------------------------------------------------------------------------------ final review I5
+
+
+def _bulk_market(st, n=2000, gone_share=0.3):
+    """n saleable listings of KEY on olx (PLN) seen over the last 25 days, a share of them disappeared in the last
+    3 days after a 2-day life (so clears_at has probably-sold rows), each with two observations."""
+    import random as _r
+    ledger.migrate(st)
+    rnd = _r.Random(7)
+    now = NOW
+    rows, ex, obs = [], [], []
+    for i in range(n):
+        first = now - timedelta(days=rnd.uniform(3, 25))
+        gone = i < n * gone_share
+        last = now - timedelta(days=rnd.uniform(0, 2.5)) if gone else now - timedelta(minutes=rnd.uniform(1, 600))
+        price = Decimal(1300 + rnd.randint(0, 300))
+        dis = last if gone else None
+        appeared = (dis - timedelta(days=2)) if gone else None
+        rows.append((i + 1, "olx", f"b{i}", f"https://olx.pl/d/{i}", "RTX 3060 12GB", "", str(price), "PLN", "PL",
+                     "Krakow", f"s{i}", first.isoformat(), last.isoformat(), None if dis is None else dis.isoformat(),
+                     None if appeared is None else appeared.isoformat()))
+        ex.append((i + 1, KEY, "gpu", 0.95, "used", "[]", 0, 0, 0, "[]", "rules"))
+        obs.append((i + 1, str(price + 50), first.isoformat()))
+        obs.append((i + 1, str(price), (first + (last - first) / 2).isoformat()))
+    st.conn.executemany(
+        "insert into listings (id, source, source_id, url, title, description, price, currency, country, city, "
+        "seller_hash, first_seen_at, last_seen_at, disappeared_at, appeared_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows)
+    st.conn.executemany("insert into extractions (listing_id, key, category, certainty, condition, defects, box_only, "
+                        "for_parts, wanted_ad, bundle_items, method) values (?,?,?,?,?,?,?,?,?,?,?)", ex)
+    st.conn.executemany("insert into observations (listing_id, price, seen_at) values (?,?,?)", obs)
+    st.conn.commit()
+
+
+async def test_estimate_phase_is_fast_with_a_large_ledger(tmp_path):
+    """I5 benchmark: 2,000 listings of one key, 100 candidates. The ledger comps (clears_at, active asks) are
+    computed once per (key, condition) per round and the median asks come from one index per (key, currency); the
+    estimate phase stays within a few seconds (it was O(candidates x disappeared x listings) queries)."""
+    import time as _time
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    _bulk_market(ctx.store)
+    r = scheduler._Round(ctx)
+    await r._warm_rates()
+    lids = [row[0] for row in ctx.store.conn.execute(
+        "select id from listings where disappeared_at is null order by id limit 100")]
+    t0 = _time.monotonic()
+    limit = 5.0
+    ests = []
+    for lid in lids:
+        for ch in r.enabled_channels:
+            ests.append(r._estimate(KEY, "used", ch, lid))
+        assert _time.monotonic() - t0 < limit, f"estimate phase too slow: {len(ests)} estimates in {limit:.0f} s"
+    took = _time.monotonic() - t0
+    print(f"estimate phase: {len(ests)} estimates for {len(lids)} candidates in {took:.2f} s")
+    assert took < limit, took
+    e = next(x for x in ests if x is not None)
+    kinds = {c.kind for c in e.comps}
+    assert {"probably_sold", "active_ask"} <= kinds, kinds
+
+
+async def test_cached_ledger_rows_give_the_same_estimate_and_drop_the_candidate(tmp_path):
+    """I5: the per-round ledger cache must not change an estimate, and a candidate is never its own comparable."""
+    from dh import valuation
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    _bulk_market(ctx.store, n=120)
+    r = scheduler._Round(ctx)
+    lid = ctx.store.conn.execute("select id from listings where disappeared_at is null limit 1").fetchone()[0]
+    for ch in ("olx", "allegro"):
+        fresh = valuation.estimate(ctx.store, KEY, "used", ch, ctx.now(), params=r.params, channels=r.channels,
+                                   exclude_listing_ids=[lid])
+        cached = r._estimate(KEY, "used", ch, lid)
+        assert (fresh is None) == (cached is None)
+        if fresh is not None:
+            assert (fresh.p25_pln, fresh.median_pln, fresh.p75_pln, fresh.n_effective, len(fresh.comps)) == \
+                   (cached.p25_pln, cached.median_pln, cached.p75_pln, cached.n_effective, len(cached.comps))
+            assert f"https://olx.pl/d/{lid - 1}" not in {c.ref for c in cached.comps}
+
+
+def test_median_ask_index_matches_the_reference(tmp_path):
+    """I5: the indexed median ask (one load per key and currency) equals the per-call SQL computation."""
+    st = Store(tmp_path / "t.db")
+    _bulk_market(st, n=300)
+    cache: dict = {}
+    for h in (1, 10, 30, 70, 200, 500):
+        t = NOW - timedelta(hours=h)
+        assert ledger.median_ask(st, KEY, "PLN", t, ledger.ASK_WINDOW, cache=cache) == \
+               ledger._median_ask(st, KEY, "PLN", t, ledger.ASK_WINDOW)
+
+
+# ------------------------------------------------------------------------------------------------ minor: gone
+
+
+async def test_deal_whose_listing_is_gone_gets_status_gone(tmp_path):
+    """A listing that is gone at the live re-check, or confirmed gone after disappearing, turns its deal into
+    status "gone" (card rewritten so the publisher updates it); a deal found alive again is "new" again."""
+    ad = FakeAdapter([listing()])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    assert d.status == "new"
+    ad.alive_result = (False, None)
+    ad.listings = [listing(price="690")]  # a price change: re-evaluated, re-checked live -> gone
+    s = await scheduler.run_round(ctx)
+    assert s.dropped.get("gone") == 1
+    d = ctx.store.get_deal(d.id)
+    assert d.status == "gone"
+    md = next((tmp_path / "cards" / "deals").glob(f"*/*-{d.id}.md"))
+    assert "Status: gone" in md.read_text()
+    ad.alive_result = (True, None)
+    ad.listings = [listing(price="680")]
+    await scheduler.run_round(ctx)
+    assert ctx.store.get_deal(d.id).status == "new"
+
+
+async def test_disappeared_listing_confirmed_dead_marks_its_deal_gone(tmp_path):
+    ad = FakeAdapter([listing()])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    ad.alive_result = (False, None)
+    r = scheduler._Round(ctx)
+    await r._confirm_disappeared(ad, ad.name, [d.listing_ref])
+    assert ctx.store.get_deal(d.id).status == "gone"
+
+
+async def test_triage_cache_is_keyed_by_the_prompt_sha(tmp_path):
+    """A cached triage is reused only under the same prompt.triage; a promoted new prompt re-triages the listing."""
+    q = {"id": "q.rtx3060", "kind": "query", "target": "all", "value": "rtx 3060", "sentinel": False}
+
+    def items(text):
+        return [q, {"id": "prompt.triage", "kind": "prompt", "target": "senior", "value": text, "sentinel": False}]
+
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+    llm = FakeLLM(LLM_3060)
+    ctx = tier1_ctx(tmp_path, ad, llm, items=items("triage prompt A"), reeval_hours=0)
+    await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 1
+    await scheduler.run_round(ctx)  # same prompt: cached
+    assert len(llm.triage_calls) == 1
+    ctx.items = items("triage prompt B")  # a promoted prompt
+    st = await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 2 and llm.triage_calls[1][2] == "triage prompt B"
+    assert st.triage.get("cached", 0) == 0

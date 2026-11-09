@@ -25,8 +25,9 @@ single-platform bots. Deal Hunter's edge:
 - **PL JDG economics.** The net calculation covers margin-scheme VAT, import VAT and duty, the 2026 EU
   consignment and handling fees, platform fees, FX spread, returns reserve (2-year B2C warranty), a scam/DOA
   haircut and income tax. Every figure on a card shows its inputs. See [`docs/ECONOMICS.md`](docs/ECONOMICS.md).
-- **Scam screening.** Hard excludes (box only, for parts, off-platform payment), a logistic scam score, photo
-  reuse detection by perceptual hash, and a "how to buy safely" checklist on each card.
+- **Scam screening.** Hard excludes (box only, for parts, off-platform payment or messengers; a bare phone number
+  only raises the score), a logistic scam score, photo reuse detection by perceptual hash, and a "how to buy
+  safely" checklist on each card that fits the platform.
 - **Gated self-improvement.** The agent may change only its playbook, one typed change at a time, behind frozen
   gates, and it stops changing when it works. See [`docs/SELF-IMPROVEMENT.md`](docs/SELF-IMPROVEMENT.md) and the
   [status note](docs/ARCHITECTURE.md#what-is-and-is-not-wired-yet) on what is wired into the running agent.
@@ -98,8 +99,9 @@ stays off and the rest of the agent still works.
 2. **Create the private repo `deal-hunter`** for this code, if you have not already.
 3. **Alert mailbox (gated: Allegro.pl and OLX; also Kleinanzeigen and eBay alerts).** Create a dedicated mailbox,
    store its IMAP login as `bw-secret dh-mail#imap` (JSON), save narrow searches on the platforms with that
-   address, and enable the adapter. Full steps in [`docs/SOURCES.md`](docs/SOURCES.md#alert-mailbox-set-up).
-4. **eBay developer keys (gated: eBay DE/PL).** Store `bw-secret ebay#client_id` and `ebay#client_secret`. Apply
+   address, and enable the adapter (restart the agent after adding the secret). Full steps in [`docs/SOURCES.md`](docs/SOURCES.md#alert-mailbox-set-up).
+4. **eBay developer keys (gated: eBay DE/PL).** Store `bw-secret ebay#client_id` and `ebay#client_secret` (then
+   `dh stop` and `dh start`: the keys, like the IMAP login, are read once per run). Apply
    for the Marketplace Insights scope to get sold prices; without it eBay supplies active asks only.
 5. **Email fallback for pushes (optional).** `bw-secret dh-mail#smtp` (JSON). Without it, a failed ntfy push is
    queued and retried for up to 6 hours.

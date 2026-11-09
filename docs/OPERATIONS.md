@@ -38,7 +38,15 @@ watched hours, the last round, deals today by tier, tokens and cost today, block
 24 h), llama-swap and its loaded models, the ntfy topic and the log repo (clone path, last commit, remote).
 
 Read the deals with `dh deals [--tier N] [--limit N] [--json]`, `dh show <id>` (the card), `dh verify <id>`
-(recompute the net from the stored evidence and re-check that the listing is live) and `dh books`.
+(recompute the net from the stored evidence, at the FX rates the deal was valued with, and re-check that the
+listing is live) and `dh books`.
+
+A deal whose listing is gone, or that failed its re-verification (a different price), gets the status **gone**:
+at the round's live re-check, when a listing that disappeared from the search results is confirmed gone, or by
+`dh verify`. The web page, the card (front matter `status: gone` and a line at the top) and the log repo's
+`INDEX.md` (gone deals last) show it; the publisher pushes the rewritten card at its next cycle. A listing that
+comes back and is a deal again turns its deal back to `new`. A blocked or unreachable platform never makes a deal
+gone.
 
 The web page on port 8711 shows the same, with the Bought, Skipped and Sold buttons on each deal. Marks are the
 agent's main source of verified outcomes: use them.
@@ -70,7 +78,7 @@ Open `/health` or run `dh status`. The events that need action:
 | `alert_parse_empty` | A real alert mail parsed to zero offers and was left unread | The platform changed its mail format; see [SOURCES.md](SOURCES.md) |
 | `sweep_timeout` | A source's sweep was cut after `sweep_timeout_s` | Usually a slow site; repeated cuts mean the source is unhealthy |
 | `foreign_model` | Another model was loaded in llama-swap, so the round was rules-only | Free the model or remap the roles |
-| `frozen_changed` | A frozen file changed while running; the rounds stopped | `dh stop` then `dh start` |
+| `frozen_changed` | A frozen file changed while running; the rounds are paused (`dh status` says PAUSED, one push was sent) | Undo the change (the rounds resume, `frozen_restored`), or `dh stop` then `dh start` to accept it |
 | `ntfy_failed`, `email_failed`, `push_expired` | Push delivery problems | Check the topic and network; pushes retry for 6 h, then expire |
 | `no_clone`, `clone_failed`, `sync_error`, `bad_branch` | Log publishing problems | See [Log repo](#the-log-repo) |
 
@@ -93,7 +101,7 @@ impersonation, stealth browsers, challenge solving or proxy rotation: those are 
 ## The log repo
 
 Every `publish.interval_min` (30) minutes the publisher pulls `deal-hunter-log`, writes the deal cards (sanitised:
-no seller data), `INDEX.md` (starred and tier-1 deals first), and daily and weekly summaries, commits, and pushes
+no seller data), `INDEX.md` (starred and tier-1 deals first, gone deals last), and daily and weekly summaries, commits, and pushes
 to the `log` branch only. It also imports `outcome:` edits you made to a card's front matter in the GitHub app as
 marks. A git or network failure is a health event, never a crash; local state is kept and the next cycle pushes
 again.
@@ -170,7 +178,7 @@ If the process or the rig dies, the agent leaves no unsafe state:
 - **Alert mail.** Mails are marked read only after their listings are saved, so a crash re-delivers them (the
   save is idempotent).
 - **A stale unit.** `dh start` runs `systemctl --user reset-failed deal-hunter` first. If `dh status` shows
-  `processes` after a stop, `dh stop` again, then check `pgrep -af "dh.runtime serve"`.
+  `processes` after a stop, `dh stop` again, then check `pgrep -af -- "-m dh.runtime serve"` (the `--` matters: without it pgrep reads the pattern as options).
 - **A stale foreground-round lock** (`var/run/round.pid`) is ignored when its process is gone.
 - **A damaged database**: restore the latest backup (see above). The log repo keeps sanitised deal cards, not the
   ledger, so a backup is the only way to keep the price history.

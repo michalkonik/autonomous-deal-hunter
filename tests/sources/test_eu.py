@@ -357,7 +357,7 @@ def test_search_and_detail_redact_contact_and_flag_it():
     assert al.ADAPTER.parse_detail(fresh, "<div class='mlc-offer__description'>Sprzedam</div>").contact_in_text is False
 
 
-def test_redacted_listing_still_trips_risk_offplatform_flag():
+def test_redacted_listing_still_trips_the_risk_contact_feature():
     from dh import config, risk
     from dh.models import Extraction
     l = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[0]
@@ -365,4 +365,5 @@ def test_redacted_listing_still_trips_risk_offplatform_flag():
     assert "600" not in d.description and d.contact_in_text
     cfg = config.load(Path(__file__).resolve().parents[2])
     r = risk.assess(d, Extraction(key=None, category=None, certainty=0.9, condition="used"), None, cfg)
-    assert r.hard_exclude and "offplatform_phone" in r.flags
+    # final review I3 ruling: a (redacted) phone number is the score feature contact_in_text, not a hard exclude
+    assert not r.hard_exclude and "contact_in_text" in r.flags

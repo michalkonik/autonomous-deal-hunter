@@ -49,12 +49,14 @@ def test_hard_excludes():
     r = assess(e=ext(for_parts=True))
     assert r.hard_exclude and "for_parts" in r.flags
     assert assess(e=ext(condition="for_parts")).hard_exclude
-    for desc, flag in [("Zadzwon 600 123 456", "offplatform_phone"), ("tel +48 600-123-456", "offplatform_phone"),
-                       ("tel. 600123456", "offplatform_phone"), ("Tel 600123456", "offplatform_phone"),
-                       ("Tel: 600123456", "offplatform_phone"), ("Kontakt: 600123456", "offplatform_phone"),
-                       ("zadzwoń 600123456", "offplatform_phone"), ("ZADZWOŃ 600123456", "offplatform_phone"),
-                       ("Telefon: 600123456", "offplatform_phone"), ("Zadzwoń +48600123456", "offplatform_phone"), ("pisz +49 170 1234567", "offplatform_phone"),
-                       ("pisz na WhatsApp", "offplatform_whatsapp"), ("kontakt Telegram @x", "offplatform_telegram"),
+    # final review I3 (controller ruling): a bare phone number or e-mail is a scam-score feature, not a hard exclude
+    for desc in ("Zadzwon 600 123 456", "tel +48 600-123-456", "tel. 600123456", "Tel 600123456", "Tel: 600123456",
+                 "Kontakt: 600123456", "zadzwoń 600123456", "ZADZWOŃ 600123456", "Telefon: 600123456",
+                 "Zadzwoń +48600123456", "pisz +49 170 1234567", "mail: jan.kowalski@example.pl"):
+        r = assess(l=listing(description=desc))
+        assert not r.hard_exclude and "contact_in_text" in r.flags, (desc, r.flags)
+    for desc, flag in [("pisz na WhatsApp", "offplatform_whatsapp"), ("kontakt Telegram @x", "offplatform_telegram"),
+                       ("napisz wa.me/48600123456", "offplatform_whatsapp"), ("t.me/sprzedawca", "offplatform_telegram"),
                        ("wiecej zdjec https://foto.example/x", "offplatform_url"),
                        ("zdjecia na www.foto.example", "offplatform_url"),
                        ("PayPal Friends & Family", "offplatform_paypal_ff")]:
@@ -73,7 +75,7 @@ def test_hard_excludes():
     "Tel 06-30-123-4567", "+36 30 123 4567"])
 def test_de_cz_hu_mobile_formats_are_phone_numbers(desc):
     r = assess(l=listing(description=desc))
-    assert r.hard_exclude and "offplatform_phone" in r.flags, (desc, r.flags)
+    assert not r.hard_exclude and "contact_in_text" in r.flags, (desc, r.flags)
 
 
 @pytest.mark.parametrize("desc", [
@@ -81,14 +83,51 @@ def test_de_cz_hu_mobile_formats_are_phone_numbers(desc):
     "GTX 1080 8GB 256bit 2020", "ISBN 978-3-16-148410-0", "Nr 06301234567"])
 def test_serials_and_part_numbers_are_not_phone_numbers(desc):
     r = assess(l=listing(description=desc))
-    assert "offplatform_phone" not in r.flags, (desc, r.flags)
+    assert "contact_in_text" not in r.flags, (desc, r.flags)
 
 
-def test_redacted_contact_flag_counts_as_offplatform_phone():
+def test_redacted_contact_flag_is_the_contact_feature():
     clean = listing(description="Karta sprawna, [redacted]")
-    assert not assess(l=clean).hard_exclude
+    assert not assess(l=clean).hard_exclude and "contact_in_text" not in assess(l=clean).flags
     r = assess(l=replace(clean, contact_in_text=True))
-    assert r.hard_exclude and "offplatform_phone" in r.flags
+    assert not r.hard_exclude and "contact_in_text" in r.flags and r.p_scam > assess(l=clean).p_scam
+
+
+def test_contact_weight_pinned_by_the_ruling():
+    """I3 ruling: a normal listing with a phone stays p_scam < 0.05 (it can still be tier 1); phone + new account +
+    too cheap is > 0.5. Phone + too cheap from an established seller leaves "high" confidence (>= 0.05)."""
+    phone = "Odbior osobisty Krakow, tel 600 123 456"
+    assert CFG.economics.risk.weights.contact_in_text > 0
+    assert assess(l=listing(description=phone)).p_scam < 0.05
+    assert assess(l=listing(contact_in_text=True)).p_scam < 0.05
+    bad = assess(l=listing(description=phone, price=Decimal("3000"), seller_age_days=5))
+    assert {"contact_in_text", "too_cheap", "new_account"} <= set(bad.flags) and bad.p_scam > 0.5
+    assert not bad.hard_exclude
+    cheap = assess(l=listing(description=phone, price=Decimal("3000")))
+    assert 0.05 <= cheap.p_scam < 0.5
+    # the excludes that stay hard
+    for desc in ("pisz na whatsapp", "telegram @x", "https://x.example", "paypal friends and family"):
+        assert assess(l=listing(description=desc)).hard_exclude, desc
+    assert assess(l=listing(description="przelew na konto", seller_age_days=3)).hard_exclude
+
+
+@pytest.mark.parametrize("source,pickup,protected", [
+    ("allegro_lokalnie", False, True), ("kleinanzeigen", False, True), ("ebay_de", False, True),
+    ("ebay_pl", True, True), ("olx", False, True),
+    ("bazos_cz", False, False), ("hardverapro", False, False), ("sprzedajemy", False, False),
+    ("marktplaats", False, False),
+    ("allegro_lokalnie", True, False), ("kleinanzeigen", True, False)])
+def test_checklist_payment_line_depends_on_the_platform(source, pickup, protected):
+    """I3: platforms with a protected checkout -> pay only through it; phone-first classifieds (and a pickup where
+    the platform's protection does not apply) -> meet, test, pay only after testing, never in advance."""
+    c = assess(l=listing(source=source, pickup_only=pickup, description="tel 600 123 456")).checklist
+    text = " ".join(c).lower()
+    if protected:
+        assert "protected checkout" in text and "never pay in advance" not in text
+    else:
+        assert "protected checkout" not in text
+        assert "meet in person" in text and "test before paying" in text and "gpu-z" in text
+        assert "cash or instant transfer only after testing" in text and "never pay in advance" in text
 
 
 def test_for_parts_allowed_when_repair_enabled():

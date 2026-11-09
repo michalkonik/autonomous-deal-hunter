@@ -158,3 +158,79 @@ class Fx:
 
     async def pln_to_usd(self, amount_pln: Decimal, day: date) -> Decimal:
         return q2(amount_pln / await self.rate("USD", day))
+
+
+# ---------------------------------------------------------------- FX replay (final review I2)
+
+
+class _FxApi:
+    """rate / to_pln / pln_to_usd on top of `rate_with_date` (same rounding as Fx)."""
+
+    async def rate_with_date(self, ccy: str, day: date) -> tuple[Decimal, date]:  # pragma: no cover - abstract
+        raise NotImplementedError
+
+    async def rate(self, ccy: str, day: date) -> Decimal:
+        return (await self.rate_with_date(ccy, day))[0]
+
+    async def to_pln(self, amount: Decimal, ccy: str, day: date) -> Decimal:
+        return q2(Decimal(amount) * await self.rate(ccy, day))
+
+    async def pln_to_usd(self, amount_pln: Decimal, day: date) -> Decimal:
+        return q2(Decimal(amount_pln) / await self.rate("USD", day))
+
+
+async def _rate_with_date(fx, ccy: str, day: date) -> tuple[Decimal, date]:
+    if hasattr(fx, "rate_with_date"):
+        return await fx.rate_with_date(ccy, day)
+    return await fx.rate(ccy, day), day  # simple fakes (tests) only have rate()
+
+
+class RecordingFx(_FxApi):
+    """Wraps the round's FX and records every (currency, day) -> (rate, NBP effective date) it serves. The deal's
+    evidence stores them (`fx_rates`), so `dh verify` and the books replay the net with exactly these rates even
+    after NBP publishes today's table (an unpublished day is served yesterday's rate and never pinned)."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.served: dict[tuple[str, date], tuple[Decimal, date]] = {}
+
+    async def rate_with_date(self, ccy: str, day: date) -> tuple[Decimal, date]:
+        c = ccy.upper()
+        if c == "PLN":
+            return Decimal(1), day
+        got = await _rate_with_date(self._inner, c, day)
+        self.served[(c, day)] = (Decimal(got[0]), got[1])
+        return got
+
+    def as_json(self) -> list[dict]:
+        return [{"currency": c, "day": d.isoformat(), "rate": str(r), "effective_date": e.isoformat()}
+                for (c, d), (r, e) in sorted(self.served.items())]
+
+
+class FixedFx(_FxApi):
+    """Serves the rates a deal was valued with (evidence `fx_rates`). A pair not in the table goes to `fallback`
+    (the live Fx) when given, else raises FxError."""
+
+    def __init__(self, rates: dict[tuple[str, date], tuple[Decimal, date]], fallback=None):
+        self.rates, self.fallback = dict(rates), fallback
+
+    @classmethod
+    def from_evidence(cls, ev: dict, fallback=None) -> "FixedFx":
+        rates = {}
+        for r in (ev or {}).get("fx_rates") or []:
+            try:
+                rates[(str(r["currency"]).upper(), date.fromisoformat(r["day"]))] = (
+                    Decimal(str(r["rate"])), date.fromisoformat(r.get("effective_date") or r["day"]))
+            except (KeyError, ValueError, TypeError, ArithmeticError):
+                continue
+        return cls(rates, fallback)
+
+    async def rate_with_date(self, ccy: str, day: date) -> tuple[Decimal, date]:
+        c = ccy.upper()
+        if c == "PLN":
+            return Decimal(1), day
+        if (c, day) in self.rates:
+            return self.rates[(c, day)]
+        if self.fallback is None:
+            raise FxError(f"no recorded rate for {c} {day}")
+        return await _rate_with_date(self.fallback, c, day)

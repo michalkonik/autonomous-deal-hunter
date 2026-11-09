@@ -11,7 +11,7 @@
 <div class="tbl"><table><tr><th></th><th>Tier</th><th>Deal</th><th>Src</th><th>Ctry</th><th class="n">Cons. net USD</th><th class="n">Exp. net USD</th><th>Conf.</th><th>Mark</th></tr>
 {% for r in rows %}<tr>
 <td class="star">{% if r.d.star %}&#9733;{% endif %}</td><td>{{r.d.tier}}</td>
-<td><a href="/deal/{{r.d.id}}">{{r.d.key or "deal"}}</a><div class="mut">{{r.l["title"] if r.l else ""}}</div></td>
+<td><a href="/deal/{{r.d.id}}">{{r.d.key or "deal"}}</a>{% if r.d.status == "gone" %} <span class="bad">gone</span>{% endif %}<div class="mut">{{r.l["title"] if r.l else ""}}</div></td>
 <td>{{r.l["source"] if r.l else ""}}</td><td>{{(r.l["country"] if r.l else "") or ""}}</td>
 <td class="n">{{r.cons_usd}}</td><td class="n">{{r.exp_usd}}</td><td>{{r.d.confidence}}</td><td>{{r.mark or ""}}</td></tr>{% endfor %}
 </table></div>
