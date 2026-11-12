@@ -265,6 +265,13 @@ class Fetcher:
         """A block (403/429/challenge) seen outside `get`: same backoff and health bookkeeping."""
         self._register_block(domain, why)
 
+    def report_ok(self, domain: str) -> None:
+        """A good page load outside `get` (a paced screenshot): resets the block and soft-failure counts exactly as
+        a good response in `get` does. A running backoff is not shortened."""
+        d = self._dom(domain)
+        d.consecutive_blocks = 0
+        d.soft_failures = 0
+
     # --- the one place a request is made ------------------------------------
     async def _locked_request(self, domain: str, url: str, headers: dict | None, *, robots: bool = False) -> _Out:
         d = self._dom(domain)

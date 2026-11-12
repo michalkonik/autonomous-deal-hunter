@@ -434,8 +434,71 @@ def test_bw_secret_cached_per_process(monkeypatch):
     ("Karta od 3 999 zł do 2 899 zł", Decimal("2899")),
     ("Karta za 2 899 zł (było 3 999 zł)", Decimal("2899")),
     ("Karta (było 3 999 zł) teraz 2 899 zł", Decimal("2899")),
-    ("Monitor 1 299 zł, kod -10% do 100 zł", Decimal("100")),
+    ("Monitor 1 299 zł, kod -10% do 100 zł", Decimal("1299")),  # "do 100 zł" is the coupon's cap, not the price
     ("Karta z 3 999 zł do 2 899 zł", Decimal("2899")),
     ("Karta 2 899 zł", Decimal("2899"))])
 def test_rss_title_price_prefers_deal_price(title, expected):
     assert rss.title_price(title, "PLN")[0] == expected
+
+
+@pytest.mark.parametrize("title,expected", [
+    # the old-price words need a word boundary: "prize"/"Größe ze" endings, "canvas" are not "ze"/"was"
+    ("Grand prize 499 zł RTX 4070", Decimal("499")),
+    ("Canvas 199 zł", Decimal("199")),
+    ("Etui Größe 99 zł", Decimal("99")),
+    ("Karta ze 3 999 zł teraz 2 899 zł", Decimal("2899")),  # a real "ze" old price still loses
+    ("Karta was 3 999 zł now 2 899 zł", Decimal("2899")),
+    # coupon caps and discount amounts are never the price
+    ("Kupon -20% do 100 zł na RTX 4070 Super", None),
+    ("Kod rabatowy 15% do 300 zł na karty graficzne", None),
+    ("RTX 4070 Super 2 499 zł + kupon -10% do 200 zł", Decimal("2499")),
+    ("RTX 4070 za 2 499 zł, rabat 100 zł z kodem", Decimal("2499")),
+    ("Cashback 200 zł na RTX 5070", None),
+    ("15% off up to £50 on graphics cards", None),
+    ("Karta od 3 999 zł do 2 899 zł", Decimal("2899")),  # a plain "do" after a price range is the deal price
+])
+def test_rss_title_price_word_boundaries_and_coupons(title, expected):
+    r = rss.title_price(title, "GBP" if "£" in title else "PLN")
+    assert (r[0] if r else None) == expected, title
+
+
+def test_prefetch_resolves_ebay_keys_in_parallel_once_per_run(monkeypatch):
+    """Profiling: two sequential `bw-secret` calls (~4.8 s each with no item) blocked a round's event loop for
+    ~9.6 s. build_context now prefetches both refs in parallel threads; `enabled` then reads the cache."""
+    import threading
+    import time
+    calls, active, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    def slow(ref):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.3)
+        with lock:
+            active[0] -= 1
+        calls.append(ref)
+        return {"ebay#client_id": "cid", "ebay#client_secret": "sec"}[ref]
+    monkeypatch.setattr("dh.notify.bw_secret", slow)
+    t0 = time.monotonic()
+    ebay.prefetch_secrets()
+    assert time.monotonic() - t0 < 0.55 and peak[0] == 2  # both at once
+    assert sorted(calls) == ["ebay#client_id", "ebay#client_secret"]
+    assert ebay.EbayBrowse("EBAY_DE").enabled is True and ebay.EbayBrowse("EBAY_PL").enabled is True
+    ebay.prefetch_secrets()
+    assert len(calls) == 2  # cached: not asked again
+
+
+def test_build_context_prefetches_the_ebay_keys(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from dh import config, runtime
+    seen = []
+    monkeypatch.setattr(ebay, "prefetch_secrets", lambda *a, **k: seen.append(1))
+    repo = Path(__file__).resolve().parents[2]
+    st = Store(tmp_path / "t.db")
+    try:
+        runtime.build_context(config.load(repo), tmp_path, st, fetcher=None, no_llm=True)
+    finally:
+        st.close()
+    assert seen == [1]

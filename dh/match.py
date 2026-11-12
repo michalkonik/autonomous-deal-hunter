@@ -103,11 +103,18 @@ _NEGATED_DEFECT = re.compile(
     r"(?:not|isn't|isnt|never)\s+(?:broken|damaged|defective|faulty|dead)|"
     r"neni\s+(?:poskozen|vadn|rozbit)\w*|nem\s+(?:serult|elromlott)\w*|"
     r"nem\s+hibas\w*|hibatlan\w*|"
-    r"bez\s+(?:zavad|zavady|vad|vady|poskozeni|artefaktu)\w*|neposkozen\w*")
+    r"bez\s+(?:zavad|zavady|vad|vady|poskozeni|artefaktu)\w*|neposkozen\w*|"
+    # cracks: "not cracked", "no cracks", "bez pęknięć", "nie pęknięta", "nicht gebrochen", "není prasklá", "nem törött"
+    r"(?:not|isn't|isnt|never|no|zero|without)\s+(?:any\s+)?crack\w*|"
+    r"(?:bez|brak|nie\s+ma)\s+(?:zadnych\s+)?pekni\w*|nie\s+(?:jest\s+)?pekniet\w*|"
+    r"nicht\s+(?:\w+\s+)?gebrochen\w*|neni\s+praskl\w*|bez\s+praskl\w*|nem\s+(?:torott|repedt)\w*")
 
 # label -> pattern; any hit means for_parts
 _DEFECTS = {
-    "damaged": re.compile(r"uszkodzon|poskozen|porouchan|beschadigt|schaden|spalon|zalan|vypalen|kurzschluss"),
+    "damaged": re.compile(r"uszkodzon|poskozen|porouchan|beschadigt|schaden|spalon|zalan|vypalen|kurzschluss|"
+                          # cracked board: EN, PL (pęknięta/pęknięcie), DE (gebrochen/abgebrochen), CZ, HU
+                          r"(?<![a-z])cracked(?![a-z])|(?<![a-z])cracks?(?![a-z])|(?<![a-z])peknie\w*|"
+                          r"gebrochen|(?<![a-z])praskl\w*|(?<![a-z])torott|(?<![a-z])repedt"),
     "faulty": re.compile(r"defekt|defective|faulty|kaputt|hibas|nefunkcn|nefunguje|vadna|wadliw|niesprawn|"
                          r"do naprawy|broken|nem mukodik|nie dziala|not working|bastler|for repair|"
                          r"spares or repair|elromlott|(?<![a-z])dead(?![a-z])"),
@@ -119,6 +126,7 @@ _DEFECTS = {
     "stripped_die": re.compile(
         r"bez\s+(?:rdzenia|chipu|gpu|pamieci|jadra|cipu)(?![a-z])|tylko\s+pcb|sama\s+plytka|"
         r"(?<![a-z])no\s+(?:die|core|gpu(?:\s+chip)?|vram)(?![a-z])|pcb\s+only|missing\s+(?:gpu\s+)?die|"
+        r"(?<![a-z])without\s+(?:the\s+)?(?:gpu\s+)?(?:die|core|chip)(?![a-z])|"
         r"ohne\s+(?:gpu-?\s?)?chip|nur\s+platine|chip\s+nelkul"),
 }
 
@@ -130,7 +138,11 @@ _USED = re.compile(r"uzywan\w*|(?<![a-z])used(?![a-z])|gebraucht|pouzit\w*|haszn
 # ---------------------------------------------------------------------------------------- bundles / context
 
 _CPU_WORDS = (r"ryzen|core[\s-]*i[3579]|(?<![a-z])i[3579][\s-]\d{4,5}|threadripper|xeon|epyc|athlon|celeron|"
-              r"pentium|(?<![a-z])cpu(?![a-z])|procesor|processor")
+              r"pentium|(?<![a-z])cpu(?![a-z])|procesor|processor|"
+              # live round 29 Oct: "Intel i7", "Core Ultra 9 275HX", "Ultra9", "R7 9800X3D", "9800X3D", "13980HX"
+              r"(?<![a-z])(?:intel|amd)\s+(?:core\s+)?i[3579](?![a-z0-9])|core[\s-]*ultra|"
+              r"(?<![a-z])ultra[\s-]?[579](?:\s+\d{3}[a-z]*)?(?![a-z0-9])|(?<![a-z0-9])r[3579][\s-]\d{4}|"
+              r"(?<![a-z0-9])\d{4,5}x3d(?![a-z])|(?<![a-z0-9])\d{3,5}hx(?![a-z0-9])|(?<![a-z0-9])\d{4}hs(?![a-z0-9])")
 _CPU = re.compile(_CPU_WORDS)
 _SYSTEM_CORE = (r"(?<!do\s)(?<!for\s)(?<!fur\s)(?<!pro\s)(?<!na\s)(?<![a-z])pc(?![a-z0-9])|"
                 r"(?<![a-z])(?:komputer|computer|desktop|rechner|pocitac|szamitogep|workstation|barebone|"
@@ -149,6 +161,9 @@ _MULTI = re.compile(r"(?<![a-z0-9])[2-9]\s*(?:x|szt\.?|pcs|stk|stuck)\s*(?:nvidi
                     r"two|three|four)\s+(?:(?:nvidia|geforce|amd|radeon|intel)\s+)*(?:rtx|rx|arc|gtx)(?![a-z])|"
                     r"(?<![a-z0-9])[x*]\s*[2-9](?![a-z0-9])|(?<![a-z0-9])[2-9]\s*(?:szt\.?|pcs|stk)(?![a-z])")
 _RAM_EVIDENCE = re.compile(r"(?<![a-z])ddr[\s-]?[345](?![0-9])|\d\s*(?:gb|go)\s*ram|(?<![a-z])ram\s*\d")
+# a GPU title naming a drive size in TB or a screen size is a laptop or a PC, never a card alone
+_SYSTEM_SPECS = re.compile(r"(?<![a-z0-9.,])\d{1,2}(?:[.,]\d{1,2})?\s*tb(?![a-z])|(?<![a-z])(?:inch|zoll|cali)(?![a-z])|"
+                           r"(?<![0-9.,])1[0-8](?:[.,]\d)?\s*(?:\"|”|''|\-?inch|\-?zoll|\-?cal)")
 _SSD_EVIDENCE = re.compile(r"(?<![a-z])(?:ssd|nvme)(?![a-z])")
 
 _MOBILE_MARKER = re.compile(
@@ -157,7 +172,7 @@ _MOBILE_MARKER = re.compile(
     r"(?<![a-z])(?:zephyrus|helios|triton|razer blade|raider|katana|cyborg|victus|loq|nitro 5|"
     r"strix[\s-]*(?:g\d{2,3}|scar\w*|flow)|rog[\s-]*(?:flow|scar)\w*|scar[\s-]*\d*|"
     r"legion[\s-]*(?:slim|pro|\d)\w*|omen[\s-]*(?:1[5-7]|max|transcend)(?![\da-z])|omen by hp|"
-    r"predator[\s-]*(?:helios|triton|neo)|alienware[\s-]*[mx]\d+|"
+    r"predator[\s-]*(?:helios|triton|neo|1[4-8](?![\da-z]))|alienware[\s-]*[mx]\d+|"
     r"msi[\s-]*(?:titan|vector|sword|stealth|raider|katana|cyborg|pulse|crosshair)|titan[\s-]*gt\d*|"
     r"tuf[\s-]*(?:gaming[\s-]*)?[fa]\d{2}|tuf dash|aorus[\s-]*1[3-8](?!\d))(?![a-z])")
 # (a screen size alone is not laptop context: it needs one of the words/series above)
@@ -200,7 +215,9 @@ _MERCH = re.compile(
 _ACCESSORY = re.compile(
     r"(?<![a-z])(?:waterblock|water[\s-]?block|wasserkuhl\w*|waku|wakue|backplate|kabel\w*|cable\w*|przewod\w*|"
     r"adapter\w*|cooler\w*|chlodzeni\w*|radiator\w*|uchwyt\w*|podstawk\w*|holder|bracket|stojak\w*|"
-    r"zasilacz\w*|psu|netzteil\w*|manual|riser\w*)(?![a-z])")
+    r"zasilacz\w*|psu|netzteil\w*|manual|riser\w*|heatsink\w*|kuhlkorper\w*|chladic\w*|hutobord\w*|"
+    # water blocks in PL/CZ/HU/DE/NL (live round 29 Oct: "Blok wodny Alphacool RTX 4070 Ti" became a 380 PLN "card")
+    r"blok|blokk|bloku|wasserblock\w*|kuhlblock\w*|vizhuto\w*|waterblok\w*|waterkoel\w*)(?![a-z])")
 _INCLUSION = {"+", "&", "z", "ze", "with", "w", "mit", "inkl", "incl", "plus", "oraz", "i", "a", "und", "and", "s",
               "es", "ses"}
 
@@ -210,17 +227,30 @@ def _accessory_after(after: str) -> bool:
     ("RTX 4090 Waterblock EK"). Further away, or after + / z / with / mit ..., it is an included extra."""
     if after.lstrip()[:1] in (",", ";", "(", "/", "+"):
         return False
-    for tok in after.split()[:2]:
+    toks = after.split()
+    for i, tok in enumerate(toks[:2]):
         bare = tok.strip(",;:.()")
         if tok.startswith("+") or bare in _INCLUSION:
             return False
         if bare != "manual" and _ACCESSORY.search(" " + bare + " "):
-            return not (bare.startswith("cooler") and after.split()[after.split().index(tok) + 1: after.split().index(tok) + 2] == ["master"])
+            return not (bare.startswith("cooler") and toks[i + 1: i + 2] == ["master"])  # "Cooler Master" brand
     return False
 
 
 def _accessory_blocks(t: str, start: int, end: int) -> bool:
     return _ACCESSORY.search(t[:start]) is not None or _accessory_after(t[end:])
+
+
+def _storage_accessory(t: str, ram: bool) -> bool:
+    """RAM / SSD: an accessory noun before the first module or drive token, or right after ANY of those tokens or
+    the capacity ("SSD NVMe 1TB radiator", "DDR4 16GB heatsink"): a window after the first token alone ends
+    before the capacity and lets the accessory through."""
+    anchors = list((_DDR if ram else _SSD_SIGNAL).finditer(t))
+    if not anchors:
+        return False
+    if _ACCESSORY.search(t[: anchors[0].start()]):
+        return True
+    return any(_accessory_after(t[m.end():]) for m in [*anchors, *_CAP.finditer(t)])
 
 
 # "for <chip>": an accessory made for the card, or a swap ("na RTX 4090")
@@ -644,6 +674,8 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
         gpu_bundle.append("ram")
     if _SSD_EVIDENCE.search(t) and re.search(r"\d\s*(?:tb|gb)", t):
         gpu_bundle.append("ssd")
+    if _SYSTEM_SPECS.search(t) and "system" not in gpu_bundle:
+        gpu_bundle.append("system")
     if _MULTI.search(t):
         gpu_bundle.append("multiple")
     other_bundle: list[str] = []  # why a RAM/SSD title was rejected as a bundle
@@ -661,10 +693,8 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
         result = _gpu(t, gpu_bundle, laptop_ctx)
         if result is None:
             result = _ram(t, other_bundle) or _ssd(t, other_bundle)
-            if result and result[0]:
-                anchor = _DDR.search(t) if result[1].startswith("ram") else _SSD_SIGNAL.search(t)
-                if anchor and _accessory_blocks(t, anchor.start(), anchor.end()):
-                    result = None
+            if result and result[0] and _storage_accessory(t, result[1].startswith("ram")):
+                result = None
     key, cat, cert = result if result and result[0] else (None, None, 0.0)
     items = gpu_bundle if (key and cat in taxonomy.GPU_CATEGORIES) else other_bundle
     return Extraction(

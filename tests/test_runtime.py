@@ -88,7 +88,7 @@ def test_start_launches_systemd_run_unit(tmp_path):
                        python="/venv/bin/python", wait_s=0)
     assert rc == 0, out.getvalue()
     sr = next(c for c in sysrun.calls if c[0] == "systemd-run")
-    assert sr[:3] == ["systemd-run", "--user", "--unit=deal-hunter"]
+    assert sr[:3] == ["systemd-run", "--user", "--unit=deal-hunter-test"]  # conftest: never the live unit's name
     assert "--property=KillMode=control-group" in sr and sr[-4:] == ["/venv/bin/python", "-m", "dh.runtime", "serve"]
     st = json.loads((tmp_path / "var" / "run" / "state.json").read_text())
     assert st["models_before"] == [ROLES[0]]
@@ -107,7 +107,7 @@ def test_stop_unloads_only_own_role_models_and_checks_processes(tmp_path):
     sysrun, swap, out = Sys(active=True), Swap(ROLES), io.StringIO()
     rc = runtime.stop(cfg(), tmp_path, run=sysrun, http_get=swap, out=out)
     assert rc == 0, out.getvalue()
-    assert ["systemctl", "--user", "stop", "deal-hunter"] in sysrun.calls
+    assert ["systemctl", "--user", "stop", "deal-hunter-test"] in sysrun.calls
     assert any(u.endswith("/unload") for u in swap.gets) and swap.running == []
     assert "nothing left running" in out.getvalue()
     st = Store(tmp_path / "var" / "dh.db")
@@ -384,3 +384,173 @@ def test_push_owner_uses_the_shared_header_builder_with_default_priority(tmp_pat
     ok = asyncio.run(notify.push_owner(config.load(tmp_path), tmp_path, "Deal Hunter PAUSED", "body",
                                        priority="default", client=httpx.AsyncClient(transport=httpx.MockTransport(h))))
     assert ok and seen[0]["priority"] == "default" and "actions" not in seen[0] and seen[0]["title"] == "Deal Hunter PAUSED"
+
+
+# ------------------------------------------------------------------ unit name of a second checkout (dev clone)
+
+
+def _root_with_runtime_yaml(tmp_path, body: str | None, local: bool = True) -> Path:
+    root = tmp_path / "checkout"
+    (root / "config" / "local").mkdir(parents=True)
+    if body is not None:
+        (root / "config" / ("local" if local else "") / "runtime.yaml").write_text(body)
+    return root
+
+
+def test_unit_name_default_config_and_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("DH_UNIT_NAME")  # conftest sets a dummy name for every test
+    plain = _root_with_runtime_yaml(tmp_path / "a", None)
+    assert runtime.unit_name(plain) == "deal-hunter"
+    dev = _root_with_runtime_yaml(tmp_path / "b", "unit_name: deal-hunter-dev\n")
+    assert runtime.unit_name(dev) == "deal-hunter-dev"
+    shipped = _root_with_runtime_yaml(tmp_path / "c", "unit_name: dh-other.service\n", local=False)
+    assert runtime.unit_name(shipped) == "dh-other"  # a ".service" suffix is accepted and dropped
+    monkeypatch.setenv("DH_ROOT", str(dev))
+    assert runtime.unit_name() == "deal-hunter-dev"  # the project root is DH_ROOT by default
+    monkeypatch.setenv("DH_UNIT_NAME", "dh-env")
+    assert runtime.unit_name(dev) == "dh-env"  # the environment wins over the config
+    for bad in ("deal hunter", "-x", "a;rm", "../x"):
+        monkeypatch.setenv("DH_UNIT_NAME", bad)
+        with pytest.raises(ValueError, match="invalid unit name"):
+            runtime.unit_name(dev)
+
+
+def test_is_active_asks_only_about_this_checkouts_unit(monkeypatch):
+    """The owner's unit `deal-hunter` is active; a dev clone named `deal-hunter-dev` is not refused because of it."""
+    asked = []
+
+    def run(cmd, **kw):
+        asked.append(cmd[-1])
+        on = cmd[-1] == "deal-hunter"
+        return subprocess.CompletedProcess(cmd, 0 if on else 3, "active\n" if on else "inactive\n", "")
+    monkeypatch.delenv("DH_UNIT_NAME")  # the shipped default, as on the owner's checkout
+    assert runtime.is_active(run) is True
+    monkeypatch.setenv("DH_UNIT_NAME", "deal-hunter-dev")
+    assert runtime.is_active(run) is False
+    assert asked == ["deal-hunter", "deal-hunter-dev"]
+
+
+def test_start_stop_and_status_use_the_configured_unit(tmp_path, monkeypatch):
+    monkeypatch.setenv("DH_UNIT_NAME", "deal-hunter-dev")
+    sysrun, swap, out = Sys(), Swap([ROLES[0]]), io.StringIO()
+    assert runtime.start(cfg(), tmp_path, run=sysrun, http_get=swap, meminfo=meminfo(tmp_path, 30), out=out,
+                         python="/venv/bin/python", wait_s=0) == 0
+    sr = next(c for c in sysrun.calls if c[0] == "systemd-run")
+    assert sr[:3] == ["systemd-run", "--user", "--unit=deal-hunter-dev"]
+    assert "--setenv=DH_UNIT_NAME=deal-hunter-dev" in sr  # serve and its children see the same name
+    assert ["systemctl", "--user", "reset-failed", "deal-hunter-dev"] in sysrun.calls
+    assert runtime.status(cfg(), tmp_path, run=sysrun, http_get=swap)["unit"] == "deal-hunter-dev"
+    runtime.stop(cfg(), tmp_path, run=sysrun, http_get=swap, out=out)
+    assert ["systemctl", "--user", "stop", "deal-hunter-dev"] in sysrun.calls
+    named = [c for c in sysrun.calls if c[0] == "systemctl" and c[2] != "show"]
+    assert named and all(c[-1] == "deal-hunter-dev" for c in named), named
+    assert not any("deal-hunter" == c[-1] for c in sysrun.calls)
+
+
+def test_serve_processes_ignores_another_checkouts_serve(tmp_path, fake_pgrep, monkeypatch):
+    """pgrep sees every `-m dh.runtime serve` on the host; only this checkout's (or an unreadable one) counts."""
+    here = tmp_path / "dev"
+    here.mkdir()
+    monkeypatch.setenv("DH_ROOT", str(here))
+    roots = {4242: tmp_path / "owner", 4343: here, 4444: None}
+    monkeypatch.setattr(runtime, "_proc_root", lambda pid: None if roots[pid] is None else roots[pid].resolve())
+    fake_pgrep("4242 /owner/.venv/bin/python -m dh.runtime serve", "4343 /dev/.venv/bin/python -m dh.runtime serve",
+               "4444 /x/python -m dh.runtime serve")
+    assert runtime.serve_processes() == ["4343 /dev/.venv/bin/python -m dh.runtime serve",
+                                         "4444 /x/python -m dh.runtime serve"]
+
+
+@pytest.mark.skipif(not Path("/proc/self/environ").exists(), reason="needs /proc (Linux)")
+def test_proc_root_reads_dh_root_then_the_working_directory(tmp_path):
+    import os
+    import sys
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir()
+    b.mkdir()
+    code = "import time; time.sleep(30)"
+    with_env = subprocess.Popen([sys.executable, "-c", code], env={**os.environ, "DH_ROOT": str(a)}, cwd=str(b))
+    env = {k: v for k, v in os.environ.items() if k != "DH_ROOT"}
+    without = subprocess.Popen([sys.executable, "-c", code], env=env, cwd=str(b))
+    try:
+        assert runtime._proc_root(with_env.pid) == a.resolve()
+        assert runtime._proc_root(without.pid) == b.resolve()
+    finally:
+        for p in (with_env, without):
+            p.kill()
+            p.wait()
+    assert runtime._proc_root(with_env.pid) is None  # gone
+
+
+def test_repository_config_in_tests_ignores_config_local(tmp_path):
+    """conftest: the suite is hermetic against an owner's config/local/ in the repository (a role mapping, a unit
+    name); a tmp root still merges its own local overrides."""
+    root = tmp_path / "r"
+    (root / "config" / "local").mkdir(parents=True)
+    (root / "config" / "models.yaml").write_text("roles: {worker: a}\n")
+    (root / "config" / "local" / "models.yaml").write_text("roles: {worker: b}\n")
+    assert config.load(root).models.roles.worker == "b"
+    assert config.load(root, local=False).models.roles.worker == "a"
+    assert config.load(REPO).to_dict() == config.load(REPO, local=False).to_dict()
+
+
+# ------------------------------------------------------------------ validation F10: the improvement step's LLM
+
+
+def test_post_round_runs_the_improvement_step_without_the_llm_while_a_foreign_model_is_loaded(tmp_path, monkeypatch):
+    """An advisor call after the round must not swap out a model another workload loaded meanwhile."""
+    from dh import improve
+    from dh.llm import LLMUnavailable
+    from dh.store import Store
+    results, checks = [], []
+
+    async def fake_after_round(ctx, st):
+        try:
+            results.append(await ctx.llm.chat_json("advisor", "s", "u", {}))
+        except LLMUnavailable as e:
+            results.append(str(e))
+    monkeypatch.setattr(improve, "after_round", fake_after_round)
+    foreign = [["gemma-4-26b-a4b"]]
+
+    async def running():
+        checks.append(1)
+        return foreign[0]
+
+    class Model:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_json(self, *a, **kw):
+            self.calls += 1
+            return {"ok": True}
+    st = Store(tmp_path / "t.db")
+    llm = Model()
+    ctx = type("Ctx", (), {})()
+    ctx.cfg, ctx.store, ctx.root, ctx.llm, ctx.llm_check = cfg(), st, tmp_path, llm, running
+    asyncio.run(runtime.post_round(ctx, None, weekly=False))
+    foreign[0] = []
+    asyncio.run(runtime.post_round(ctx, None, weekly=False))
+    assert "outside the roles" in results[0] and results[1] == {"ok": True} and llm.calls == 1
+    assert ctx.llm is llm  # the caller's context is never changed
+    assert st.conn.execute("select count(*) from health where source='improve' and kind='foreign_model'").fetchone()[0] == 1
+
+
+def test_post_round_makes_no_llama_swap_request_when_the_step_makes_no_llm_call(tmp_path, monkeypatch):
+    from dh import improve
+    from dh.store import Store
+    checks = []
+
+    async def fake_after_round(ctx, st):
+        return None
+
+    async def running():
+        checks.append(1)
+        return []
+    monkeypatch.setattr(improve, "after_round", fake_after_round)
+    ctx = type("Ctx", (), {})()
+    ctx.cfg, ctx.store, ctx.root, ctx.llm, ctx.llm_check = cfg(), Store(tmp_path / "t.db"), tmp_path, object(), running
+    asyncio.run(runtime.post_round(ctx, None, weekly=False))
+    assert checks == []
+
+
+def test_the_suite_never_uses_the_live_unit_name():
+    assert runtime.unit_name() == "deal-hunter-test"

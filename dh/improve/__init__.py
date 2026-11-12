@@ -18,7 +18,7 @@ import json
 from pathlib import Path
 
 from . import gates, monitor, report, shadow
-from .controller import Controller, InFlight, command_result, enqueue
+from .controller import Controller, InFlight, command_result, enqueue, pending_applies, rollback_warning
 from .playbook import ROOT, Playbook, active_version, versions
 
 __all__ = ["after_round", "apply_queued_now", "Controller", "InFlight", "cli_playbook_show", "cli_eval", "cli_rollback", "cli_status",
@@ -114,7 +114,7 @@ def apply_queued_now(store, root: Path, *, llm=None, cfg=None) -> int | None:
     applies them at its next round). Without `llm` a queued apply is NOT consumed: it stays queued for the running
     agent, and every other command still applies in queue order. Returns the number applied."""
     from ..runtime import AgentLock
-    lock = AgentLock(root)
+    lock = AgentLock(root, role="cli")  # serve waits for an owner command to finish
     if not lock.acquire():
         return None
     try:
@@ -142,8 +142,13 @@ def _queue(store, root: Path, cmd: str, running: bool | None, llm=None, **args) 
 
 @_with_store
 def cli_rollback(version: int, *, root: Path, store, running: bool | None = None) -> tuple[str, int]:
-    """`dh playbook --rollback N`: make version N active again (aborts any change in flight)."""
-    return _queue(store, root, "rollback", running, version=int(version))
+    """`dh playbook --rollback N`: make version N active again (aborts any change in flight). The reply warns about
+    owner applies still queued: the rollback does not cancel them (applied now: in the JSON as `warning`)."""
+    text, code = _queue(store, root, "rollback", running, version=int(version))
+    if text.startswith("queued"):
+        w = rollback_warning(pending_applies(store), int(version))
+        text = text + ("\n" + w if w else "")
+    return text, code
 
 
 @_with_store

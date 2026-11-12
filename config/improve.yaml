@@ -1,2 +1,3 @@
 # Self-improvement wiring (dh/runtime.py post_round). Owner-tunable; the gates themselves are frozen (dh/improve/gates.py).
 post_round_timeout_s: 300   # the per-round improvement step is cut after this many seconds (health event improve_timeout); 0 = no limit
+apply_expiry_days: 7        # a queued owner `dh playbook --apply` older than this many days is dropped (never applied); re-run it

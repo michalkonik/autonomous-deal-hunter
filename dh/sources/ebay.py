@@ -116,13 +116,31 @@ _secrets: dict[str, str | None] = {}
 def _cached_bw_secret(ref: str) -> str | None:
     """bw_secret once per process and ref (a missing key is cached too); `clear_secret_cache()` resets."""
     if ref not in _secrets:
-        from ..notify import bw_secret
-        _secrets[ref] = bw_secret(ref)
+        from .. import notify
+        _secrets[ref] = notify.bw_secret(ref)
     return _secrets[ref]
 
 
 def clear_secret_cache() -> None:
     _secrets.clear()
+
+
+KEY_REFS = ("ebay#client_id", "ebay#client_secret")
+
+
+def prefetch_secrets(refs: tuple[str, ...] = KEY_REFS) -> None:
+    """Resolve the uncached refs now, in parallel threads, so no round ever waits on `bw-secret` (about 5 s per
+    call when the item is missing) inside its event loop: `EbayBrowse.enabled` is read from the cache. Called
+    once per run, before the first round (runtime.build_context)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .. import notify
+    todo = [r for r in refs if r not in _secrets]
+    if not todo:
+        return
+    with ThreadPoolExecutor(max_workers=len(todo)) as ex:
+        for ref, val in zip(todo, ex.map(notify.bw_secret, todo)):
+            _secrets[ref] = val
 
 
 def query_for_key(key: str) -> str:

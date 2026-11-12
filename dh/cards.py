@@ -221,8 +221,26 @@ def _rel(path, root: Path | None) -> str | None:
     return p.as_posix()
 
 
+_URL_UNSAFE = {" ": "%20", "(": "%28", ")": "%29", "<": "%3C", ">": "%3E", "[": "%5B", "]": "%5D", "`": "%60"}
+
+
 def _link(label: str, url: str | None) -> str:
-    return f"[{label}]({url})" if url and str(url).startswith(("http://", "https://")) else _esc(url or label)
+    """A Markdown link. `label` is already escaped by the caller (never escaped again here); the URL's characters
+    that would end or break the link target are percent-encoded. Without a web URL: the escaped URL text, or the
+    label alone."""
+    if url and str(url).startswith(("http://", "https://")):
+        target = "".join(_URL_UNSAFE.get(ch, ch) for ch in str(url).strip())
+        return f"[{label}]({target})"
+    return _esc(url) if url else label
+
+
+def _ask_ratio() -> str:
+    """valuation.ask_to_sale_ratio (config/valuation.yaml), for the comparables legend of a card."""
+    try:
+        from .valuation import default_params
+        return str(default_params().ask_to_sale_ratio)
+    except Exception:  # noqa: BLE001 - a card is never lost over its legend
+        return "0.92"
 
 
 def _table(rows: list[dict]) -> list[str]:
@@ -265,12 +283,15 @@ def _markdown(d: dict) -> str:
           f"- Screenshot at verification: {_esc(shots.get('verification') or 'none')}",
           f"- Retail ceiling: {d['retail_ceiling_pln']} PLN; 30-day trend: {d['trend_30d']}", "",
           "### Comparables", ""]
+    if any(c.get("kind") == "active_ask" for c in d["comps"]):
+        L += [f"Prices in PLN. An active ask is shown at x{_ask_ratio()} of its asking price (the price it is expected "
+              "to sell at), so it is lower than on the linked page.", ""]
     L += [f"- {c['kind']} {c['price']} PLN on {(c['date'] or '')[:10]}: {_link('link', c['url'])}"
           for c in d["comps"]] or ["- none"]
     tri = d.get("triage")
     tri_line = ("not run (tier 3 or below)" if tri is None else
                 f"{_esc(tri['verdict'])}" + (f": {_esc('; '.join(tri['reasons']))}" if tri["reasons"] else ""))
-    L += ["", "## Risk", "", f"- p_scam: {d['risk']['p_scam']}",
+    L += ["", "## Risk", "", f"- p_scam: {float(d['risk']['p_scam']):.3f}",
           f"- Flags: {_esc(', '.join(d['risk']['flags'])) or 'none'}",
           f"- Triage (senior model, finalists only): {tri_line}", "", "## Why this tier", ""]
     L += [f"- {_esc(r)}" for r in d["reasons"]] or ["- n/a"]

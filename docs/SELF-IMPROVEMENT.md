@@ -143,14 +143,19 @@ time by chance (research §3.1).
   right. Your Bought / Skipped / Sold marks label disagreements automatically. A Skipped mark counts as a
   wrong-deal label only when its reason names the wrongness (scam, box, wrong model, broken...; see
   `evals/labels.py`).
-- **Force a rollback**: `dh playbook --rollback N` makes version N active again and aborts any change in flight.
+- **Force a rollback**: `dh playbook --rollback N` makes version N active again and aborts any change in flight. A
+  rollback does not cancel an `--apply` still queued: the reply warns and names it (it would be re-applied on top
+  of version N at the next round, after its live must-pass).
 - **Force maintenance on or off**: `dh playbook --maintenance on|off`.
-- **Apply a prompt change**: `dh playbook --apply ID`, after reading it in `--pending`. It needs the running agent (the must-pass set is re-checked with the live model); with the agent stopped the command refuses.
+- **Apply a prompt change**: `dh playbook --apply ID`, after reading it in `--pending`. It needs the running agent (the must-pass set is re-checked with the live model); with the agent stopped the command refuses. A
+  queued apply that has not run within `improve.apply_expiry_days` (7) days is dropped with an "expired" result;
+  the proposal keeps waiting for review.
 - `dh status` and every other read never write: the controller is read-only until a round or an owner command
   runs. An applied command is marked in the same commit that saves its effect.
 - **One writer.** Only the process holding the agent lock (`var/run/agent.lock`, a kernel `flock`) ever changes
   the loop's state: the running agent (`dh start`), a foreground `dh round`, or a CLI command applying the queue
-  when no agent runs. Each controller step is one database transaction. The playbook file is rewritten only over
+  when no agent runs. A starting agent waits for such a CLI command to finish (it marks the lock as `cli`), but gives
+  up after 30 s when another agent holds it. Each controller step is one database transaction. The playbook file is rewritten only over
   the loop's own previous content, never over an edit you saved meanwhile.
 - These owner commands are **queued** (`improve_commands`). The running agent applies them at the start of its
   next round, and again just before saving if one arrives mid-round. When the agent is stopped, the CLI applies

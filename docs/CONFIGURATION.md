@@ -205,6 +205,7 @@ adapters; those platforms arrive through the mailbox.
 | `lookback_days` | `90` | How far back comps are read |
 | `active_ask_max_age_days` | `3` | A tracked listing counts as a live ask if seen this recently |
 | `fx_max_back_days` | `4` | A cached NBP rate may be this much older than the comp |
+| `fx_stale_days` | `3` | The note `fx_stale` appears only when a recent comp (one that makes the quantiles) was converted at a rate more than this many days older than its date; weekend and holiday gaps are normal |
 | `channels.<source>.channel`, `market` | per source | The channel name and country of each comparable source |
 | `partout.parting_cost` | `0.12` | Share of a PC's parts value lost to listing, haggling and returns |
 | `partout.heavy_parts` | `3` | Effort is heavy from this many detected parts |
@@ -228,11 +229,11 @@ Push title format: `T1 <star> +$640 <product key> · <source> <city>`.
 | Key | Default | Meaning |
 |---|---|---|
 | `interval_min` | `30` | Minutes between log-repo syncs |
-| `remote` | `null` | Clone URL of `deal-hunter-log`; used only when `log_dir` is not yet a clone |
+| `remote` | `git@github.com:michalkonik/deal-hunter-log.git` | Clone URL of `deal-hunter-log`; used only when `log_dir` is not yet a clone. Another owner overrides it in `config/local/publish.yaml` |
 | `branch` | `log` | Must stay `log`; any other value is refused with a `bad_branch` health event |
 | `log_dir` | `~/.local/share/deal-hunter/log` | Local clone of the log repo |
 | `cards_dir` | `var/cards/deals` | Where cards are written (relative to the repo root) |
-| `repo_web_url` | not set | Optional, e.g. `https://github.com/<you>/deal-hunter-log`; used to link the card in pushes |
+| `repo_web_url` | `https://github.com/michalkonik/deal-hunter-log` | Used to link the card in pushes; `null` leaves the "Card" button out |
 
 ## books.yaml
 
@@ -259,6 +260,20 @@ network.
 | Key | Default | Meaning |
 |---|---|---|
 | `post_round_timeout_s` | `300` | The improvement step that runs after each round (`improve.after_round`) is cut after this many seconds, with an `improve_timeout` health event; `0` = no limit. An error in that step is an `improve_error` health event and never stops the rounds. The gates themselves are frozen (`dh/improve/gates.py`) and are not configuration |
+| `apply_expiry_days` | `7` | A `dh playbook --apply ID` still queued after this many days (wall clock) is dropped, never applied; its result says so and the proposal still waits for review, so run the apply again if you still want it |
+
+## runtime.yaml
+
+| Key | Default | Meaning |
+|---|---|---|
+| `unit_name` | `deal-hunter` | The systemd user unit this checkout runs as. `DH_UNIT_NAME` in the environment wins over it. |
+
+A second checkout on the same host (a development clone) must use its own name, in `config/local/runtime.yaml`
+(`unit_name: deal-hunter-dev`) or `DH_UNIT_NAME=deal-hunter-dev`. Otherwise its `dh round` refuses because the
+owner's unit is active, and its `dh stop` would stop the owner's agent. The lock, pid and state files are under
+each checkout's own `var/run/`, and `dh status`/`dh stop` only count `dh.runtime serve` processes whose `DH_ROOT`
+(or working directory) is this checkout. Give the second checkout its own web port too (`config/local/web.yaml`,
+`port: 8712`) if you `dh start` it.
 
 ## The playbook
 

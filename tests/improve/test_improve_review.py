@@ -272,6 +272,26 @@ def test_health_rise_on_the_sentinel_sources_is_not_the_playbook(env):
     assert ctl.phase == "probation" and not [e for e in ctl.s["events"] if e["event"] == "rolled_back"]
 
 
+def test_health_rise_keys_are_matched_by_domain_too(env):
+    """A sentinel source that reports under its HOST must be as invisible to probation as one named by adapter.
+    (2026-11-01, live: proposal 1 changed only sprzedajemy and was rolled back by `allegrolokalnie.pl|blocked`,
+    because "allegro_lokalnie" is not a substring of "allegrolokalnie.pl".)"""
+    ctl = _cadence_probation(env, "allegrolokalnie.pl")  # the same unhealthy control source, host spelling
+    assert ctl.phase == "probation" and not [e for e in ctl.s["events"] if e["event"] == "rolled_back"]
+
+
+def test_source_matches_maps_adapter_names_to_their_domains(env):
+    ctl = make(env)
+    ids = ctl._source_identities()
+    assert "allegrolokalnie.pl" in ids["allegro_lokalnie"] and "www.kleinanzeigen.de" in ids["kleinanzeigen"]
+    control = {"allegro_lokalnie", "hardverapro", "kleinanzeigen"}
+    assert Controller._source_matches("allegrolokalnie.pl|blocked", control, ids)
+    assert Controller._source_matches("www.kleinanzeigen.de|robots_disallow", control, ids)
+    assert not Controller._source_matches("images.marktplaats.com|robots_error", control, ids)
+    assert not Controller._source_matches("sprzedajemy.pl|blocked", control, ids)
+    assert not Controller._source_matches("imap|poll_failed", control, ids)
+
+
 # ------------------------------------------------------------------ cooldowns, triggers, health per state, MDE
 
 

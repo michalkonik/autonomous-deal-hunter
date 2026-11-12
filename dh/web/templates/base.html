@@ -21,5 +21,5 @@ button{background:var(--acc);color:#fff;border-color:var(--acc);cursor:pointer}b
 pre{white-space:pre-wrap;overflow-x:auto;background:var(--card);padding:8px;border-radius:6px;font-size:.85rem}
 .tag{display:inline-block;padding:0 6px;border-radius:10px;background:var(--card);border:1px solid var(--line);font-size:.8rem}
 </style></head><body>
-<nav>{% for href,label,key in [("/","Deals","deals"),("/rounds","Rounds","rounds"),("/playbook","Playbook","playbook"),("/books","Books","books"),("/health","Health","health")] %}<a href="{{href}}"{% if page==key or (page=="deal" and key=="deals") %} class="on"{% endif %}>{{label}}</a>{% endfor %}</nav>
+<nav>{% for href,label,key in [("/","Deals","deals"),("/rounds","Rounds","rounds"),("/playbook","Playbook","playbook"),("/books","Books","books"),("/health","Health","health"),("/params","Current Parameters","params")] %}<a href="{{href}}"{% if page==key or (page=="deal" and key=="deals") %} class="on"{% endif %}>{{label}}</a>{% endfor %}</nav>
 <main>{% block body %}{% endblock %}</main></body></html>

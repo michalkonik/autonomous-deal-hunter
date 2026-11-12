@@ -41,6 +41,7 @@ Robustness:
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import logging
@@ -51,6 +52,7 @@ from typing import Callable
 
 from .. import config as dhconfig
 from .. import ledger
+from ..llm import LLMUnavailable
 from . import gates, monitor, probation, reflect, replay, shadow
 from .cusum import PoissonCusum, make
 from .playbook import migrate as pb_migrate
@@ -58,6 +60,14 @@ from .playbook import (ROOT, Delta, Playbook, PlaybookError, active_version, ens
                        version_sha)
 
 log = logging.getLogger(__name__)
+
+
+def _flat(s: str) -> str:
+    """Lowercased letters and digits only, so an adapter name and the host its fetcher records can be compared
+    ("allegro_lokalnie" vs "allegrolokalnie.pl"): punctuation is the only thing that separates most pairs."""
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
 STATE_SQL = "create table if not exists improve_state (key text primary key, value text not null)"
 COMMANDS_SQL = """create table if not exists improve_commands (
   id integer primary key, cmd text not null, args text not null, created_at text not null, applied_at text,
@@ -67,6 +77,7 @@ PHASES = ("idle", "shadow", "probation", "maintenance")
 PROPOSAL_COLUMNS = ("version_id integer", "stage text", "decided_at text", "detail text")
 BASE_COOLDOWN = gates.COOLDOWN_WATCHED_HOURS[0]
 NO_LIVE_MODEL = "apply waits for the running agent: its live must-pass needs the model"
+APPLY_EXPIRY_DAYS = 7  # improve.apply_expiry_days: a queued owner apply older than this is dropped, never applied
 STALE_LIVE = "apply waits for the next step: its live must-pass checked another champion"
 
 
@@ -121,6 +132,33 @@ def enqueue(store, cmd: str, **args) -> int:
                              (cmd, json.dumps(args), _now()))
     store.conn.commit()
     return cur.lastrowid
+
+
+def pending_applies(store) -> list[dict]:
+    """Owner `apply` commands still queued: [{"command": id, "proposal": proposal_id, "queued_at": iso}]. Read only
+    (no schema change: it runs inside a step's transaction)."""
+    out = []
+    try:
+        rows = store.conn.execute("select id, args, created_at from improve_commands where applied_at is null "
+                                  "and cmd='apply' order by id").fetchall()
+    except sqlite3.OperationalError:  # no command was ever queued
+        return out
+    for r in rows:
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            out.append({"command": r["id"], "proposal": int(json.loads(r["args"] or "{}")["proposal_id"]),
+                        "queued_at": r["created_at"]})
+    return out
+
+
+def rollback_warning(pending: list[dict], version) -> str | None:
+    """The owner's rollback reply names the applies still queued: each re-makes its change on top of the rolled
+    back version when the agent applies it (after its live must-pass), so the rollback alone does not undo them."""
+    if not pending:
+        return None
+    what = ", ".join(f"command {p['command']} (proposal {p['proposal']})" for p in pending)
+    return (f"warning: {len(pending)} owner apply still queued: {what}. It will be re-applied on top of v{version} "
+            "at the agent's next round (after its live must-pass). Expect it, or let it expire "
+            "(improve.apply_expiry_days).")
 
 
 def command_result(store, cid: int) -> dict | None:
@@ -455,6 +493,16 @@ class Controller:
         done = 0
         for r in rows:
             args = json.loads(r["args"] or "{}")
+            if r["cmd"] == "apply" and self._expired(r["created_at"]):
+                if not self.store.conn.in_transaction:
+                    self.store.conn.execute("begin")
+                self.store.conn.execute("update improve_commands set applied_at=?, result=? where id=?", (
+                    _now(), json.dumps({"ok": False, "expired": True, "error": (
+                        f"expired: queued at {r['created_at']}, more than {self._expiry_days():g} days ago, and never "
+                        "applied; the proposal still waits for review: `dh playbook --apply "
+                        f"{args.get('proposal_id')}` again to apply it")}), r["id"]))
+                done += 1
+                continue
             before, n_ev = copy.deepcopy(self.s), len(self._new)
             if not self.store.conn.in_transaction:  # an outermost savepoint's RELEASE would COMMIT the step early
                 self.store.conn.execute("begin")
@@ -483,6 +531,20 @@ class Controller:
             done += 1
         return done
 
+    def _expiry_days(self) -> float:
+        imp = self.cfg.get("improve") if self.cfg is not None else None
+        return float((imp.to_dict() if imp is not None else {}).get("apply_expiry_days", APPLY_EXPIRY_DAYS))
+
+    def _expired(self, created_at: str | None) -> bool:
+        """A queued owner apply older than improve.apply_expiry_days (wall clock: the owner's intent ages even
+        while the agent is stopped)."""
+        try:
+            at = datetime.fromisoformat(str(created_at))
+        except (TypeError, ValueError):
+            return False
+        at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - at).total_seconds() > self._expiry_days() * 86400
+
     async def _prepare_live(self) -> None:
         """The LIVE must-pass of every queued owner apply, run BEFORE the step opens its transaction: no model call
         is ever awaited inside a step. Kept per command with the sha of the challenger it checked; `_apply_owner`
@@ -490,9 +552,11 @@ class Controller:
         self._live = {}
         if self.llm is None:
             return
-        rows = self.store.conn.execute("select id, args from improve_commands where applied_at is null and cmd='apply' "
-                                       "order by id").fetchall()
+        rows = self.store.conn.execute("select id, args, created_at from improve_commands where applied_at is null "
+                                       "and cmd='apply' order by id").fetchall()
         for r in rows:
+            if self._expired(r["created_at"]):  # dropped by the step: never spend a live must-pass on it
+                continue
             try:
                 built = self._owner_challenger(int(json.loads(r["args"] or "{}")["proposal_id"]))
             except Exception:  # noqa: BLE001 - a bad command is reported by the step itself
@@ -682,14 +746,22 @@ class Controller:
                 self._event(wh, "trigger_in_cooldown", trigger=trigger,
                             left_wh=round(self.s["cooldown_until_wh"] - wh, 2))
             return  # the trigger stays pending (a due weekly review is not lost)
+        cause = trigger.split(":", 1)[1] if trigger.startswith("failures:") else None
+        try:
+            d = await reflect.propose(trigger, evidence, self.champion(), llm=self.llm,
+                                      rejected=reflect.rejected_ideas(self.store))
+        except LLMUnavailable as e:
+            # no answer is not "no proposal": the cluster is not consumed, no cooldown, the trigger stays pending
+            self._io_done()
+            last = self.s["events"][-1] if self.s["events"] else {}
+            if last.get("event") != "advisor_unavailable" or last.get("trigger") != trigger:
+                self._event(wh, "advisor_unavailable", trigger=trigger, why=str(e)[:200])
+            return
+        self._io_done()  # the advisor call ran before this step wrote anything
         if trigger == "weekly":
             self.s["last_review_wh"] = wh
         if trigger.startswith("health:"):
             self.s["health_pending"] = {}
-        cause = trigger.split(":", 1)[1] if trigger.startswith("failures:") else None
-        d = await reflect.propose(trigger, evidence, self.champion(), llm=self.llm,
-                                  rejected=reflect.rejected_ideas(self.store))
-        self._io_done()  # the advisor call ran before this step wrote anything
         if d is None:
             reflect.consume(self.store, cause, 0, commit=False)  # stamped: the cluster does not call the advisor again
             self.s["cooldown_until_wh"] = max(self.s["cooldown_until_wh"], wh + BASE_COOLDOWN)
@@ -771,6 +843,11 @@ class Controller:
         if pre is None or pre[0] != challenger.sha():
             raise _Deferred(STALE_LIVE)
         live = pre[1]
+        if live.get("unavailable"):
+            # some live calls got no answer (model down, swapped out, or refused because another workload's model
+            # is loaded): the run proves nothing either way, and cases may have failed only for want of the model.
+            # The owner's apply waits for the next step instead of being rejected for good.
+            raise _Deferred(NO_LIVE_MODEL)
         detail = {"live_must_pass": live, "applied_at_wh": round(wh, 2)}
         if not live["ok"]:
             self._proposal(pid, "rejected", "owner_live_must_pass", detail)
@@ -849,12 +926,53 @@ class Controller:
         named = set(self.s.get("delta_sources") or [])
         control = monitor.sentinel_sources(self.sentinel_playbook()) - named
 
-        def on(key: str, sources: set[str]) -> bool:
-            src = key.split("|", 1)[0]
-            return any(s == src or s in src for s in sources)
-        if any(on(k, control) for k in rising):
+        if any(self._source_matches(k, control, self._source_identities()) for k in rising):
             return []  # the control group is unhealthy too: the sites changed, not the playbook
         return sorted(rising)
+
+    def _source_identities(self) -> dict[str, set[str]]:
+        """adapter name -> every string its health events can carry (its own domain included).
+
+        Health events are recorded by the fetcher under a HOST ("allegrolokalnie.pl",
+        "www.kleinanzeigen.de", "pc.bazos.cz", "api.ebay.com") while playbook items and deltas name the
+        ADAPTER ("allegro_lokalnie", "kleinanzeigen", "bazos_cz", "ebay_de"). Best effort: without the
+        registry only the names are known and matching still works for the host-less sources."""
+        cached = getattr(self, "_src_ids", None)
+        if cached is not None:
+            return cached
+        ids: dict[str, set[str]] = {}
+        try:
+            from ..sources import registry
+            for name, ad in registry(self.cfg, self.root).items():
+                ids[str(name)] = {str(name)}
+                dom = str(getattr(ad, "domain", "") or "")
+                if dom:
+                    ids[str(name)].add(dom)
+        except Exception as e:  # noqa: BLE001 - registry needs a full config; name-only matching is enough
+            log.debug("improve: source domains unavailable (%s), matching names only", type(e).__name__)
+        self._src_ids = ids
+        return ids
+
+    @classmethod
+    def _source_matches(cls, key: str, sources: set[str], ids: dict[str, set[str]] | None = None) -> bool:
+        """Does a health key "<source>|<kind>" belong to one of these source names?
+
+        A plain substring test misses the pairs that share no punctuation: "allegro_lokalnie" is NOT inside
+        "allegrolokalnie.pl". A control-group source missed this way is read as "the delta caused it" and
+        silently rolls back an unrelated proposal (observed 2026-11-01: proposal 1 targeted sprzedajemy only
+        and was killed by allegrolokalnie.pl|blocked). So: exact name, the adapter's own domain, or a
+        punctuation-free form of either inside the punctuation-free host."""
+        src = key.split("|", 1)[0]
+        if src in sources:
+            return True
+        flat_src = _flat(src)
+        ids = ids or {}
+        for s in sources:
+            for token in ids.get(s, (s,)):
+                flat = _flat(str(token))
+                if flat and (flat == flat_src or flat in flat_src):
+                    return True
+        return False
 
     def _rollback(self, wh: float, why: list) -> None:
         """Version status and state in ONE transaction, then the file."""
@@ -943,4 +1061,9 @@ class Controller:
         self._champion_changed(old, vid)
         self._rest()
         self._event(wh, "owner_rollback", to=version, as_version=vid)
-        return {"ok": True, "version": vid, "to": version}  # committed with the command mark by the caller
+        out = {"ok": True, "version": vid, "to": version}  # committed with the command mark by the caller
+        pend = pending_applies(self.store)
+        if pend:
+            out["pending_applies"] = pend
+            out["warning"] = rollback_warning(pend, version)
+        return out

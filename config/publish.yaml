@@ -1,5 +1,6 @@
 interval_min: 30
-remote: null            # clone URL of deal-hunter-log; only used when log_dir does not exist yet
+remote: git@github.com:michalkonik/deal-hunter-log.git   # clone URL of the private log repo; used when log_dir is not a clone yet
+repo_web_url: https://github.com/michalkonik/deal-hunter-log   # links the "Card" button of a push to the card on GitHub
 branch: log
 log_dir: ~/.local/share/deal-hunter/log
 cards_dir: var/cards/deals

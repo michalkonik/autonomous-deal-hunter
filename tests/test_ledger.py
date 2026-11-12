@@ -526,3 +526,36 @@ def test_watched_hours_union_partial_nested_and_open_windows(store):
     assert ledger.watched_hours(store, "hardverapro") == pytest.approx(2.0)
     e = ledger.open_window(store, "olx", t0 + timedelta(hours=20))  # open, never observed: zero
     assert ledger.watched_hours(store) == pytest.approx(8.0)
+
+
+# ------------------------------------------------------------------ performance: one commit per sweep
+
+
+class _CountingConn:
+    """sqlite3.Connection stand-in that counts commits (the C type's methods cannot be patched)."""
+
+    def __init__(self, conn):
+        self._c, self.commits = conn, 0
+
+    def commit(self):
+        self.commits += 1
+        return self._c.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def test_observe_commits_once_per_sweep_not_per_listing(store, tmp_path):
+    """Profiling (docs/VALIDATION.md): one fsync per upserted listing cost ~3.6 s of a round's event loop."""
+    ledger.observe(store, SRC, [lst("w", "100")], h(0), arm="a")  # window and schema exist already
+    store.conn = counting = _CountingConn(store.conn)
+    ls = [lst(f"s{i}", str(100 + i)) for i in range(50)]
+    ids = ledger.observe(store, SRC, ls, h(1), arm="a")
+    assert len(ids) == 50 and counting.commits <= 2, counting.commits
+    other = Store(tmp_path / "dh.db")  # durable and visible to another connection when observe returns
+    try:
+        n = other.conn.execute("select count(*) from listings where source=?", (SRC,)).fetchone()[0]
+        obs = other.conn.execute("select count(*) from observations").fetchone()[0]
+    finally:
+        other.close()
+    assert n == 51 and obs == 51

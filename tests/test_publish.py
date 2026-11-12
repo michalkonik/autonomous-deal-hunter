@@ -295,3 +295,34 @@ def test_index_shows_gone_deals_after_live_ones(tmp_path):
     idx = (tmp_path / "clone/INDEX.md").read_text()
     line = next(l for l in idx.splitlines() if f"deal-{a}" in l)
     assert "gone" in line and idx.index(f"deal-{b}") < idx.index(f"deal-{a}")
+
+
+def test_conflict_reset_keeps_clone_only_cards_and_weekly_reports(tmp_path):
+    """Deferred minor: the conflict recovery's `reset --hard origin/log` dropped every unpushed file the local card
+    dir can no longer regenerate (a card whose source was pruned, a weekly report written but not pushed yet)."""
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    hook = bare / "hooks/pre-receive"
+    hook.write_text("#!/bin/sh\nexit 1\n"); hook.chmod(0o755)  # pushes fail for a while
+    did2 = add_deal(st, tmp_path, tier=3, net="80", key="RX 7900 XTX")
+    (tmp_path / "clone" / "weekly").mkdir(exist_ok=True)
+    (tmp_path / "clone" / "weekly" / "2026-10-29.md").write_text("# weekly\n")
+    card = tmp_path / f"var/cards/deals/2026-10-29/deal-{did}.md"
+    card.write_text(card.read_text().replace("# RTX 4090", "# RTX 4090 local"))  # same line as the remote edit
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["committed"] and not r["pushed"]
+    for ext in (".md", ".json"):  # the second card's source is gone (pruned): only the clone has it now
+        (tmp_path / f"var/cards/deals/2026-10-29/deal-{did2}{ext}").unlink()
+    hook.unlink()
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("# RTX 4090", "# RTX 4090 edited").replace("status: open", "status: bought"))
+    git(phone, "commit", "-qam", "bought"); git(phone, "push", "-q", "origin", "log")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert not r["pulled"]  # a real conflict: the recovery path (fetch, import, reset) ran
+    assert r["pushed"] and r["marks"] == 1 and r.get("restored", 0) >= 2
+    tree = git(tmp_path / "clone", "ls-tree", "-r", "--name-only", "origin/log")
+    assert f"deals/2026-10-29/deal-{did2}.md" in tree and f"deals/2026-10-29/deal-{did2}.json" in tree
+    assert "weekly/2026-10-29.md" in tree
+    assert "bought" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()  # origin's mark kept

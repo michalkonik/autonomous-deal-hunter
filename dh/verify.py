@@ -91,7 +91,7 @@ async def verify_deal(store, deal_id: int, cfg, fx, customs, adapters, fetcher) 
     except AdapterError:  # blocked, robots, transport: not verified, never assumed alive, but not "gone" either
         alive, price_now, unverifiable = False, None, True
     net_now = replay.cons_net_pln
-    gone = not unverifiable and not alive  # gone = the listing is gone or unverifiable-as-alive; a price change alone is not
+    gone = not unverifiable and not alive  # gone = the platform says the listing is gone; an unverifiable fetch is not gone, nor is a price change alone
     if not alive:
         diffs.append("listing not confirmed alive")
     elif price_now is None or price_now <= 0:
@@ -109,6 +109,10 @@ async def verify_deal(store, deal_id: int, cfg, fx, customs, adapters, fetcher) 
         cap_usd = res_now.capital_usd if res_now.capital_usd is not None else await fx.pln_to_usd(res_now.capital_pln, inp.day)
         tr = tiering.assign(cons_usd, exp_usd, deal.effort, deal.confidence, cap_usd, cfg.rules)
         diffs.append(f"conservative net now {cons_usd} USD, {deal.effort} floor {tr.floor_usd} USD")
+        if tr.tier is None:  # as the scheduler: a rising-market trend signal still keeps it as a tier-4 watch
+            from . import scheduler
+            tr = scheduler.trend_signal(ev.get("estimate", {}).get("trend_30d"), cons_usd, cap_usd, deal.confidence,
+                                        cfg.rules, scheduler.sched_cfg(cfg), tr.floor_usd) or tr
         if tr.tier is None:
             gone = True
             diffs.append("price_changed_below_floor: no longer a deal at the new price")
@@ -213,6 +217,9 @@ async def _shoot(url: str, path: Path, fetcher) -> bool:
                 return False
             if final != url and not await fetcher.allowed(final):  # belt and braces: the guard already checked it
                 return False
+            ok = getattr(fetcher, "report_ok", None)
+            if ok is not None:  # a good load resets the domain's consecutive-block count, like a good `get`
+                ok(urlsplit(final).netloc.lower() or domain)
             path.parent.mkdir(parents=True, exist_ok=True)
             await page.screenshot(path=str(path))
             return path.is_file() and path.stat().st_size > 0

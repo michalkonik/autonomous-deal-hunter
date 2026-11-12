@@ -201,7 +201,7 @@ def test_eu_fallback_converts_at_comp_date(store):
     # 1000 € × 4.30 × 0.92 = 3956.00, 1100 € → 4351.60; weight 0.3 × 0.7
     assert sorted(c.price_pln for c in e.comps) == [Decimal("3956.00"), Decimal("4351.60")]
     assert {c.weight for c in e.comps} == {0.21}
-    assert "fx_stale" in e.notes  # NBP effective date 10-27 is not the comp date 10-28
+    assert "fx_stale" not in e.notes  # a 1-day gap (NBP 10-27 for a 10-28 comp) is normal, not stale (<= 3 days)
     # a PL exit channel with no PL comps uses the EU pool at × 0.5
     e_pl = valuation.estimate(store, KEY, "used", "allegro", DAY)
     assert "fallback_eu" in e_pl.notes and {c.weight for c in e_pl.comps} == {0.15}
@@ -399,3 +399,34 @@ def test_trend_window_follows_lookback(store):
     assert valuation.estimate(store, KEY, "used", "allegro", DAY).trend_30d == pytest.approx(-0.10)
     short = dataclasses.replace(valuation.default_params(), lookback_days=45)
     assert valuation.estimate(store, KEY, "used", "allegro", DAY, params=short).trend_30d is None
+
+
+# ------------------------------------------------------------------ deferred minor: the scope of the FX notes
+
+
+def _eur_row(days, ref, price="1000"):
+    return CompRow(key=KEY, condition="used", channel="kleinanzeigen", kind="probably_sold", price=Decimal(price),
+                   currency="EUR", at=ago(days), weight=0.5, ref=ref)
+
+
+def test_fx_notes_cover_only_the_recent_comps(store):
+    """fx_missing / fx_stale were raised by comps older than recent_days, which never reach the quantiles."""
+    recent = [_eur_row(1, "r1"), _eur_row(2, "r2")]
+    put_rate(store, ago(1).date(), "EUR", "4.30")
+    put_rate(store, ago(2).date(), "EUR", "4.30")
+    old_missing = _eur_row(40, "old1")  # trend window only, and no rate cached for its day
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY, ledger_rows=[*recent, old_missing])
+    assert e is not None and e.notes == [], e.notes
+    put_rate(store, ago(45).date(), "EUR", "4.10")  # an old comp converted with a 4-day-old rate: still no note
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY, ledger_rows=[*recent, _eur_row(41, "old2")])
+    assert e.notes == [], e.notes
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY,
+                           ledger_rows=[*recent, _eur_row(3, "r3")])  # a RECENT comp without a rate: noted
+    assert "fx_missing:EUR" in e.notes
+
+
+@pytest.mark.parametrize("gap,stale", [(0, False), (2, False), (3, False), (4, True)])
+def test_fx_stale_only_when_the_rate_is_older_than_fx_stale_days(store, gap, stale):
+    put_rate(store, ago(1).date(), "EUR", "4.30", effective=ago(1 + gap).date())
+    e = valuation.estimate(store, KEY, "used", "kleinanzeigen", DAY, ledger_rows=[_eur_row(1, "r1")])
+    assert ("fx_stale" in e.notes) is stale, (gap, e.notes)

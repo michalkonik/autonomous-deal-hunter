@@ -9,3 +9,5 @@ var/
 *.db-wal
 *.db-shm
 .superpowers/
+deal_hunter.egg-info/
+*.egg-info/

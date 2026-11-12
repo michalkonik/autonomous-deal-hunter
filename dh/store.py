@@ -41,7 +41,8 @@ create table if not exists deals (
 );
 create table if not exists marks (
   id integer primary key, deal_id integer not null, status text, price_pln text, note text,
-  source text, created_at text default current_timestamp
+  source text, false_positive integer not null default 0,
+  created_at text default current_timestamp
 );
 create table if not exists comps (
   id integer primary key, key text not null, condition text, channel text, price_pln text,
@@ -103,6 +104,8 @@ class Store:
         for col in ("prompt_sha text", "extracted_at text"):  # which extraction prompt produced an LLM result, when
             if col.split()[0] not in have:
                 self.ensure_table(f"alter table extractions add column {col}")
+        if "false_positive" not in {r["name"] for r in self.conn.execute("pragma table_info(marks)")}:
+            self.ensure_table("alter table marks add column false_positive integer not null default 0")
 
     def ensure_table(self, sql: str) -> None:
         self.conn.execute(sql)
@@ -112,7 +115,8 @@ class Store:
         self.conn.close()
 
     # listings
-    def upsert_listing(self, l: Listing) -> int:
+    def upsert_listing(self, l: Listing, *, commit: bool = True) -> int:
+        """Insert or update a listing; its id. `commit=False`: the caller commits (a sweep's batch, one fsync)."""
         seen = _iso(l.seen_at)
         self.conn.execute(
             """insert into listings (source, source_id, url, title, description, price, currency, country,
@@ -135,16 +139,18 @@ class Store:
              None if l.is_business is None else int(l.is_business), json.dumps(l.photos),
              _iso(l.posted_at), seen, seen, l.raw_path, int(bool(l.contact_in_text))),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return self.conn.execute("select id from listings where source=? and source_id=?",
                                  (l.source, l.source_id)).fetchone()["id"]
 
-    def record_observation(self, listing_id: int, price: Decimal, seen_at: datetime) -> None:
+    def record_observation(self, listing_id: int, price: Decimal, seen_at: datetime, *, commit: bool = True) -> None:
         self.conn.execute("insert into observations (listing_id, price, seen_at) values (?,?,?)",
                           (listing_id, str(price), _iso(seen_at)))
         self.conn.execute("update listings set last_seen_at=max(coalesce(last_seen_at,''), ?) where id=?",
                           (_iso(seen_at), listing_id))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     # observation windows
     def open_window(self, source: str, ts: datetime) -> int:
@@ -224,9 +230,12 @@ class Store:
         r = self.conn.execute("select * from deals where id=?", (deal_id,)).fetchone()
         return self._deal(r) if r else None
 
-    def add_mark(self, deal_id: int, status: str, price_pln: Decimal | None, note: str, source: str) -> None:
-        self.conn.execute("insert into marks (deal_id, status, price_pln, note, source) values (?,?,?,?,?)",
-                          (deal_id, status, None if price_pln is None else str(price_pln), note, source))
+    def add_mark(self, deal_id: int, status: str, price_pln: Decimal | None, note: str, source: str,
+                 false_positive: bool = False) -> None:
+        self.conn.execute("insert into marks (deal_id, status, price_pln, note, source, false_positive) "
+                          "values (?,?,?,?,?,?)",
+                          (deal_id, status, None if price_pln is None else str(price_pln), note, source,
+                           int(false_positive)))
         self.conn.commit()
 
     # comps

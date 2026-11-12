@@ -114,3 +114,52 @@ def test_write_is_atomic_no_temp_left(tmp_path):
     cards.write(d, tmp_path)
     cards.write(d, tmp_path)
     assert not list(tmp_path.glob("deals/*/*.tmp"))
+
+
+def test_link_escapes_once_and_keeps_parentheses_inside_the_url():
+    """Deferred minors: the label was escaped twice on the no-URL fallback, and a ')' in a URL ended the link."""
+    label = cards._esc("RTX [4090] | OC")
+    assert cards._link(label, None) == "RTX \\[4090\\] \\| OC"  # escaped once, not "\\\\["
+    assert cards._link(label, "ftp://x") == "ftp://x"  # not a web URL: shown as escaped text, no link
+    u = "https://www.kleinanzeigen.de/s-anzeige/rtx-4090-(oc)/123?x=a b"
+    out = cards._link("listing", u)
+    assert out == "[listing](https://www.kleinanzeigen.de/s-anzeige/rtx-4090-%28oc%29/123?x=a%20b)"
+    assert out.count("(") == 1 and out.count(")") == 1  # Markdown sees one link, not a truncated one
+
+
+def test_card_listing_line_with_parenthesised_url(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    lst.url = "https://allegrolokalnie.pl/oferta/karta-rtx-3080-(10gb)-123"
+    md, _ = cards.render(d, lst, estimate(), res, risk())
+    line = next(l for l in md.split("\n") if l.startswith("- Listing:"))
+    assert line.endswith("(https://allegrolokalnie.pl/oferta/karta-rtx-3080-%2810gb%29-123)"), line
+
+
+def test_comparables_legend_explains_discounted_asks(tmp_path):
+    """Validation: an owner reading a card saw "active_ask 3219.99 PLN" and a linked page asking 3499.99 PLN.
+    A card with asks among its comparables now says they are shown at x ask_to_sale_ratio."""
+    import dataclasses
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from dh.models import CompRef
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    md, _ = cards.render(d, lst, estimate(), res, risk())
+    assert "asking price" not in md  # sales only: no legend
+    e = estimate()
+    e = dataclasses.replace(e, comps=[*e.comps, CompRef("active_ask", "allegro", Decimal("3219.99"),
+                                                         datetime(2026, 10, 29, tzinfo=timezone.utc), 0.3,
+                                                         "https://allegro.pl/a/1")])
+    md, _ = cards.render(d, lst, e, res, risk())
+    assert "An active ask is shown at x0.92 of its asking price" in md
+
+
+def test_p_scam_is_shown_with_three_decimals(tmp_path):
+    """A live card showed "p_scam: 0.043107254941086116"."""
+    import dataclasses
+    st = Store(tmp_path / "t.db")
+    d, res, lst = make_deal(st)
+    md, data = cards.render(d, lst, estimate(), res, dataclasses.replace(risk(), p_scam=0.043107254941086116))
+    assert "- p_scam: 0.043\n" in md

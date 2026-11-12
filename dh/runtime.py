@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -49,13 +51,35 @@ from .store import Store
 
 log = logging.getLogger("dh.runtime")
 
-UNIT = "deal-hunter"
+UNIT = "deal-hunter"  # the default unit name; `unit_name()` lets a second checkout on the same host use its own
 SERVE_PATTERN = "-m dh.runtime serve"
 ROOT = Path(__file__).resolve().parents[1]
+_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,99}$")
 
 
 def root_dir() -> Path:
     return Path(os.environ.get("DH_ROOT") or ROOT)
+
+
+def unit_name(root: Path | None = None) -> str:
+    """The systemd user unit this checkout runs as: $DH_UNIT_NAME, else config `runtime.unit_name`
+    (config/runtime.yaml, or config/local/runtime.yaml), else "deal-hunter". A second checkout on the same host (a
+    development clone) sets its own name, so its `dh round`, `dh start`, `dh stop` and `dh status` never take the
+    owner's unit for their own. The lock, pid and state files are under each checkout's own var/run already.
+    ValueError for a name systemd would not accept."""
+    name = os.environ.get("DH_UNIT_NAME")
+    if not name:
+        try:
+            rt = dhconfig.load(Path(root or root_dir())).get("runtime")
+            name = (rt.to_dict() if rt is not None else {}).get("unit_name")
+        except Exception:  # noqa: BLE001 - an unreadable config is reported by whatever loads it next
+            name = None
+    name = str(name or UNIT).strip()
+    name = name[: -len(".service")] if name.endswith(".service") else name
+    if not _UNIT_RE.match(name):
+        raise ValueError(f"invalid unit name {name!r} (DH_UNIT_NAME or runtime.unit_name): letters, digits and "
+                         "_ . : @ - only")
+    return name
 
 
 def db_path(root: Path) -> Path:
@@ -86,7 +110,8 @@ def agent_lock_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "agent.lock"
 
 
-AGENT_LOCK_WAIT_S = 30.0  # serve waits this long for the lock (the CLI may hold it briefly for a queued command)
+AGENT_LOCK_WAIT_S = 30.0  # serve waits this long for a lock held by another agent (serve, `dh round`)
+AGENT_LOCK_CLI_WAIT_S = 3600.0  # ... and up to this long while an owner CLI command holds it (it always ends)
 AGENT_LOCK_STEP_S = 1.0
 
 
@@ -96,8 +121,9 @@ class AgentLock:
     (`improve.apply_queued_now`). Only the holder mutates the improvement loop's state. The kernel drops the lock
     when the process dies, so a crash never leaves it stale."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, role: str = "agent"):
         self.path = agent_lock_path(root)
+        self.role = role  # "agent" (serve, `dh round`) or "cli" (an owner command): written next to the pid
         self.fd: int | None = None
 
     def acquire(self) -> bool:
@@ -110,7 +136,7 @@ class AgentLock:
             os.close(fd)
             return False
         os.ftruncate(fd, 0)
-        os.write(fd, str(os.getpid()).encode())
+        os.write(fd, f"{os.getpid()} {self.role}".encode())
         self.fd = fd
         return True
 
@@ -127,6 +153,15 @@ class AgentLock:
 
     def __exit__(self, *exc) -> None:
         self.release()
+
+
+def lock_holder(root: Path) -> tuple[int | None, str | None]:
+    """(pid, role) written by the current holder of the agent lock; (None, None) when unreadable."""
+    try:
+        parts = agent_lock_path(root).read_text().split()
+        return int(parts[0]), (parts[1] if len(parts) > 1 else None)
+    except (OSError, ValueError, IndexError):
+        return None, None
 
 
 def agent_lock_held(root: Path) -> bool:
@@ -223,8 +258,10 @@ def _sys(run, *cmd: str, timeout: float = 60) -> subprocess.CompletedProcess:
 
 
 def is_active(run=subprocess.run) -> bool:
+    """This checkout's unit (`unit_name()`) is active."""
     try:
-        return _sys(run, "systemctl", "--user", "is-active", UNIT).stdout.strip() in ("active", "activating", "reloading")
+        return _sys(run, "systemctl", "--user", "is-active", unit_name()).stdout.strip() in ("active", "activating",
+                                                                                           "reloading")
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -254,8 +291,23 @@ def own_lineage(pid: int | None = None) -> set[int]:
     return out
 
 
+def _proc_root(pid: int) -> Path | None:
+    """The project root a serve process runs for: its DH_ROOT (set by `dh start`), else its working directory.
+    None when it cannot be read (another OS, another user, the process is gone)."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        for kv in env:
+            if kv.startswith(b"DH_ROOT="):
+                return Path(kv[len(b"DH_ROOT="):].decode(errors="replace")).resolve()
+        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except (OSError, ValueError):
+        return None
+
+
 def serve_processes(run=subprocess.run) -> list[str]:
-    """`pid cmdline` of every `python -m dh.runtime serve` process except this one and its ancestors. The pattern
+    """`pid cmdline` of every `python -m dh.runtime serve` process of THIS checkout (`root_dir()`), except this one
+    and its ancestors. A serve whose root can be read and is another checkout's (the owner's agent seen from a
+    development clone) is not ours; one whose root cannot be read is counted (belt and braces). The pattern
     goes after `--`: it starts with "-m", which pgrep would otherwise parse as options (exit 2, nothing found)."""
     try:
         r = _sys(run, "pgrep", "-af", "--", SERVE_PATTERN)
@@ -265,10 +317,14 @@ def serve_processes(run=subprocess.run) -> list[str]:
         log.warning("pgrep failed (%s): %s", r.returncode, (r.stderr or "").strip()[:200])
         return []
     mine = own_lineage()
+    here = Path(root_dir()).resolve()
     out = []
     for ln in r.stdout.splitlines():
         parts = ln.split(None, 1)
         if not parts or not parts[0].isdigit() or int(parts[0]) in mine:
+            continue
+        theirs = _proc_root(int(parts[0]))
+        if theirs is not None and theirs != here:
             continue
         out.append(ln.strip())
     return out
@@ -331,8 +387,9 @@ async def warm_models(cfg, *, timeout_s: float = 300.0, post=None) -> dict[str, 
 def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, meminfo: str | Path = "/proc/meminfo",
           out=sys.stdout, python: str | None = None, wait_s: float = 3.0) -> int:
     root = Path(root)
+    unit = unit_name()
     if is_active(run):
-        print(f"deal-hunter is already running (systemctl --user status {UNIT})", file=out)
+        print(f"deal-hunter is already running (systemctl --user status {unit})", file=out)
         return 0
     rp = round_running(root)
     if rp is not None:
@@ -354,9 +411,10 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     state_path(root).parent.mkdir(parents=True, exist_ok=True)
     state_path(root).write_text(json.dumps({"started_at": _now().isoformat(), "models_before": running or []}))
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        _sys(run, "systemctl", "--user", "reset-failed", UNIT)
-    cmd = ["systemd-run", "--user", f"--unit={UNIT}", "--collect", "--property=KillMode=control-group",
-           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", "--setenv=PYTHONUNBUFFERED=1",
+        _sys(run, "systemctl", "--user", "reset-failed", unit)
+    cmd = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--property=KillMode=control-group",
+           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", f"--setenv=DH_UNIT_NAME={unit}",
+           "--setenv=PYTHONUNBUFFERED=1",
            python or sys.executable, "-m", "dh.runtime", "serve"]
     r = _sys(run, *cmd)
     if r.returncode != 0:
@@ -365,20 +423,21 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     if wait_s:
         time.sleep(wait_s)
     if not is_active(run):
-        print(f"deal-hunter did not stay up: see journalctl --user -u {UNIT}", file=out)
+        print(f"deal-hunter did not stay up: see journalctl --user -u {unit}", file=out)
         return 1
     web = cfg.get("web")
     port = (web.to_dict() if web is not None else {}).get("port", 8711)
-    print(f"deal-hunter started (unit {UNIT}); web page on port {port}; stop with `dh stop`", file=out)
+    print(f"deal-hunter started (unit {unit}); web page on port {port}; stop with `dh stop`", file=out)
     return 0
 
 
 def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=sys.stdout) -> int:
     root = Path(root)
+    unit = unit_name()
     was = is_active(run)
     try:
-        r = _sys(run, "systemctl", "--user", "stop", UNIT, timeout=150)
-        print(f"systemctl --user stop {UNIT}: " + ("stopped" if was else "was not running")
+        r = _sys(run, "systemctl", "--user", "stop", unit, timeout=150)
+        print(f"systemctl --user stop {unit}: " + ("stopped" if was else "was not running")
               + (f" ({r.stderr.strip()})" if r.returncode and r.stderr.strip() else ""), file=out)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"systemctl stop failed: {e}", file=out)
@@ -405,7 +464,7 @@ def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=
 
 def _show(run) -> dict:
     try:
-        r = _sys(run, "systemctl", "--user", "show", UNIT, "-p", "ActiveState", "-p", "MainPID", "-p",
+        r = _sys(run, "systemctl", "--user", "show", unit_name(), "-p", "ActiveState", "-p", "MainPID", "-p",
                  "ActiveEnterTimestamp")
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -416,7 +475,7 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
     root = Path(root)
     show = _show(run)
     active = is_active(run)
-    out: dict[str, Any] = {"running": active, "unit": UNIT, "state": show.get("ActiveState"),
+    out: dict[str, Any] = {"running": active, "unit": unit_name(), "state": show.get("ActiveState"),
                            "pid": int(show.get("MainPID") or 0) or None, "since": show.get("ActiveEnterTimestamp"),
                            "uptime_s": None, "processes": serve_processes(run)}
     try:
@@ -502,6 +561,21 @@ def _log_repo(cfg) -> dict:
 # ------------------------------------------------------------------------------------------------ serve
 
 
+def _llm_ctx(ctx):
+    """The context for the improvement step: its LLM calls (reflection, advisor, an owner apply's live must-pass)
+    go through the same per-call foreign-model check as the round's (scheduler._CountingLLM), so a model another
+    workload loaded meanwhile is never swapped out by an advisor call. No llama-swap request unless a call is made."""
+    if getattr(ctx, "llm", None) is None or getattr(ctx, "llm_check", None) is None:
+        return ctx
+
+    def on_foreign(foreign: list[str]) -> None:
+        ctx.store.add_health("improve", "foreign_model", "improvement step without the LLM; llama-swap runs "
+                             + ", ".join(foreign))
+    out = copy.copy(ctx)
+    out.llm = scheduler._CountingLLM(ctx.llm, scheduler.RoundStats(), ctx.llm_check, on_foreign)
+    return out
+
+
 async def post_round(ctx, st, *, weekly: bool = True) -> None:
     """Hooks that run after every round (`serve` and `dh round`): the self-improvement step, then (serve only) the
     weekly report when 168 watched hours have passed. Neither can end the round loop: a failure becomes a health
@@ -510,7 +584,7 @@ async def post_round(ctx, st, *, weekly: bool = True) -> None:
     try:
         imp = ctx.cfg.get("improve")
         limit = float((imp.to_dict() if imp is not None else {}).get("post_round_timeout_s", 300))
-        await asyncio.wait_for(improve.after_round(ctx, st), limit if limit > 0 else None)
+        await asyncio.wait_for(improve.after_round(_llm_ctx(ctx), st), limit if limit > 0 else None)
     except asyncio.TimeoutError:
         log.error("improve.after_round exceeded %.0f s", limit)
         ctx.store.add_health("improve", "improve_timeout", f"after_round cut after {limit:.0f}s (improve.post_round_timeout_s)")
@@ -534,9 +608,10 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     """Everything a round needs, wired to the real modules (shared by `serve` and `dh round`)."""
     from .customs import Customs
     from .money import Fx
-    from .sources import registry
+    from .sources import ebay, registry
     from .sources.ebay_insights import EbayInsights
 
+    ebay.prefetch_secrets()  # the eBay keys, once per run and in parallel: never a blocking bw-secret inside a round
     root = Path(root)
     try:
         cards_dir = Path(str(cfg.publish.cards_dir))
@@ -590,11 +665,19 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
     db_path(root).parent.mkdir(parents=True, exist_ok=True)
     paused_path(root).unlink(missing_ok=True)  # a pause belongs to the run that saw the change
     agent_lock = AgentLock(root)
-    deadline = time.monotonic() + AGENT_LOCK_WAIT_S
+    t0 = time.monotonic()
+    deadline = t0 + AGENT_LOCK_WAIT_S
+    told = False
     while not agent_lock.acquire():  # single writer: another serve, a foreground `dh round` or the CLI holds it
+        pid, role = lock_holder(root)
+        if role == "cli":  # an owner command (a queued apply may run a live must-pass for minutes): wait it out
+            deadline = max(deadline, t0 + AGENT_LOCK_CLI_WAIT_S)
+            if not told:
+                log.info("an owner command (pid %s) holds %s: waiting for it to finish", pid, agent_lock.path)
+                told = True
         if time.monotonic() >= deadline or stop.is_set():
-            log.error("another agent process holds %s (waited %.0f s); not serving", agent_lock.path,
-                      AGENT_LOCK_WAIT_S)
+            log.error("another process (pid %s, %s) holds %s (waited %.0f s); not serving", pid, role or "agent",
+                      agent_lock.path, time.monotonic() - t0)
             return 1
         with contextlib.suppress(asyncio.TimeoutError):  # the CLI applying a queued command holds it for a moment
             await asyncio.wait_for(stop.wait(), AGENT_LOCK_STEP_S)

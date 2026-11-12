@@ -1,5 +1,9 @@
 # Deal Hunter
 
+> **Owner: start with [`OWNER-TODO.md`](OWNER-TODO.md)**: the short checklist of what only you can do (restart on
+> the new code, subscribe to pushes, publish `main`, mailbox, eBay keys, accountant). Validation results:
+> [`docs/VALIDATION.md`](docs/VALIDATION.md).
+
 Deal Hunter is an autonomous agent that runs on the owner's local LLM rig, while the owner has switched it on, and
 looks for **electronics that can be resold at a profit**: GPUs first, then RAM, SSDs and gaming PCs to part out. It
 finds listings, values them against real clearing prices, computes the full net profit for a Polish VAT-registered
@@ -36,6 +40,22 @@ single-platform bots. Deal Hunter's edge:
 impersonation, no stealth browsers, no challenge solving, no proxy rotation. Requests are plain, identify the agent
 honestly and respect robots.txt. Sites that block polite requests are used only through official APIs, RSS or the
 alert mailbox, or are dropped. See [`docs/SOURCES.md`](docs/SOURCES.md).
+
+## Fastest start: let your coding agent do it
+
+Cloning this repo also gives you its setup skill. Open the checkout with
+[Claude Code](https://claude.com/claude-code) (or any agent that loads
+[Agent Skills](https://agentskills.io)) and run:
+
+```
+/setup-deal-hunter
+```
+
+The agent takes you end to end: preflight (Python, RAM, systemd, llama-swap), install, mapping its LLM roles to
+the models you already run, optional secrets stored without ever printing them (eBay keys, alert mailbox), your
+pickup city and log repo, the systemd unit, the first round - and reports what it verified, with the commands it
+ran. Your only manual steps are this clone and subscribing to the push topic on your phone. The manual path
+below is the same path and stays the reference.
 
 ## Quick start
 
@@ -84,13 +104,14 @@ before judging it. You can seed price history from the public Bazos dataset
 
 ## Owner set-up checklist
 
-Spec section 15, updated for what was built. Items marked **gated** switch a feature on; without them the feature
-stays off and the rest of the agent still works.
+Optional unlocks only - `/setup-deal-hunter` (see [Fastest start](#fastest-start-let-your-coding-agent-do-it))
+walks you through these interactively. Spec section 15, updated for what was built. Items marked **gated** switch
+a feature on; without them the feature stays off and the rest of the agent still works.
 
-1. **Create the private GitHub log repo `deal-hunter-log` (gated: log publishing).** The automated creation was
-   denied by the permission system, so you must create it. An empty repo, or one with only `main`, is fine: the
-   publisher creates the `log` branch itself on its first sync and pushes only `log`, never `main`. Set the clone
-   URL in `config/local/publish.yaml`:
+1. **The private GitHub log repo `deal-hunter-log` (gated: log publishing).** Done: the repo exists and
+   `config/publish.yaml` points at `git@github.com:michalkonik/deal-hunter-log.git`. An empty repo, or one with
+   only `main`, is fine: the publisher creates the `log` branch itself on its first sync and pushes only `log`,
+   never `main`. For another owner, set the clone URL in `config/local/publish.yaml`:
    ```yaml
    remote: git@github.com:<you>/deal-hunter-log.git
    repo_web_url: https://github.com/<you>/deal-hunter-log   # optional: makes push links point at the card
@@ -121,6 +142,7 @@ stays off and the rest of the agent still works.
 | [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) | Every config file and key, local overrides, secrets |
 | [`docs/TUNING.md`](docs/TUNING.md) | Which knob moves what, how to read the scoreboard, symptoms and fixes |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | Start, stop, logs, health, backups, blocks, retention, upgrades, crash recovery |
+| [`.claude/skills/setup-deal-hunter/`](.claude/skills/setup-deal-hunter/SKILL.md) | The `/setup-deal-hunter` skill: first-run setup your coding agent runs for you |
 | [`docs/RUNNING.md`](docs/RUNNING.md) | Command table and sharing the rig |
 | [`docs/SOURCES.md`](docs/SOURCES.md) | Every source: access, robots decision, status; alert mailbox set-up |
 | [`docs/ADDING-A-SOURCE.md`](docs/ADDING-A-SOURCE.md) | Writing an adapter |

@@ -391,3 +391,19 @@ async def test_get_bytes_binary_body_obeys_robots_and_skips_snapshot(tmp_path):
     assert d.disallowed and d.content == b""
     big = await f.get_bytes("https://img.example/p/2.jpg", max_bytes=3)
     assert big.content == b""
+
+
+async def test_report_ok_resets_consecutive_blocks_like_a_good_get(tmp_path):
+    """Deferred minor: a successful paced load (screenshot) never reset `consecutive_blocks`, so two old blocks and
+    one new one, hours apart with good loads between, disabled the domain for the session."""
+    f, ft, st = make(tmp_path, ok_handler([]))
+    f.report_block("a.test", "429")
+    f.report_block("a.test", "429")
+    ft.t += 10_000  # the backoff is over
+    assert await f.pace("a.test") is True
+    f.report_ok("a.test")  # the page loaded fine
+    f.report_block("a.test", "429 much later")
+    assert not f.disabled("a.test")  # counted as the first block again, not the third
+    f.report_block("a.test", "429")
+    f.report_block("a.test", "429")
+    assert f.disabled("a.test")  # three in a row still disable it

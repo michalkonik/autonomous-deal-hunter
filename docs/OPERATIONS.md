@@ -150,6 +150,24 @@ Not deleted: deal cards, evidence screenshots in `var/screenshots/`, and the dat
 screenshots by hand if the disk fills. Seller names and phone numbers are never stored (only a salted hash of the
 seller ID, account age and ratings), and never reach the log repo.
 
+### Comparables after a matcher fix
+
+Comparables are read live from the stored listings and their extractions. An extraction keeps the verdict of the
+matcher that made it until the listing is evaluated again (a new price, or after `scheduler.reeval_hours`), and a
+listing that is gone is never evaluated again: it stays a comparable for up to `valuation.lookback_days` (90
+days). After an upgrade that tightens the matcher (for example the 30 October 2026 fix for laptops and PCs naming
+a GPU, and for water blocks), clear the old verdicts once, with the agent stopped:
+
+```bash
+cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh recheck            # dry run
+cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh recheck --apply    # write
+```
+
+It re-runs the current rules matcher over rules extractions that are comparables today; each one it no longer
+accepts is replaced by the new rules result (so it stops being a comparable at once) and its evaluation is deleted
+(so the next round re-queues it while it is recent, and the LLM decides). LLM extractions and logged deals are
+never changed; deals on affected listings are listed for you to review.
+
 ## Upgrades
 
 1. `dh stop`. Do not pull code while the agent runs: a changed frozen file stops the rounds.
@@ -159,6 +177,8 @@ seller ID, account age and ratings), and never reach the log repo.
 5. Read the diff of `config/*.yaml` against `config/local/*.yaml`: new keys appear in the shipped files, and your
    local overrides still win.
 6. `dh round --once --dry`, then `dh start`.
+7. If the release notes mention a matcher fix: `dh stop`, `dh recheck`, `dh recheck --apply`, `dh start` (see
+   [Comparables after a matcher fix](#comparables-after-a-matcher-fix)).
 
 Schema changes are additive (`create table if not exists`, `add column`) and run on first open, so no manual
 migration is needed.

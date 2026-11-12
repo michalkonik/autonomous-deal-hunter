@@ -388,3 +388,118 @@ def test_deal_page_shows_usd_rate_and_triage(tmp_path):
     t = c.get(f"/deal/{d.id}").text
     assert "3.7012 PLN per USD (NBP mid, 2026-10-28)" in t and "<b>demote</b>" in t
     assert "<b>stock photos</b>" not in t and "&lt;b&gt;stock photos" in t  # model output is escaped
+
+
+# ------------------------------------------------------------------ web fixes 2026-11-03 (LAN 403, date/time, false positive, params)
+
+
+def build_dyn(tmp_path, monkeypatch, ips=("203.0.113.7",)):
+    """App WITHOUT a web.allowed_hosts override: the allowlist is the machine's current addresses
+    (`_local_ipv4s` monkeypatched to a fake LAN IP)."""
+    from dh.web import app as webapp
+    monkeypatch.setattr(webapp, "_local_ipv4s", lambda: set(ips))
+    monkeypatch.setattr(webapp, "_HOSTS_CACHE", None)
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    cfg = config.Config(data)
+    db = tmp_path / "t.db"
+    st = Store(db)
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    return st, TestClient(app, raise_server_exceptions=False)
+
+
+def test_mark_accepted_from_current_local_interface_ip(tmp_path, monkeypatch):
+    st, c = build_dyn(tmp_path, monkeypatch)
+    d, _, _ = make_deal(st)
+    r = c.post(f"/deal/{d.id}/mark", data={"status": "bought"}, follow_redirects=False,
+               headers={"Origin": "http://203.0.113.7:8711", "Host": "203.0.113.7:8711"})
+    assert r.status_code == 303  # the 2026-11-03 bug: LAN IP missing from the startup allowlist -> 403
+    r = c.post(f"/deal/{d.id}/mark", data={"status": "bought"},
+               headers={"Origin": "http://evil.example:8711", "Host": "evil.example:8711"})
+    assert r.status_code == 403  # DNS-rebinding style foreign Host is still refused
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
+
+
+def test_default_allowed_hosts_include_local_interfaces(monkeypatch):
+    from dh.web.app import default_allowed_hosts
+    monkeypatch.setattr("dh.web.app._local_ipv4s", lambda: {"192.168.0.39"})
+    h = default_allowed_hosts()
+    assert "192.168.0.39" in h and "localhost" in h and "127.0.0.1" in h
+
+
+def test_date_time_columns_and_filters(tmp_path):
+    st, c, _ = build(tmp_path)
+    d1, _, _ = make_deal(st, sid="1", seller="1", key="KEY-ONE")
+    make_deal(st, sid="2", seller="2", key="KEY-TWO", created=NOW - timedelta(days=10))
+    loc = d1.created_at.astimezone()  # the table and filters show/compare LOCAL time
+    day, hm = loc.strftime("%Y-%m-%d"), loc.strftime("%H:%M")
+    assert day in c.get("/").text  # the new Date column renders
+    day2 = (NOW - timedelta(days=10)).astimezone().strftime("%Y-%m-%d")
+    t = c.get(f"/?date={day}").text
+    assert "KEY-ONE" in t and "KEY-TWO" not in t
+    t = c.get(f"/?date={day2}").text
+    assert "KEY-TWO" in t and "KEY-ONE" not in t
+    assert "KEY-ONE" in c.get(f"/?date={day}&time={hm}").text  # at exactly that minute: included
+    late = (loc + timedelta(minutes=2)).strftime("%H:%M")
+    assert "KEY-ONE" not in c.get(f"/?date={day}&time={late}").text
+    assert "KEY-ONE" in c.get(f"/?time={hm}").text  # time alone filters time-of-day, any date
+    loc2 = (NOW - timedelta(days=10)).astimezone()
+    if loc2.strftime("%H:%M") < hm:  # keep the assertion meaningful for both deals' local times
+        assert "KEY-TWO" not in c.get(f"/?time={hm}").text
+    for q in ("date=yesterday", "time=25:70", "time=14", "fp=maybe"):
+        assert c.get("/?" + q).status_code == 400
+
+
+def test_false_positive_mark_tag_and_filter(tmp_path):
+    st, c, _ = build(tmp_path)
+    d1, _, _ = make_deal(st, sid="1", seller="1", key="KEY-FP")
+    d2, _, _ = make_deal(st, sid="2", seller="2", key="KEY-CLEAN")
+    assert post(c, d1.id, status="skipped", reason="not a deal", false_positive="1").status_code == 303
+    assert post(c, d2.id, status="bought").status_code == 303
+    assert st.conn.execute("select false_positive from marks where deal_id=?", (d1.id,)).fetchone()[0] == 1
+    assert st.conn.execute("select false_positive from marks where deal_id=?", (d2.id,)).fetchone()[0] == 0
+    t = c.get(f"/deal/{d1.id}").text
+    assert "false positive" in t and 'name="false_positive"' in t  # tag shown, checkbox in all forms
+    assert c.get(f"/deal/{d2.id}").text.count('name="false_positive"') == 3
+    yes, no = c.get("/?fp=yes").text, c.get("/?fp=no").text
+    assert "KEY-FP" in yes and "KEY-CLEAN" not in yes
+    assert "KEY-CLEAN" in no and "KEY-FP" not in no
+
+
+def test_marks_false_positive_migration(tmp_path):
+    """A pre-existing DB whose marks table lacks the column migrates on open; old rows read as false_positive=0."""
+    import sqlite3
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.execute("create table marks (id integer primary key, deal_id integer not null, status text, price_pln text,"
+                " note text, source text, created_at text default current_timestamp)")
+    con.execute("insert into marks (deal_id, status) values (7, 'bought')")
+    con.commit()
+    con.close()
+    st = Store(db)
+    assert st.conn.execute("select false_positive from marks where deal_id=7").fetchone()[0] == 0
+    st.add_mark(8, "skipped", None, "x", "web", false_positive=True)
+    assert st.conn.execute("select false_positive from marks where deal_id=8").fetchone()[0] == 1
+
+
+def test_params_page(tmp_path):
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    data["web"] = {"allowed_hosts": ["testserver"]}
+    data.setdefault("sources", {}).setdefault("adapters", {})["imap_probe"] = {"user": "IMSECRETMARKER42"}
+    cfg = config.Config(data)
+    db = tmp_path / "t.db"
+    st = Store(db)
+    pb = tmp_path / "playbook"
+    pb.mkdir()
+    (pb / "items.yaml").write_text("- {id: q.gpu, kind: query, target: allegro, value: rtx 4090 sentinel, min_pln: 1000}\n")
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.get("/params")
+    assert r.status_code == 200
+    t = r.text
+    assert "Current Parameters" in t and "Deals" in t  # nav entry present
+    assert "allegro" in t and "rtx 4090 sentinel" in t  # shops + playbook queries rendered
+    assert "disabled" in t  # vinted/willhaben are disabled in the shipped config
+    assert "PL" in t and "IMSECRETMARKER42" not in t  # countries shown, secrets never
+    assert "Tier-1 minimum" in t and "gemma" in t

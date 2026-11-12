@@ -13,7 +13,7 @@ from decimal import Decimal
 
 STUBS = ["replay"]  # later milestone
 COMMANDS = ["start", "stop", "status", "deals", "show", "verify", "replay", "eval", "playbook", "books", "round",
-            "report"]
+            "report", "recheck"]
 
 
 def _stub(args: argparse.Namespace) -> int:
@@ -152,7 +152,8 @@ async def _round(args) -> int:
     from .fetch import Fetcher
     root, cfg = _ctx()
     if runtime.is_active():
-        print("refused: the deal-hunter service is running (dh status); stop it before a foreground round")
+        print(f"refused: the agent's unit {runtime.unit_name()} is running (dh status); stop it before a foreground "
+              "round (a second checkout sets its own unit name: DH_UNIT_NAME or runtime.unit_name)")
         return 1
     reasons, before, warnings = runtime.preflight(cfg, need_llm=not args.no_llm)
     for w in warnings:
@@ -492,6 +493,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--weekly", action="store_true", required=True, help="the weekly report (Markdown)")
     sp.add_argument("--publish", action="store_true", help="also write it into the log repo's weekly/ (committed by the next sync)")
     sp.set_defaults(func=cmd_report)
+    from . import recheck
+
+    sp = sub.add_parser("recheck", help="owner, one-off after a matcher fix: rules extractions the current matcher "
+                                        "no longer accepts stop being comparables (dry unless --apply; agent stopped)")
+    sp.add_argument("--apply", action="store_true", help="write the changes (default: only report them)")
+    sp.set_defaults(func=recheck.cli)
     for name in STUBS:
         sp = sub.add_parser(name, help=f"{name} (later milestone)")
         sp.set_defaults(func=_stub)

@@ -187,10 +187,12 @@ def test_p3_owner_apply_with_the_model_down_promotes_nothing(env):
     pid = _prompt_proposal(env)
     down = DownLLM()
     text, code = cli_apply(pid, root=root, store=store, running=False, llm=down)
-    assert code != 0 and down.calls > 0 and "unavailable" in text
-    row = store.conn.execute("select status, detail from proposals where id=?", (pid,)).fetchone()
-    detail = json.loads(row["detail"])
-    assert row["status"] == "rejected" and detail["live_must_pass"]["unavailable"] > 0
+    # review of the 30 Oct wave: a run with unavailable live calls proves nothing, so the apply is neither promoted
+    # nor rejected: it stays queued for a step with the model (and expires after improve.apply_expiry_days)
+    assert down.calls > 0 and "queued as command" in text and "waits" in text
+    row = store.conn.execute("select status from proposals where id=?", (pid,)).fetchone()
+    assert row["status"] == "owner_review"
+    assert store.conn.execute("select applied_at from improve_commands").fetchone()[0] is None
     assert "much worse" not in Playbook.from_file(root).get("prompt.extract").value
 
 

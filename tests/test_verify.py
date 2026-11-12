@@ -357,3 +357,35 @@ def test_price_rise_below_the_floor_is_gone(tmp_path):
     d, _, _ = make_deal(st, price="1500")
     r = run(st, d, FakeAdapter(True, P("2300")))
     assert r.gone and any("below_floor" in x for x in r.diffs)
+
+
+def test_trend_tier4_deal_survives_a_price_change(tmp_path):
+    st = Store(tmp_path / "t.db")
+    d, _, _ = make_deal(st, price="1500")
+    r = run(st, d, FakeAdapter(True, P("2100")))
+    assert r.gone  # no trend signal: below the floor and the tier-4 margin
+    ev = json.loads(d.evidence_json)
+    ev["estimate"]["trend_30d"] = 0.30
+    st.conn.execute("update deals set evidence_json=? where id=?", (json.dumps(ev), d.id))
+    st.conn.commit()
+    r = run(st, d, FakeAdapter(True, P("2100")))  # conservative net about +5 USD: a trend tier-4 watch
+    assert not r.gone
+
+
+# ------------------------------------------------------------------ deferred minor: a good screenshot load resets blocks
+
+
+def test_a_good_screenshot_load_reports_ok_to_the_fetcher(tmp_path, monkeypatch):
+    """`get` resets a domain's consecutive-block count on a good response; a page loaded through `pace` (the
+    screenshot browser) now does the same through `report_ok`, so old blocks no longer add up to a disable."""
+    url = "https://www.kleinanzeigen.de/s-anzeige/x/1"
+    oks = []
+
+    class F(FakeFetcher):
+        def report_ok(self, domain):
+            oks.append(domain)
+    _redirecting_playwright(monkeypatch, [], [])
+    assert asyncio.run(verify.screenshot(url, tmp_path / "a.png", F())) is True
+    assert oks == ["www.kleinanzeigen.de"]
+    _redirecting_playwright(monkeypatch, [], [])
+    assert asyncio.run(verify.screenshot(url, tmp_path / "b.png", FakeFetcher())) is True  # a fetcher without it

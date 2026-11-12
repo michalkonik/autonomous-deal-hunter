@@ -21,8 +21,10 @@ limited to `lookback_days`. The quantiles are capped at the new-retail ceiling: 
 last `recent_days` (or `retail_new_pln`) × 0.95.
 
 FX: `estimate` is sync and reads the `fx` cache (filled by money.Fx; `warm_fx` fills it ahead). A rate up to
-`fx_max_back_days` older than the comp date is accepted with the note "fx_stale" whenever the NBP effective date is
-not the comp date; a comp with no rate is skipped ("fx_missing:CCY").
+`fx_max_back_days` older than the comp date is accepted. The notes cover the comps that make the quantiles (the last
+`recent_days`) only: "fx_stale" when one of them was converted at an NBP rate more than `fx_stale_days` older than
+its date (a weekend or holiday gap is normal NBP behaviour, not staleness), "fx_missing:CCY" when one had no rate
+(it is skipped). Older comps (trend only) never add a note.
 
 Quantiles use midpoint interpolation: each value sits at the middle of its weight on the cumulative-weight axis.
 With equal weights this reproduces the ordinary median.
@@ -63,6 +65,7 @@ class Params:
     lookback_days: int
     active_ask_max_age_days: int
     fx_max_back_days: int
+    fx_stale_days: int
 
     @classmethod
     def from_config(cls, cfg: dhconfig.Config) -> "Params":
@@ -80,6 +83,7 @@ class Params:
             lookback_days=int(d["lookback_days"]),
             active_ask_max_age_days=int(d["active_ask_max_age_days"]),
             fx_max_back_days=int(d["fx_max_back_days"]),
+            fx_stale_days=int(d["fx_stale_days"]),
         )
 
 
@@ -300,7 +304,7 @@ def _tiers(target: str | None, channel: str, p: Params, market_of) -> list[tuple
 class _Conv:
     row: CompRow
     pln: Decimal | None
-    stale: bool
+    gap_days: int  # comp date - NBP effective date of the rate used (0 for PLN or a same-day rate)
 
 
 def _wmedian(rows: list[tuple[Decimal, float]]) -> Decimal:
@@ -349,15 +353,15 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         if (r.listing_id is not None and r.listing_id in excluded) or (r.kind, r.ref) in seen:
             continue
         seen.add((r.kind, r.ref))
-        pln, stale = r.price_pln, False
+        pln, gap = r.price_pln, 0
         if pln is None:
             got = cached_rate(store, r.currency, r.at.date(), p.fx_max_back_days)
             if got is not None:
                 rate, eff = got
-                pln, stale = q2(r.price * rate), eff != r.at.date()
+                pln, gap = q2(r.price * rate), (r.at.date() - eff).days
         if pln is not None and r.kind == "active_ask":
             pln = q2(pln * p.ask_to_sale_ratio)
-        conv.append(_Conv(r, pln, stale))
+        conv.append(_Conv(r, pln, gap))
 
     # channel tier: the first with a converted comp from the last recent_days
     chosen = None
@@ -370,11 +374,12 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         return None
     note, factor, pool = chosen
     notes: list[str] = [note] if note else []
-    missing = sorted({c.row.currency.upper() for c in pool if c.pln is None})
+    recent_pool = [c for c in pool if c.row.at >= recent_from]  # the comps the quantiles use: the FX notes' scope
+    missing = sorted({c.row.currency.upper() for c in recent_pool if c.pln is None})
     notes += [f"fx_missing:{m}" for m in missing]
     used = [(c.row, c.pln, round(p.weights.get(c.row.kind, c.row.weight) * factor, 4))
             for c in pool if c.pln is not None]
-    if any(c.stale for c in pool if c.pln is not None):
+    if any(c.gap_days > p.fx_stale_days for c in recent_pool if c.pln is not None):
         notes.append("fx_stale")
 
     recent = [u for u in used if u[0].at >= recent_from]

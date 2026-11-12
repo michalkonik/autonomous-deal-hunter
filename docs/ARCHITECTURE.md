@@ -59,7 +59,9 @@ says so ([What is and is not wired yet](#what-is-and-is-not-wired-yet)).
 2. **Maintenance** (at most daily, `maintenance_hours`): delete photo hashes, raw snapshots and saved alert mails
    older than the retention.
 3. **LLM guard.** If llama-swap runs a model outside the configured roles, this round runs on rules alone and the
-   listings that need the LLM are marked `llm_pending` (health event `foreign_model`).
+   listings that need the LLM are marked `llm_pending` (health event `foreign_model`). The check is repeated before every
+   LLM call of the round and of the improvement step after it (concurrent calls share one check in flight): a
+   model another workload loads mid-round stops those calls (they would make llama-swap evict it).
 4. **FX warm-up** for EUR, CZK, HUF, GBP, USD (NBP mid rate). The round's day is the LOCAL date, the same date
    `money.Fx` pins rates by. Each appraisal records every rate it used (`money.RecordingFx`); the deal's evidence
    keeps them as `fx_rates` (and the USD rate as `fx_usd`, shown on the card), so `dh verify` and the books replay

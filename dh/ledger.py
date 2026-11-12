@@ -208,9 +208,10 @@ def observe(store: Store, source: str, listings: list[Listing], ts: datetime, *,
             store.conn.execute("update listings set last_seen_at=max(coalesce(last_seen_at,''), ?) where id=?",
                                (ts_iso, lid))
         else:
-            lid = store.upsert_listing(dataclasses.replace(l, seen_at=ts))
+            # one commit for the whole sweep (below), not one fsync per listing: ~3.6 s of a round's event loop
+            lid = store.upsert_listing(dataclasses.replace(l, seen_at=ts), commit=False)
             if old is None or Decimal(old["price"]) != l.price:
-                store.record_observation(lid, l.price, ts)
+                store.record_observation(lid, l.price, ts, commit=False)
         store.conn.execute("update listings set last_window_id=?, disappeared_at=null where id=?", (wid, lid))
         if old is None and appeared is not None:
             store.conn.execute("update listings set appeared_at=? where id=?", (appeared, lid))

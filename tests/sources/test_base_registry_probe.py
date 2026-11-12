@@ -25,7 +25,13 @@ def test_registry_default_and_enabled_filter():
     assert {"allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats",
             "bazos_cz", "bazos_sk"} <= set(reg)
     assert "bazos_at" not in reg
-    assert all(isinstance(a, Adapter) and a.domain and a.country and a.currency for a in reg.values())
+    # Every marketplace adapter names its host, country and currency. The alert mailbox is not a marketplace:
+    # it has no site of its own (its listings carry the platform's source, country and currency), so a live
+    # `adapters.mailbox.enabled: true` in config/local/ must not fail this check.
+    assert all(isinstance(a, Adapter) and a.domain and a.country and a.currency
+               for name, a in reg.items() if name != "mailbox")
+    if "mailbox" in reg:
+        assert reg["mailbox"].domain == "imap"
     assert "olx" not in reg and "olx_pl" not in reg  # OLX moved to the mailbox channel
     assert "sbazar" not in reg and "sbazar" in DROPPED and "robots" in DROPPED["sbazar"]
 

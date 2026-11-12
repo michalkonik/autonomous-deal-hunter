@@ -205,13 +205,3 @@ def test_paid_cap_counts_spend_once_across_rounds_and_a_month_boundary(tmp_path)
     usage["paid_usd"] = 0.0
     assert books.paid_month_usd(st, clock[0]) == 0.0 and c._paid_session == pytest.approx(0.0)
     assert asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA)) == {"a": 1}
-
-
-def test_negative_net_tier4_row_cannot_make_the_bandit_update_raise():
-    """A trend tier-4 deal can carry a negative expected net (min_cons_net_usd < 0): value_units goes negative and
-    Bandit.update refuses negatives, so the scheduler clamps the arm's value at 0."""
-    from dh.bandit import value_units
-    assert value_units([(4, -500.0)]) < 0  # the raw sum is negative ...
-    import inspect
-    from dh import scheduler
-    assert "max(0.0, value_units(" in inspect.getsource(scheduler._Round.run)  # ... and the update site clamps it

@@ -94,14 +94,15 @@ def _read_yaml(p: Path) -> dict:
     return yaml.safe_load(p.read_text()) or {}
 
 
-def load(root: Path) -> Config:
+def load(root: Path, *, local: bool = True) -> Config:
+    """config/*.yaml deep-merged with config/local/*.yaml (`local=False`: the shipped defaults only)."""
     root = Path(root)
     data: dict[str, Any] = {}
     for f in sorted((root / "config").glob("*.yaml")):
         data[f.stem] = _read_yaml(f)
-    local = root / "config" / "local"
-    if local.is_dir():
-        for f in sorted(local.glob("*.yaml")):
+    local_dir = root / "config" / "local"
+    if local and local_dir.is_dir():
+        for f in sorted(local_dir.glob("*.yaml")):
             data[f.stem] = deep_merge(data.get(f.stem, {}), _read_yaml(f))
     check_policy(data)
     return Config(data, root)

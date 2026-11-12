@@ -1,0 +1,51 @@
+{% extends "base.html" %}{% block title %}Current Parameters{% endblock %}
+{% block body %}<h1>Current Parameters</h1>
+<p class="mut">What the agent is configured to do right now (from config/ and the active playbook). Secrets
+(mailbox password, API keys) live in the secret store and are never shown here.</p>
+
+<h2>Shops &amp; sources checked</h2>
+{% if rows %}<div class="tbl"><table><tr><th>Source</th><th>Country</th><th>Status</th><th>Access</th><th>Note</th></tr>
+{% for r in rows %}<tr><td>{{r.name}}</td><td>{{r.country}}</td>
+<td>{% if r.enabled %}<span class="ok">enabled</span>{% else %}<span class="mut">disabled</span>{% endif %}</td>
+<td>{{r.via}}</td><td class="mut">{{r.reason}}</td></tr>{% endfor %}</table></div>
+{% else %}<p class="mut">no sources configured</p>{% endif %}
+{% if feed_sources %}<p class="mut">Feed sources (one query-less sweep per round): {{feed_sources|join(", ")}}</p>{% endif %}
+
+<h2>Retail price watch</h2>
+{% if watches %}<p class="mut">A listing is emitted on a price fall of {{(drop_pct * 100)|round(1) if drop_pct is not none else "?"}}% or more, or below the key's clears-at P25.</p>
+<div class="tbl"><table><tr><th>Shop</th><th>Watched page</th></tr>
+{% for w in watches %}<tr><td>{{w.shop}}</td><td>{{w.url}}</td></tr>{% endfor %}</table></div>
+{% else %}<p class="mut">none</p>{% endif %}
+
+<h2>Countries covered</h2>
+<p>{% if countries %}{% for c in countries %}<span class="tag">{{c}}</span> {% endfor %}{% else %}<span class="mut">none</span>{% endif %}</p>
+
+<h2>Product types searched (active playbook queries)</h2>
+{% if queries %}<div class="tbl"><table><tr><th>Query</th><th>Sources</th><th class="n">Min PLN</th><th class="n">Max PLN</th></tr>
+{% for q in queries %}<tr><td>{{q.value}}</td><td>{{q.target}}</td><td class="n">{{q.min_pln if q.min_pln is not none else ""}}</td><td class="n">{{q.max_pln if q.max_pln is not none else ""}}</td></tr>{% endfor %}</table></div>
+{% else %}<p class="mut">no query items in the playbook</p>{% endif %}
+
+<h2>Money rules</h2>
+<div class="card"><table>
+<tr><th>Effort floors (USD net)</th><td>easy {{money.floors.get("easy")}}, moderate {{money.floors.get("moderate")}}, heavy {{money.floors.get("heavy")}}</td></tr>
+<tr><th>Tier-1 minimum (conservative net USD)</th><td>{{money.t1_min}}</td></tr>
+<tr><th>Star threshold (USD)</th><td>{{money.star_usd}}</td></tr>
+<tr><th>Capital cap (USD)</th><td>{{money.capital_cap_usd}}</td></tr></table></div>
+
+<h2>Cadence &amp; budgets</h2>
+<div class="card"><table>
+<tr><th>Round interval</th><td>{{cadence.round_interval_s}} s</td></tr>
+<tr><th>Search budget per round</th><td>{{cadence.budget}} (max {{cadence.budget_max}})</td></tr>
+<tr><th>Max searches per source</th><td>{{cadence.max_searches_per_source}}</td></tr>
+<tr><th>Max LLM items per round</th><td>{{cadence.max_llm_items}}</td></tr>
+<tr><th>Re-evaluation every</th><td>{{cadence.reeval_hours}} h</td></tr>
+<tr><th>Round timeout</th><td>{{cadence.round_timeout_s}} s</td></tr></table></div>
+
+<h2>Models</h2>
+<div class="card"><table>
+{% for role, name in roles.items() %}<tr><th>{{role}}</th><td>{{name}}</td></tr>{% endfor %}
+<tr><th>Paid API</th><td>{{"enabled (capped)" if paid_enabled else "off (local models only)"}}</td></tr></table></div>
+
+<h2>Web page</h2>
+<p class="mut">{{web_host}}:{{web_port}} (LAN)</p>
+{% endblock %}

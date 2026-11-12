@@ -55,6 +55,7 @@ from urllib.parse import urlsplit
 
 from . import books, cards, dedupe, economics, extract, ledger, notify, partout, photos, risk as riskmod, tiering, valuation, verify
 from . import triage as triagemod
+from .llm import LLMUnavailable
 from .bandit import Bandit, value_units
 from .config import Config, assert_frozen_unchanged
 from .match import rules_extract
@@ -390,12 +391,50 @@ class RoundContext:
 
 
 class _CountingLLM:
-    def __init__(self, inner, stats: RoundStats):
+    """Every LLM call of a round goes through here: counted, and never sent while llama-swap runs a model outside
+    the configured roles. The round-start guard (`_Round._llm_guard`) is not enough: another workload can load its
+    model in the middle of a round (validation, 30 Oct: one did, swapped the role model out and four calls hung
+    for 60 s); the next call would make llama-swap load the role model back and evict theirs. So EVERY call checks
+    llama-swap `/running` first, with no cache: concurrent calls share the one check in flight (a shared future),
+    a call arriving after it finished starts a new one. A refused call raises LLMUnavailable (the listing waits as
+    llm_pending) and is not counted. (A model loaded between the check and llama-swap receiving the call cannot be
+    seen by any client; the window is the round trip to localhost.)"""
+
+    def __init__(self, inner, stats: RoundStats, check: Callable[[], Awaitable[list[str]]] | None = None,
+                 on_foreign: Callable[[list[str]], None] | None = None):
         self._inner, self._stats = inner, stats
+        self._check, self._on_foreign = check, on_foreign
+        self._inflight: asyncio.Future | None = None
+        self._foreign: list[str] = []
+
+    async def _run_check(self) -> list[str]:
+        try:
+            found = list(await self._check())
+        except Exception as e:  # noqa: BLE001 - cannot tell: be safe, no LLM call
+            found = [f"check failed: {type(e).__name__}"]
+        if found and not self._foreign and self._on_foreign is not None:
+            self._on_foreign(found)
+        self._foreign = found
+        return found
+
+    async def _foreign_now(self) -> list[str]:
+        if self._check is None:
+            return []
+        fut = self._inflight
+        if fut is None or fut.done():
+            fut = asyncio.ensure_future(self._run_check())
+            self._inflight = fut
+        return await asyncio.shield(fut)  # one caller's cancellation never cancels the others' shared check
 
     async def chat_json(self, *a, **kw):
+        foreign = await self._foreign_now()
+        if foreign:
+            raise LLMUnavailable("llama-swap runs a model outside the roles: " + ", ".join(foreign))
         self._stats.llm_calls += 1
         return await self._inner.chat_json(*a, **kw)
+
+    def __getattr__(self, name):  # anything else (paid_booked, aclose, ...) is the wrapped client's
+        return getattr(self._inner, name)
 
 
 @dataclass
@@ -430,7 +469,8 @@ class _Round:
         self.stats = RoundStats()
         self.rf = RoundFetcher(ctx.fetcher)
         self.fx = MemoFx(ctx.fx)
-        self.llm = _CountingLLM(ctx.llm, self.stats) if ctx.llm is not None else None
+        self.llm = (_CountingLLM(ctx.llm, self.stats, ctx.llm_check, self._foreign_midround)
+                    if ctx.llm is not None else None)
         workers = ctx.cfg.get("models")
         par = 4
         try:
@@ -856,6 +896,11 @@ class _Round:
         if not ex.key or ex.box_only or ex.wanted_ad or ex.for_parts:
             self._mark_eval(lid, l, note="llm_pending" if pending else "no_key_after_llm")
             return self.stats.drop("no_key")
+        if pending and ex.key != PC_KEY and (ex.bundle_items or ex.certainty < ledger.COMP_MIN_CERTAINTY):
+            # LLM off or unreachable and the rules only guess (a laptop or PC naming a GPU, a lot): never valued as
+            # the bare product; it waits for the LLM (live round 29 Oct: an RTX 5090 laptop became a T3 "card")
+            self._mark_eval(lid, l, note="llm_pending")
+            return self.stats.drop("weak_match_waits_for_llm")
         if ex.key != rules.key and ex.key != PC_KEY and not self._in_range(ex.key, price_pln):
             self._mark_eval(lid, l, note="price_range")
             return self.stats.drop("price_range")
@@ -1321,6 +1366,13 @@ class _Round:
         else:
             nxt = cur
         self.ctx.budget = nxt
+
+    def _foreign_midround(self, foreign: list[str]) -> None:
+        """Another workload loaded a model during this round: the rest of the round's LLM work waits (llm_pending)."""
+        self.stats.llm_mode = "foreign_model"
+        self.stats.foreign_models = list(foreign)
+        self.store.add_health("scheduler", "foreign_model",
+                              "mid-round: LLM calls stopped; llama-swap runs " + ", ".join(foreign))
 
     # ------------------------------------------------------------ main
     async def _llm_guard(self) -> None:

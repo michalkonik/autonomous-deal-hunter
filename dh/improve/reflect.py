@@ -18,7 +18,7 @@ import weakref
 import re
 from datetime import datetime, timedelta, timezone
 
-from ..llm import LLMError, wrap_untrusted
+from ..llm import LLMError, LLMUnavailable, wrap_untrusted
 from . import gates
 from .playbook import EDITABLE_PROMPT_TARGETS, Delta, Item, Playbook, PlaybookError
 
@@ -253,7 +253,8 @@ def is_repeat(d: Delta, rejected: list[dict]) -> bool:
 
 async def propose(trigger: str, evidence: list[dict], playbook: Playbook, *, llm, rejected: list[dict] | None = None,
                   role: str = "advisor") -> Delta | None:
-    """At most one typed delta for `trigger`, or None (no model, no fitting proposal, or a repeat)."""
+    """At most one typed delta for `trigger`, or None (no model, no fitting proposal, or a repeat). LLMUnavailable
+    propagates: the caller keeps the trigger pending instead of treating the silence as "nothing to propose"."""
     if llm is None or playbook.get("prompt.propose") is None:
         return None
     rejected = rejected or []
@@ -266,6 +267,8 @@ async def propose(trigger: str, evidence: list[dict], playbook: Playbook, *, llm
             + wrap_untrusted("\n".join(f"{e.get('ref')} [{e.get('cause')}] {e.get('detail', '')}" for e in evidence[:40])))
     try:
         out = await llm.chat_json(role, playbook.get("prompt.propose").value, user, PROPOSAL_SCHEMA, max_tokens=900)
+    except LLMUnavailable:
+        raise  # no answer at all (model down, swapped out, another workload's model loaded): not "no proposal"
     except LLMError:
         return None
     d = build_delta(out, playbook, trigger)

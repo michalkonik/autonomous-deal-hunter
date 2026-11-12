@@ -24,14 +24,25 @@ _PRICE_IN_TITLE = re.compile(
 ID_RE = re.compile(r"(\d{4,})/?$")
 
 
-_OLD = re.compile(r"(?:było|bylo|was|zamiast|instead of|normally|rrp|ze)\s*\(?\s*$", re.I)
+_OLD = re.compile(r"(?<!\w)(?:było|bylo|was|zamiast|instead of|normally|rrp|ze)\s*\(?\s*$", re.I)
 _DEAL = re.compile(r"(?:\bza|\bdo|\bfor|\bonly|\bnow)\s*$", re.I)
+# a coupon's cap ("kod -10% do 100 zł", "15% off up to £50") or a discount amount ("rabat 100 zł", "cashback 200 zł",
+# "kupon 50 zł"): never the item's price
+_COUPON_WORD = r"(?:kupon\w*|kod\w*|rabat\w*|zni[zż]k\w*|voucher\w*|coupon\w*|cashback|code|promo\w*)"
+_CAP = re.compile(r"(?:\d\s*%|" + _COUPON_WORD + r")[^\d£€$]{0,24}(?:\bdo|\bup to|\bmax\.?|\bbis|\baz)\s*$", re.I)
+_DISCOUNT = re.compile(r"(?<!\w)" + _COUPON_WORD + r"(?:\s+\w+)?\s*[-–]?\s*$|(?<![\w\s])\s*-\s*$|(?<=\s)-$", re.I)
+
+
+def _not_a_price(title: str, m: re.Match) -> bool:
+    head = title[:m.start()]
+    return bool(_OLD.search(head[-14:]) or _CAP.search(head[-40:]) or _DISCOUNT.search(head[-24:]))
 
 
 def title_price(title: str, default_ccy: str):
     """The deal price in a title: the one after "za"/"do" (the last such, so "z X do Y" gives Y), never a
-    "(było X)" / "was X" old price; otherwise the last remaining price."""
-    ms = [m for m in _PRICE_IN_TITLE.finditer(title) if not _OLD.search(title[:m.start()][-14:])]
+    "(było X)" / "was X" old price, a coupon's cap ("-10% do 100 zł") or a discount amount ("rabat 100 zł");
+    otherwise the last remaining price."""
+    ms = [m for m in _PRICE_IN_TITLE.finditer(title) if not _not_a_price(title, m)]
     if not ms:
         return None
     marked = [m for m in ms if _DEAL.search(title[:m.start()][-8:])]

@@ -1109,7 +1109,10 @@ def _cadence_items(minutes):
     if minutes is None:
         return q
     pb = Playbook.from_file(REPO)
-    pb = pb.apply(pb.make_delta("add", Item(f"cadence.allegro_lokalnie", "cadence", "allegro_lokalnie", minutes)))
+    item = Item("cadence.allegro_lokalnie", "cadence", "allegro_lokalnie", minutes)
+    # an owner may already carry a cadence item for this source in playbook/items.yaml: overwrite it instead of
+    # adding a second one ("add: item exists" is a PlaybookError, and the test is about the value, not the op)
+    pb = pb.apply(pb.make_delta("update" if pb.get(item.id) else "add", item))
     return q + [i for i in pb.as_dicts() if i["kind"] == "cadence"]
 
 
@@ -1290,3 +1293,159 @@ async def test_triage_cache_is_keyed_by_the_prompt_sha(tmp_path):
     st = await scheduler.run_round(ctx)
     assert len(llm.triage_calls) == 2 and llm.triage_calls[1][2] == "triage prompt B"
     assert st.triage.get("cached", 0) == 0
+
+
+def test_triage_table_without_prompt_sha_is_migrated(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    ctx.store.conn.execute("drop table if exists triage")
+    ctx.store.conn.execute("create table triage (listing_id integer primary key, title_hash text, price text, "
+                           "result text not null, at text not null)")
+    ctx.store.conn.execute("insert into triage values (1, 'h', '10', '{}', 'x')")
+    ctx.store.conn.commit()
+    scheduler._Round(ctx)
+    cols = {r[1] for r in ctx.store.conn.execute("pragma table_info(triage)")}
+    assert "prompt_sha" in cols
+    assert ctx.store.conn.execute("select prompt_sha from triage where listing_id=1").fetchone()[0] is None
+
+
+# ------------------------------------------------------------------ deferred minors: paid booking, bandit clamp
+
+
+class PaidLLM(FakeLLM):
+    """A paid endpoint: every call costs $0.01, reported through ctx.on_paid like llm.Client(on_paid=...) does;
+    `paid_booked` records what the round handed back after booking it."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.ctx, self.booked = None, []
+
+    async def chat_json(self, role, system, user, schema, max_tokens=600):
+        self.ctx.on_paid(role, 0.01)
+        return await super().chat_json(role, system, user, schema, max_tokens)
+
+    def paid_booked(self, usd):
+        self.booked.append(usd)
+
+
+async def test_round_books_paid_spend_once_and_clears_the_clients_unbooked_counter(tmp_path):
+    """Wiring minor: the round writes the paid_api cost row, then hands exactly that amount to llm.paid_booked and
+    zeroes ctx.usage["paid_usd"], so the client's cap check (books + unbooked) never counts it twice."""
+    llm = PaidLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), llm)
+    llm.ctx = ctx
+    seed_comps(ctx.store)
+    s1 = await scheduler.run_round(ctx)
+    n_calls = len(llm.calls) + len(llm.triage_calls)
+    assert n_calls >= 2 and s1.llm_calls == n_calls
+    assert llm.booked == [pytest.approx(0.01 * n_calls)] and ctx.usage["paid_usd"] == 0.0
+    pln_per_usd = float(ctx.cfg.models.paid_api.pln_per_usd)
+    row = ctx.store.conn.execute("select amount_pln from costs where kind='paid_api' and round_id=?",
+                                 (s1.round_id,)).fetchone()
+    assert float(row["amount_pln"]) == pytest.approx(0.01 * n_calls * pln_per_usd, abs=0.01)
+    s2 = await scheduler.run_round(ctx)  # nothing new to evaluate: no paid call, nothing more booked
+    assert len(llm.booked) == 1 and ctx.usage["paid_usd"] == 0.0
+    row2 = ctx.store.conn.execute("select amount_pln from costs where kind='paid_api' and round_id=?",
+                                  (s2.round_id,)).fetchone()
+    assert float(row2["amount_pln"]) == 0.0
+
+
+async def test_a_negative_net_trend_deal_updates_its_arm_with_zero_value(tmp_path, monkeypatch):
+    """Behavioural test of the bandit clamp (was source inspection): a tier-4 trend deal with a negative expected
+    net makes value_units negative; the round must still finish and the arm gets one pull with reward 0."""
+    import dataclasses
+
+    from dh.bandit import value_units
+    ad = FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1395")])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    _with(ctx, scheduler={"trend": {"min_30d": 0.15, "min_cons_net_usd": -100000}})
+    real = scheduler._Round._estimate
+
+    def rising(self, *a, **kw):
+        e = real(self, *a, **kw)
+        return None if e is None else dataclasses.replace(e, trend_30d=0.3)
+    monkeypatch.setattr(scheduler._Round, "_estimate", rising)
+    st = await scheduler.run_round(ctx)
+    ds = ctx.store.deals()
+    assert [d.tier for d in ds] == [4] and ds[0].exp_net_usd < 0, [(d.tier, d.exp_net_usd) for d in ds]
+    assert value_units([(4, float(ds[0].exp_net_usd))]) < 0  # the raw value would be refused by Bandit.update
+    arm = ledger.arm_id("allegro_lokalnie", "rtx 3060")
+    row = ctx.store.conn.execute("select pulls, reward from arm_stats where arm=?", (arm,)).fetchone()
+    assert row["pulls"] == 1 and row["reward"] == 0.0
+    assert st.round_id is not None and ctx.store.conn.execute(
+        "select notes from rounds where id=?", (st.round_id,)).fetchone()["notes"]  # bookkeeping completed
+
+
+async def test_without_the_llm_a_laptop_naming_a_gpu_is_never_valued_as_the_card(tmp_path):
+    """Live round 29 Oct: "MSI ... Core Ultra 9 275HX ... RTX 5090" (a laptop) became a T3 deal on the rules key.
+    A weak rules key (a system/lot, or certainty < 0.7) waits for the LLM instead of being valued on its own."""
+    lap = listing("9", "Ryzen 7 7800X3D 2TB RTX 3060 12GB", "900")  # rules: gpu:rtx-3060:12, a system, 0.5
+    ctx = make_ctx(tmp_path, FakeAdapter([lap]), None)  # the LLM is off
+    seed_comps(ctx.store)  # 900 PLN against ~1400 PLN cards: a "deal" if valued as a bare card
+    st = await scheduler.run_round(ctx)
+    assert ctx.store.deals() == [] and st.dropped.get("weak_match_waits_for_llm") == 1, st.dropped
+    note = ctx.store.conn.execute("select note from evaluations").fetchone()["note"]
+    assert note == "llm_pending"  # evaluated again as soon as the LLM is back
+
+
+async def test_without_the_llm_a_plain_card_is_still_valued(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), None)
+    seed_comps(ctx.store)
+    st = await scheduler.run_round(ctx)
+    assert st.candidates == 1 and "weak_match_waits_for_llm" not in st.dropped
+
+
+# ------------------------------------------------------------------ validation: a foreign model loaded mid-round
+
+
+async def test_a_model_loaded_mid_round_stops_the_rounds_llm_calls(tmp_path):
+    """Validation 30 Oct: another workload loaded its model after the round-start guard had passed. Every later LLM
+    call would make llama-swap load the role model back and evict theirs; the round's calls stop instead, the
+    listings wait (llm_pending), and one health event says why."""
+    checks = []
+
+    async def running():
+        checks.append(1)
+        return [] if len(checks) == 1 else ["gemma-4-26b-a4b"]  # clean at the round-start guard, then not
+    llm = FakeLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter([listing("1"), listing("2", price="720")]), llm)
+    ctx.llm_check = running
+    seed_comps(ctx.store)
+    st = await scheduler.run_round(ctx)
+    assert llm.calls == [] and llm.triage_calls == [] and st.llm_calls == 0
+    assert st.llm_mode == "foreign_model" and st.foreign_models == ["gemma-4-26b-a4b"]
+    notes = {r["note"] for r in ctx.store.conn.execute("select note from evaluations")}
+    assert notes == {"llm_pending"}  # valued on the rules for now (certainty 0.7), re-evaluated with the LLM later
+    assert ctx.store.conn.execute("select count(*) from health where kind='foreign_model'").fetchone()[0] == 1
+
+
+async def test_counting_llm_checks_before_every_call_and_shares_the_check_in_flight():
+    """Review: a 15 s cache let a call through up to 15 s after another workload loaded its model, and concurrent
+    callers did not share a check. Every call now awaits a check that is in flight or starts a new one."""
+    from dh.llm import LLMUnavailable
+    checks, foreign, gate = [], [[]], asyncio.Event()
+
+    async def running():
+        checks.append(1)
+        await gate.wait()  # slow /running: the concurrent calls must all wait for this one check
+        return foreign[0]
+
+    class Model:
+        def __init__(self):
+            self.n = 0
+
+        async def chat_json(self, *a, **kw):
+            self.n += 1
+            return {"ok": True}
+    seen = []
+    c = scheduler._CountingLLM(Model(), scheduler.RoundStats(), running, seen.append)
+    calls = [asyncio.create_task(c.chat_json("worker", "s", "u", {})) for _ in range(4)]
+    await asyncio.sleep(0)
+    gate.set()
+    assert [await t for t in calls] == [{"ok": True}] * 4 and len(checks) == 1  # one shared check
+    foreign[0] = ["qwen3.8-flash-next-uncensored"]  # loaded right after: the very next call sees it (no cache)
+    with pytest.raises(LLMUnavailable, match="outside the roles"):
+        await c.chat_json("worker", "s", "u", {})
+    assert len(checks) == 2 and c._inner.n == 4 and seen == [["qwen3.8-flash-next-uncensored"]]
+    foreign[0] = []
+    assert await c.chat_json("worker", "s", "u", {}) == {"ok": True} and len(checks) == 3
