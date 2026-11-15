@@ -23,13 +23,19 @@ def _build(conf: dict | None = None) -> dict[str, Adapter]:
     from .ebay import EbayBrowse
     from .mailbox import Mailbox
     from .marktplaats import Marktplaats
+    from .ememain import E2emain
+    from .tori import Tori
     from .retail import RetailWatch
     from .rss import RssAdapter
     from .sprzedajemy import Sprzedajemy
 
     adapters: list[Adapter] = [AllegroLokalnie(), Sprzedajemy(), Kleinanzeigen(), Hardverapro(), Marktplaats(),
+                               E2emain(), Tori(),
                                Bazos("cz"), Bazos("sk"), Bazos("at"),
                                EbayBrowse("EBAY_DE"), EbayBrowse("EBAY_PL"),
+                               EbayBrowse("EBAY_GB"), EbayBrowse("EBAY_FR"), EbayBrowse("EBAY_IT"),
+                               EbayBrowse("EBAY_ES"), EbayBrowse("EBAY_IE"), EbayBrowse("EBAY_AT"),
+                               EbayBrowse("EBAY_CH"), EbayBrowse("EBAY_BE"),
                                RssAdapter("pepper_pl", "https://www.pepper.pl/rss/hot", "PL", "PLN"),
                                RssAdapter("hotukdeals", "https://www.hotukdeals.com/rss/hot", "GB", "GBP"),
                                Mailbox(),
@@ -37,8 +43,9 @@ def _build(conf: dict | None = None) -> dict[str, Adapter]:
     return {a.name: a for a in adapters}
 
 
-ADAPTER_NAMES = ["allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats",
-                 "bazos_cz", "bazos_sk", "bazos_at", "ebay_de", "ebay_pl", "pepper_pl", "hotukdeals", "mailbox", "retail"]
+ADAPTER_NAMES = ["allegro_lokalnie", "sprzedajemy", "kleinanzeigen", "hardverapro", "marktplaats", "2ememain",
+                 "bazos_cz", "bazos_sk", "bazos_at", "ebay_de", "ebay_pl", "tori", "ebay_gb", "ebay_fr", "ebay_it",
+                 "ebay_es", "ebay_ie", "ebay_at", "ebay_ch", "ebay_be", "pepper_pl", "hotukdeals", "mailbox", "retail"]
 
 
 def registry(cfg=None, root: Path | None = None) -> dict[str, Adapter]:

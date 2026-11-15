@@ -19,14 +19,14 @@
 {% if error %}<p class="bad" role="alert"><b>Not saved:</b> {{error}}</p>{% endif %}
 <p>{% if marks %}Latest: <b>{{marks[0].status}}</b>{% if marks[0].price_pln %} at {{marks[0].price_pln}} PLN{% endif %}{% if marks[0].note %} ({{marks[0].note}}){% endif %}{% if marks[0].false_positive %} <span class="tag bad">false positive</span>{% endif %}{% else %}Not marked yet.{% endif %}</p>
 <form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="bought">
-<label>Note<input name="note" maxlength="500"></label>
+<label>Note<textarea name="note" rows="4" cols="48" maxlength="500"></textarea></label>
 <label>False positive<input type="checkbox" name="false_positive" value="1" style="width:auto"></label><button>Bought</button></form>
 <form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="skipped">
-<label>Reason<input name="reason" maxlength="500"></label>
+<label>Reason<textarea name="reason" rows="4" cols="48" maxlength="500"></textarea></label>
 <label>False positive<input type="checkbox" name="false_positive" value="1" style="width:auto"></label><button class="alt">Skipped</button></form>
 <form class="f" method="post" action="/deal/{{deal.id}}/mark"><input type="hidden" name="status" value="sold">
 <label>Sold price (PLN)<input name="price_pln" inputmode="decimal" required pattern="[0-9]+([.,][0-9]{1,2})?"></label>
-<label>Note<input name="note" maxlength="500"></label>
+<label>Note<textarea name="note" rows="4" cols="48" maxlength="500"></textarea></label>
 <label>False positive<input type="checkbox" name="false_positive" value="1" style="width:auto"></label><button>Sold</button></form>
 {% if marks %}<table><tr><th>When</th><th>Status</th><th class="n">PLN</th><th>Note</th><th>FP</th><th>Via</th></tr>
 {% for m in marks %}<tr><td>{{m.created_at}}</td><td>{{m.status}}</td><td class="n">{{m.price_pln or ""}}</td><td>{{m.note or ""}}</td><td>{% if m.false_positive %}yes{% endif %}</td><td>{{m.source}}</td></tr>{% endfor %}</table>{% endif %}</div>

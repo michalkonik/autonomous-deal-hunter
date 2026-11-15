@@ -98,6 +98,43 @@ def test_ebay_parses_fixture():
     assert a.posted_at == datetime(2026, 10, 27, 8, 15, tzinfo=timezone.utc)
 
 
+def test_ebay_variation_listing_priced_at_highest_option(store):
+    """Trap: title advertises the strongest option but the search price is the cheapest one (Koniu's FIFFEX
+    screenshot: 'RTX 5090' at 2399 while the 5090 option costs 6699). The group endpoint must re-price."""
+    async def req(method, url, headers, data, timeout):
+        if "oauth2/token" in url:
+            return 200, json.dumps({"access_token": "tok", "expires_in": 7200})
+        if "get_items_by_item_group" in url:
+            assert "item_group_id=999000111222" in url and headers["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_DE"
+            return 200, fixture_text("ebay", "group_de.json")
+        return 200, fixture_text("ebay", "search_variations_de.json")
+
+    async def nosleep(_): pass
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=KEYS.get, client=ebay.ApiClient(req, min_interval_s=0, sleep=nosleep))
+    ls = run(ad.search(Query(text="gaming pc"), StoreFetcher(store)))
+    v = next(l for l in ls if l.source_id == "v1|999000111222|616564534592")
+    assert v.price == Decimal("6699.00") and v.currency == "EUR"
+    assert "variation listing verified: 3 options, price set to the highest option 6699.00 EUR" in v.description
+    plain = next(l for l in ls if l.source_id == "v1|314159265358|0")
+    assert "variation" not in plain.description and plain.price == Decimal("1549.00")
+
+
+def test_ebay_variation_group_check_failure_keeps_warning(store):
+    async def req(method, url, headers, data, timeout):
+        if "oauth2/token" in url:
+            return 200, json.dumps({"access_token": "tok", "expires_in": 7200})
+        if "get_items_by_item_group" in url:
+            return 400, '{"error": "not a group"}'
+        return 200, fixture_text("ebay", "search_variations_de.json")
+
+    async def nosleep(_): pass
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=KEYS.get, client=ebay.ApiClient(req, min_interval_s=0, sleep=nosleep))
+    ls = run(ad.search(Query(text="gaming pc"), StoreFetcher(store)))
+    v = next(l for l in ls if l.source_id == "v1|999000111222|616564534592")
+    assert v.price == Decimal("2399.00")  # untouched
+    assert "price may be for the cheapest option" in v.description  # the extractor/LLM still sees the warning
+
+
 def test_ebay_search_sends_token_marketplace_and_filter(store):
     rec = Recorder()
     ad = ebay.EbayBrowse("EBAY_PL", secret_fn=KEYS.get, client=_client(rec))
@@ -502,3 +539,16 @@ def test_build_context_prefetches_the_ebay_keys(tmp_path, monkeypatch):
     finally:
         st.close()
     assert seen == [1]
+
+
+def test_ebay_ship_to_pl_filter_on_foreign_markets(store):
+    """Every non-PL market filters to items the seller ships to Poland; PL itself does not need it."""
+    from urllib.parse import parse_qs as pq, urlsplit as us
+    rec = Recorder()
+    ad = ebay.EbayBrowse("EBAY_GB", secret_fn=KEYS.get, client=_client(rec))
+    run(ad.search(Query(text="rtx 4090"), StoreFetcher(store)))
+    assert pq(us(rec.calls[-1][1]).query)["filter"] == ["itemLocationCountry:GB,deliveryCountry:PL,buyingOptions:{FIXED_PRICE}"]
+    for cc, cn in (("EBAY_FR", "FR"), ("EBAY_CH", "CH")):
+        flt = pq(us(ebay.EbayBrowse(cc).search_url(Query(text="x"))).query)["filter"][0]
+        assert flt == f"itemLocationCountry:{cn},deliveryCountry:PL,buyingOptions:{{FIXED_PRICE}}"
+    assert "deliveryCountry" not in ebay.EbayBrowse("EBAY_PL").search_url(Query(text="x"))

@@ -122,16 +122,20 @@ def confidence(extraction, estimate, risk, verified_age_s, capital_usd, rules) -
 
 # ------------------------------------------------------------------------------------------ tiering
 
-def assign(cons_usd: Any, exp_usd: Any, effort: str, conf: str, capital_usd: Any, rules: Any) -> TierResult:
+def assign(cons_usd: Any, exp_usd: Any, effort: str, conf: str, capital_usd: Any, rules: Any,
+           ship_pl: bool = False) -> TierResult:
     """`conf` 'excluded' -> tier None. Tier 1: cons >= t1_min (300) and high confidence. Tier 2: clears the effort floor, confidence >= medium.
     Tier 3: clears the floor, low confidence. Tier 4: floor*(1-0.2) <= cons < floor. Else None (not logged).
     Capital above the cap: None. star = exp >= star_usd (only for logged deals). The trend-signal tier 4 is
-    produced elsewhere."""
+    produced elsewhere. `ship_pl`: the item ships directly to Poland (dh/shipping.py) — the owner can order it
+    himself, so the effort floor is discounted 5% (additional points, owner ruling 2026-11-07)."""
     r = _rules(rules)
     if conf == "excluded":  # a hard-excluded listing is never tiered, at any net
         return TierResult(None, False, _d(r.floors[effort]), ["hard exclude: not logged"])
     cons, exp, cap = _d(cons_usd), _d(exp_usd), _d(capital_usd)
     floor = _d(r.floors[effort])
+    if ship_pl:
+        floor = floor * Decimal("0.95")
     if cap > _d(r.capital_cap_usd):
         return TierResult(None, False, floor, [f"over capital cap ({_fmt(cap)} > {_fmt(_d(r.capital_cap_usd))} USD)"])
     reasons: list[str] = []

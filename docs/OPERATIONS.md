@@ -51,6 +51,10 @@ gone.
 The web page on port 8711 shows the same, with the Bought, Skipped and Sold buttons on each deal. Marks are the
 agent's main source of verified outcomes: use them.
 
+The page runs as its own unit (`deal-hunter-web`), so it can live without the agent: `dh page start` serves the
+same database with the hunter stopped (the nav badge then reads `hunter: stopped`), and the "stop the page"
+button stops just the page server. `dh start` and `dh stop` always handle both units.
+
 ## Logs
 
 The agent logs to the systemd journal:

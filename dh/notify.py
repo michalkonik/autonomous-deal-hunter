@@ -132,7 +132,7 @@ def _clean(x: str | None) -> str:
 def _pretty_source(s: str | None) -> str | None:
     if not s:
         return None
-    return {"olx": "OLX", "ebay_pl": "eBay PL", "ebay_de": "eBay DE", "allegro": "Allegro"}.get(s, s.capitalize())
+    return {"olx": "OLX", "allegro": "Allegro"}.get(s) or (f"eBay {s[5:].upper()}" if s.startswith("ebay_") else s.capitalize())
 
 
 def bw_secret(ref: str) -> str | None:

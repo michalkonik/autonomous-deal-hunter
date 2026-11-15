@@ -135,6 +135,21 @@ _LIKE_NEW = re.compile(r"jak nowa|jak nowy|jak nowe|like[\s-]new|wie neu|neuwert
 _NEW = re.compile(r"(?<![a-z])(?:nowa|nowy|nowe|nowka|new|neu|sealed|zaplombowan\w*|nova|novy|uj)(?![a-z])")
 _USED = re.compile(r"uzywan\w*|(?<![a-z])used(?![a-z])|gebraucht|pouzit\w*|hasznalt|second[\s-]?hand|bazar")
 
+# Structured condition fields the adapters inject from marketplace APIs (eBay browse items carry
+# "condition: New", insights rows carry their condition text). Title-only detection missed them, so unknown-
+# condition eBay comps fell into the used pool and new offers polluted used benchmarks (owner feedback
+# 2026-11-07: a used card must NEVER be benchmarked against new offers, nor the other way round).
+_COND_LABEL = r"(?:condition|zustand|kondycja|stan|estado|etat|staat|condizione|kondice|kondicio)\s*[:=]\s*"
+_COND_FIELD_LIKENEW = re.compile(_COND_LABEL + r"(?:neuwertig|wie neu|like[\s-]?new|casi nuevo|como nuevo|top zustand)")
+_COND_FIELD_NEW = re.compile(_COND_LABEL + r"(?:brand[\s-]?new|new|neu|nieuw|nouveau|nuovo|nowy|nowa|nova|uj|sealed)(?![a-z])")
+_COND_FIELD_USED = re.compile(_COND_LABEL + r"(?:used|gebraucht|pre[\s-]?owned|second[\s-]?hand|occasion\w*|usato|"
+                              r"uzywan\w*|hasznalt|gebruikt|pouzit\w*|ocazie|refurbished?\w*|renoviert|po renowacji)")
+
+# Auction listings: the shown price is the current bid of a rising auction, not a saleable price (owner
+# feedback 2026-11-07 on an allegro_lokalnie RTX 3070 that ran past 950 PLN). Note "auction" -> hard exclude.
+_AUCTION = re.compile(r"(?<![a-z])(?:licytacj\w*|licytuj\w*|aukcj\w*|auktion\w*|auction|bidding|bietowanie|"
+                      r"biederen|veiling|licitatie\w*|licitati\w*|licytacji)(?![a-z])")
+
 # ---------------------------------------------------------------------------------------- bundles / context
 
 _CPU_WORDS = (r"ryzen|core[\s-]*i[3579]|(?<![a-z])i[3579][\s-]\d{4,5}|threadripper|xeon|epyc|athlon|celeron|"
@@ -217,7 +232,17 @@ _ACCESSORY = re.compile(
     r"adapter\w*|cooler\w*|chlodzeni\w*|radiator\w*|uchwyt\w*|podstawk\w*|holder|bracket|stojak\w*|"
     r"zasilacz\w*|psu|netzteil\w*|manual|riser\w*|heatsink\w*|kuhlkorper\w*|chladic\w*|hutobord\w*|"
     # water blocks in PL/CZ/HU/DE/NL (live round 29 Oct: "Blok wodny Alphacool RTX 4070 Ti" became a 380 PLN "card")
-    r"blok|blokk|bloku|wasserblock\w*|kuhlblock\w*|vizhuto\w*|waterblok\w*|waterkoel\w*)(?![a-z])")
+    r"blok|blokk\w*|bloku|wasserblock\w*|kuhlblock\w*|vizhuto\w*|waterblok\w*|waterkoel\w*|"
+    # FI/IT/DE product nouns at the END of the title (owner feedback 7 Nov: "…Hellhound Vesijäähdytysblokki",
+    # "…Aorus Elite Backplate Dissipatore", "…EX Gamer Wasserkühler" were waterblocks, not GPUs)
+    r"vesijaadytys\w*|dissipator\w*|dissipatore)(?![a-z])")
+# Brands that only make cooling parts: when one of them is named the item sold is the part, not the GPU it fits.
+_ACC_BRAND = re.compile(r"(?<![a-z])(?:alphacool|ek ?wb|ek ?waterblocks?|barrows|koolance|bykski|"
+                        r"liquid extasy|magicool|optimus\.(?:co|foundation))(?![a-z])")
+# The trailing-window subset: unambiguous watercooling/backplate nouns only (see _accessory_after).
+_ACCESSORY_TAIL = re.compile(r"(?<![a-z])(?:waterblock|water[\s-]?block|waterblok\w*|waterkoel\w*|waterblok|"
+                             r"wasserkuhl\w*|wasserblock\w*|kuhlblock\w*|backplate|dissipator\w*|dissipatore|"
+                             r"vesijaadytys\w*|blokki|vizhuto\w*|heatsink\w*|kuhlkorper\w*)(?![a-z])")
 _INCLUSION = {"+", "&", "z", "ze", "with", "w", "mit", "inkl", "incl", "plus", "oraz", "i", "a", "und", "and", "s",
               "es", "ses"}
 
@@ -234,11 +259,21 @@ def _accessory_after(after: str) -> bool:
             return False
         if bare != "manual" and _ACCESSORY.search(" " + bare + " "):
             return not (bare.startswith("cooler") and toks[i + 1: i + 2] == ["master"])  # "Cooler Master" brand
+    if len(toks) >= 2:  # trailing strong accessory noun: DE/IT/FI word order puts the sold item LAST (see above).
+        # only waterblock-family/backplate/cooler nouns here: a plain trailing "cooler"/"cable" is an included
+        # extra of the card ("Gigabyte RTX 3080 Gaming OC cooler") and must keep the key.
+        for i in range(max(0, len(toks) - 2), len(toks)):
+            bare = toks[i].strip(",;:.()")
+            prev = toks[i - 1].strip(",;:.()") if i > 0 else ""
+            if toks[i].startswith("+") or prev in _INCLUSION or bare in _INCLUSION:
+                continue
+            if _ACCESSORY_TAIL.search(" " + bare + " "):
+                return True
     return False
 
 
 def _accessory_blocks(t: str, start: int, end: int) -> bool:
-    return _ACCESSORY.search(t[:start]) is not None or _accessory_after(t[end:])
+    return _ACC_BRAND.search(t) is not None or _ACCESSORY.search(t[:start]) is not None or _accessory_after(t[end:])
 
 
 def _storage_accessory(t: str, ram: bool) -> bool:
@@ -593,7 +628,7 @@ def _flags(title_n: str, full_n: str, title_raw: str | None = None) -> tuple[boo
     return wanted, box, bool(defects), defects
 
 
-def _condition(title_n: str, for_parts: bool) -> str:
+def _condition(title_n: str, for_parts: bool, full_n: str = "") -> str:
     if for_parts:
         return "for_parts"
     if _LIKE_NEW.search(title_n):
@@ -602,6 +637,13 @@ def _condition(title_n: str, for_parts: bool) -> str:
         return "new"
     if _USED.search(title_n):
         return "used"
+    if full_n:  # structured field the ADAPTER wrote from the API's condition (not seller prose)
+        if _COND_FIELD_LIKENEW.search(full_n):
+            return "like_new"
+        if _COND_FIELD_NEW.search(full_n):
+            return "new"
+        if _COND_FIELD_USED.search(full_n):
+            return "used"
     return "unknown"
 
 
@@ -665,7 +707,10 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
     wanted, box_only, for_parts, defects = _flags(t, full, title)
     swap = _swap_ad(t)  # exchange ads are hard-excluded like wanted ads (notes carry "swap_ad")
     wanted = wanted or swap
-    condition = _condition(t, for_parts)
+    condition = _condition(t, for_parts, full)
+    extra_notes: list[str] = ["swap_ad"] if swap else []
+    if _AUCTION.search(t) or _AUCTION.search(full):
+        extra_notes.append("auction")
 
     gpu_bundle: list[str] = []  # other products named in a GPU title: it is a PC/bundle, not a card
     if _SYSTEM.search(t):
@@ -685,7 +730,7 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
         if pc:
             return Extraction(key=pc[0], category=pc[1], certainty=pc[2], condition=condition, defects=defects,
                               box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=pc[3],
-                              method="rules", notes=["swap_ad"] if swap else [])
+                              method="rules", notes=list(extra_notes))
 
     result: tuple[str, str, float] | None = None
     if not (wanted or box_only or _MERCH.search(t)):
@@ -700,4 +745,4 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
     return Extraction(
         key=key, category=cat, certainty=cert, condition=condition, defects=defects,
         box_only=box_only, for_parts=for_parts, wanted_ad=wanted, bundle_items=sorted(set(items)), method="rules",
-        notes=["swap_ad"] if swap else [])
+        notes=list(extra_notes))

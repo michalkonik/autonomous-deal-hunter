@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 STUBS = ["replay"]  # later milestone
-COMMANDS = ["start", "stop", "status", "deals", "show", "verify", "replay", "eval", "playbook", "books", "round",
-            "report", "recheck"]
+COMMANDS = ["start", "stop", "status", "page", "deals", "show", "verify", "replay", "eval", "playbook", "books",
+            "round", "report", "recheck"]
 
 
 def _stub(args: argparse.Namespace) -> int:
@@ -55,6 +55,21 @@ def cmd_stop(args) -> int:
     from . import runtime
     root, cfg = _ctx()
     return runtime.stop(cfg, root)
+
+
+def cmd_page(args) -> int:
+    """The standalone page server (`<unit>-web`): browse the deals with the hunter stopped."""
+    from . import runtime
+    root, cfg = _ctx()
+    if args.action == "start":
+        return runtime.start_page(cfg, root)
+    if args.action == "stop":
+        return runtime.stop_page()
+    running = runtime.web_is_active()
+    web = cfg.get("web")
+    port = (web.to_dict() if web is not None else {}).get("port", 8711)
+    print(f"page server: {'RUNNING' if running else 'stopped'} (unit {runtime.web_unit_name()}, port {port})")
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -454,6 +469,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status", help="running?, rounds, last round, deals today, health, ntfy topic, log repo")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_status)
+    sp = sub.add_parser("page", help="the standalone page server: browse deals while the hunter is stopped")
+    sp.add_argument("action", nargs="?", default="status", choices=["start", "stop", "status"])
+    sp.set_defaults(func=cmd_page)
     sp = sub.add_parser("round", help="run rounds in the foreground (testing)")
     sp.add_argument("--once", action="store_true", help="one round, then exit")
     sp.add_argument("--dry", action="store_true", help="no ntfy push, no pending-push retries")
@@ -461,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_round)
     sp = sub.add_parser("deals", help="list deals (star, tier, net)")
-    sp.add_argument("--tier", type=int, choices=[1, 2, 3, 4])
+    sp.add_argument("--tier", type=int, choices=[1, 2, 3, 4, 5])
     sp.add_argument("--limit", type=int, default=100)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_deals)

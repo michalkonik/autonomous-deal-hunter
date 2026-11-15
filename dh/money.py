@@ -38,6 +38,7 @@ _CCY_PATTERNS = [
     ("HUF", re.compile(r"\bft\b|\bhuf\b", re.I)),
     ("USD", re.compile(r"\$|\busd\b", re.I)),
     ("GBP", re.compile(r"£|\bgbp\b", re.I)),
+    ("CHF", re.compile(r"\bchf\b", re.I)),
 ]
 _NUM = re.compile(r"\d{1,3}(?:[   ]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)*")
 _THOUSANDS = re.compile(r"\b(?:tys|tis|ezer)\b\.?|\bk\b", re.I)

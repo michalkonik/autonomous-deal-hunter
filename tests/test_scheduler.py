@@ -19,7 +19,7 @@ from dh.store import Store
 
 REPO = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
-RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90"}
+RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90", "CHF": "4.55"}
 KEY = "gpu:rtx-3060:12"
 
 
@@ -458,7 +458,9 @@ async def test_partout_values_pc_bundle(tmp_path, monkeypatch):
     assert llm.calls == []  # the product extractor is not asked about whole PCs
     assert stats.partout == 1
     d = ctx.store.deals()[0]
-    assert d.key == "pc:bundle" and d.effort == "heavy" and d.tier == 3  # 3 parts -> heavy; certainty 0.5 -> low
+    assert d.key == "pc:bundle" and d.tier == 3  # 3 parts -> heavy; certainty 0.5 -> low
+    # allegro_lokalnie ships inside PL: the direct-to-PL bonus eases heavy -> moderate (owner 2026-11-07)
+    assert d.effort == "moderate" and d.ship_pl == 1
     assert sorted(json.loads(d.evidence_json)["components"]) == ["cpu:ryzen-5-5600", "gpu:rtx-3060:12",
                                                                  "ram:ddr4:16:2x8"]
 
@@ -1449,3 +1451,16 @@ async def test_counting_llm_checks_before_every_call_and_shares_the_check_in_fli
     assert len(checks) == 2 and c._inner.n == 4 and seen == [["qwen3.8-flash-next-uncensored"]]
     foreign[0] = []
     assert await c.chat_json("worker", "s", "u", {}) == {"ok": True} and len(checks) == 3
+
+
+async def test_warm_rates_cover_every_adapter_currency(tmp_path):
+    """Price bounds and PLN valuation silently skip a currency whose rate was never warmed
+    (the live log showed "no PLN rate for CHF" once eBay CH went live): keep the warm list complete."""
+    from dh.sources import registry
+    from dh.sources import registry
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    r = scheduler._Round(ctx)
+    await r._warm_rates()
+    need = {a.currency for a in registry(None, REPO).values() if getattr(a, "currency", None)}
+    missing = {c for c in need if c != "PLN" and c not in r.to_pln_rates}
+    assert not missing, f"round-start rate warm-up misses {sorted(missing)}"

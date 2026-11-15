@@ -15,14 +15,15 @@ from dh.store import Store
 from dh.web.app import create_app
 
 
-def build(tmp_path, hosts=("testserver",)):
+def build(tmp_path, hosts=("testserver",), **kw):
     data = load_cfg_data()
     data["publish"] = {"cards_dir": "var/cards/deals"}
     data["web"] = {"allowed_hosts": list(hosts)}
     cfg = config.Config(data)
     db = tmp_path / "t.db"
     st = Store(db)
-    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms(),
+                     **kw)
     return st, TestClient(app, raise_server_exceptions=False), cfg
 
 
@@ -93,9 +94,9 @@ def test_filters_and_bad_values(tmp_path):
     assert "KEY-ONE" not in c.get("/?country=DE").text
     assert "KEY-ONE" not in c.get("/?source=olx").text
     assert "KEY-TWO" not in c.get("/?category=gpu").text
-    assert "KEY-TWO" not in c.get("/?since=2026-10-25").text
+    assert "KEY-TWO" not in c.get(f"/?date={NOW.astimezone().strftime('%Y-%m-%d')}").text  # only today's local day
     assert "KEY-ONE" in c.get("/?bogus=1&tier=").text
-    for q in ("tier=9", "tier=x", "since=yesterday"):
+    for q in ("tier=9", "tier=x", "date=yesterday"):
         assert c.get("/?" + q).status_code == 400
 
 
@@ -272,8 +273,8 @@ def test_pagination(tmp_path):
     d, _, _ = make_deal(st)
     st.conn.executemany(
         "insert into deals select null, listing_ref, key || ?, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
-        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
-        " from deals where id=?", [(f"-{i:03d}", d.id) for i in range(104)])
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status,"
+        " ship_pl from deals where id=?", [(f"-{i:03d}", d.id) for i in range(104)])
     st.conn.commit()
     p1, p2 = c.get("/").text, c.get("/?page=2").text
     assert p1.count('href="/deal/') == 100 and "page 1 of 2" in p1 and "next" in p1
@@ -311,11 +312,12 @@ def test_pagination_links_urlencoded(tmp_path):
     d, _, _ = make_deal(st)
     st.conn.executemany(
         "insert into deals select null, listing_ref, key, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
-        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
-        " from deals where id=?", [(d.id,)] * 101)
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status,"
+        " ship_pl from deals where id=?", [(d.id,)] * 101)
     st.conn.commit()
-    t = c.get("/?source=kleinanzeigen&since=2026-01-01").text
-    assert 'href="/?page=2&amp;source=kleinanzeigen&amp;since=2026-01-01"' in t
+    day = NOW.astimezone().strftime("%Y-%m-%d")
+    t = c.get(f"/?source=kleinanzeigen&date={day}").text
+    assert f'href="/?page=2&amp;source=kleinanzeigen&amp;date={day}"' in t
 
 
 # ------------------------------------------------------------------ final review I2 + minor: realised net
@@ -503,3 +505,84 @@ def test_params_page(tmp_path):
     assert "disabled" in t  # vinted/willhaben are disabled in the shipped config
     assert "PL" in t and "IMSECRETMARKER42" not in t  # countries shown, secrets never
     assert "Tier-1 minimum" in t and "gemma" in t
+
+
+# ----------------------------------------------------------- new UI: url column, since, badge, page stop, textareas
+
+
+def test_offer_url_column(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    html = c.get("/").text
+    assert '<a href="https://www.kleinanzeigen.de/s-anzeige/x/1"' in html and "offer url" in html
+    st.conn.execute("update listings set url='javascript:alert(1)' where id=?", (d.listing_ref,))
+    st.conn.commit()
+    assert "javascript" not in c.get("/").text  # not http(s): no link, nothing echoed
+
+
+def test_since_dropdown_filters_by_hour(tmp_path):
+    st, c, _ = build(tmp_path)
+    make_deal(st, sid="1", seller="1", key="KEY-ONE")
+    make_deal(st, sid="2", seller="2", key="KEY-TWO", created=NOW - timedelta(days=10))
+    html = c.get("/").text
+    assert 'name="since"' in html and "all time" in html and '<input name="date"' not in html
+    h = NOW.astimezone().strftime("%Y-%m-%d %H:00")
+    both = c.get("/", params={"since": h}).text
+    assert "KEY-ONE" in both and "KEY-TWO" not in both
+    nxt = (NOW.astimezone() + timedelta(hours=1)).strftime("%Y-%m-%d %H:00")
+    assert "KEY-ONE" not in c.get("/", params={"since": nxt}).text
+    for q in ("since=x", "since=2026-10-29", "since=2026-10-29%2013:30", "since=2026-13-45%2008:00"):
+        assert c.get("/?" + q).status_code == 400
+
+
+def test_hunter_badge_states(tmp_path):
+    for state, want in ((True, "hunter: running"), (False, "hunter: stopped"), (None, "hunter: status unknown")):
+        p = tmp_path / str(state)
+        p.mkdir()
+        _, c, _ = build(p, hunter_status=lambda s=state: s)
+        assert want in c.get("/").text
+
+    def boom():
+        raise RuntimeError("systemctl missing")
+    p = tmp_path / "boom"
+    p.mkdir()
+    _, c, _ = build(p, hunter_status=boom)
+    assert "hunter: status unknown" in c.get("/").text  # a broken probe never breaks the page
+
+
+def test_default_hunter_status_watches_the_hunter_unit(tmp_path, monkeypatch):
+    from dh.web import app as webapp
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        return type("R", (), {"stdout": "inactive\n"})()
+    monkeypatch.setenv("DH_HUNTER_UNIT", "deal-hunter")
+    monkeypatch.setattr(webapp.subprocess, "run", fake_run)
+    assert webapp._default_hunter_status() is False
+    assert seen[0][-1] == "deal-hunter"  # the hunter's unit, not the page unit itself
+
+    def raiser(cmd, **kw):
+        raise OSError("no systemd")
+    monkeypatch.setattr(webapp.subprocess, "run", raiser)
+    assert webapp._default_hunter_status() is None
+
+
+def test_page_stop_button(tmp_path):
+    stops = []
+    _, c, _ = build(tmp_path, page_stop=lambda: stops.append(1))
+    r = c.post("/page/stop", headers={"Origin": "http://testserver"})
+    assert r.status_code == 200 and stops == [1] and "Page server stopped" in r.text
+    assert c.post("/page/stop").status_code == 403  # the same CSRF rule as the mark forms
+    assert c.post("/page/stop", headers={"Origin": "http://evil.example"}).status_code == 403
+    assert stops == [1]
+
+
+def test_feedback_fields_are_resizable_textareas(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    html = c.get(f"/deal/{d.id}").text
+    assert '<textarea name="note"' in html and '<textarea name="reason"' in html
+    assert '<input name="note"' not in html and '<input name="reason"' not in html
+    assert "resize:vertical" in html  # drag the corner to enlarge (owner: one-line inputs hid the text)
+    assert post(c, d.id, status="skipped", reason="multi\nline reason").status_code == 303

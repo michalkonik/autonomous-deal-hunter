@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import difflib
 import json
+import os
 import re
 import socket
+import subprocess
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from pathlib import Path
 from urllib.parse import urlencode, urlsplit
@@ -30,6 +32,8 @@ from ..money import Fx
 from ..store import Store
 
 MARK_STATUSES = ("bought", "skipped", "sold")
+# Sortable columns of the deals table (owner request 2026-11-07): header links pass ?sort=<col>&dir=asc|desc.
+SORT_COLS = ("tier", "deal", "src", "ctry", "date", "cons", "exp", "conf", "ship")
 # Countries per adapter (display only, for the Current Parameters page; feeds included).
 PAGE_SIZE = 100
 _PRICE_RE = re.compile(r"\d{1,9}([.,]\d{1,2})?")
@@ -47,12 +51,43 @@ def _q2(x) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
+def _skey(sort: str, d, i) -> object:
+    """Sort key for a deal row (`i`: its joined listing/extraction info row or None). Unknown ship_pl sorts last."""
+    if sort == "tier":
+        return (d.tier, -int(d.star))
+    if sort == "deal":
+        return d.key or ""
+    if sort == "src":
+        return (i["source"] or "") if i else ""
+    if sort == "ctry":
+        return (i["country"] or "") if i else ""
+    if sort == "date":
+        return d.created_at
+    if sort == "cons":
+        return d.cons_net_usd
+    if sort == "exp":
+        return d.exp_net_usd
+    if sort == "conf":
+        return d.confidence
+    return (d.ship_pl is None, d.ship_pl if d.ship_pl is not None else -1)
+
+
 def _parse_filters(params) -> dict:
     f: dict = {}
+    sort = (params.get("sort") or "").strip()
+    if sort:
+        if sort not in SORT_COLS:
+            raise _bad(f"sort must be one of {','.join(SORT_COLS)}")
+        f["sort"] = sort
+        d = (params.get("dir") or "").strip()
+        if d:
+            if d not in ("asc", "desc"):
+                raise _bad("dir must be asc or desc")
+            f["dir"] = d
     tier = (params.get("tier") or "").strip()
     if tier:
-        if tier not in ("1", "2", "3", "4"):
-            raise _bad("tier must be 1-4")
+        if tier not in ("1", "2", "3", "4", "5"):
+            raise _bad("tier must be 1-5")
         f["tier"] = int(tier)
     for k in ("category", "country", "source"):
         v = (params.get(k) or "").strip()
@@ -60,12 +95,6 @@ def _parse_filters(params) -> dict:
             if len(v) > 64:
                 raise _bad(f"{k} too long")
             f[k] = v
-    since = (params.get("since") or "").strip()
-    if since:
-        try:
-            f["since"] = date.fromisoformat(since)
-        except ValueError:
-            raise _bad("since must be YYYY-MM-DD") from None
     day = (params.get("date") or "").strip()
     if day:
         try:
@@ -78,6 +107,15 @@ def _parse_filters(params) -> dict:
         if not _TIME_RE.fullmatch(tm):
             raise _bad("time must be HH:MM")
         f["time"] = tm
+    since = (params.get("since") or "").strip()
+    if since:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2} ([01]\d|2[0-3]):00", since):
+            raise _bad("since must look like 2026-11-07 08:00 (a full hour)")
+        try:
+            datetime.strptime(since, "%Y-%m-%d %H:%M")
+        except ValueError:
+            raise _bad("since must be a real date and hour") from None
+        f["since"] = since
     fp = (params.get("fp") or "").strip()
     if fp:
         if fp not in ("yes", "no"):
@@ -145,12 +183,41 @@ def _host_only(h: str) -> str:
     return h.split(":")[0]
 
 
-def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) -> Starlette:
+def _default_hunter_status():
+    """Is the hunter unit active right now? True/False, or None when systemctl cannot answer (other OS,
+    systemd missing). The page server gets `DH_HUNTER_UNIT` from `dh web start`/`dh start`."""
+    unit = os.environ.get("DH_HUNTER_UNIT") or os.environ.get("DH_UNIT_NAME") or "deal-hunter"
+    try:
+        r = subprocess.run(["systemctl", "--user", "is-active", unit], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() in ("active", "activating", "reloading")
+
+
+def _self_term() -> None:
+    """"stop the page": terminate THIS page-server process shortly after the button's response is sent.
+    As a transient systemd unit (`<unit>-web`) the unit exits with it; the hunter is never touched."""
+    import asyncio
+    import signal as _signal
+
+    def kill():
+        os.kill(os.getpid(), _signal.SIGTERM)
+
+    try:
+        asyncio.get_running_loop().call_later(0.5, kill)
+    except RuntimeError:
+        kill()
+
+
+def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
+               hunter_status=None, page_stop=None) -> Starlette:
     """`fx_factory(store)` / `customs_factory(store)` build the objects used for the books' realised net
     (default: the same cached NBP `Fx` and ISZTAR `Customs` the verifier uses)."""
     root = Path(root)
     fx_factory = fx_factory or (lambda st: Fx(st))
     customs_factory = customs_factory or (lambda st: Customs(st))
+    hunter_status = hunter_status or _default_hunter_status
+    page_stop = page_stop or _self_term
     web_cfg = cfg.get("web")
     # web.allowed_hosts: an explicit Host list (port ignored) accepted on POST, e.g. mDNS "rig.local" or a
     # Tailscale name. Unset (default): the current local addresses, re-discovered per request (_auto_hosts).
@@ -172,6 +239,10 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) 
 
     def render(request: Request, name: str, status: int = 200, **ctx) -> HTMLResponse:
         ctx.setdefault("page", name.removesuffix(".html"))
+        try:  # the nav badge must never break a page
+            ctx.setdefault("hunter", hunter_status())
+        except Exception:  # noqa: BLE001
+            ctx.setdefault("hunter", None)
         return HTMLResponse(_ENV.get_template(name).render(**ctx), status_code=status)
 
     # ---------------------------------------------------------------- deals list
@@ -192,25 +263,22 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) 
                 if key in f:
                     sql += f" and {col}=?"
                     args.append(f[key])
-            if "since" in f:
-                sql += " and d.created_at >= ?"
-                args.append(datetime(f["since"].year, f["since"].month, f["since"].day,
-                                     tzinfo=timezone.utc).isoformat())
             deals = [st._deal(r) for r in st.conn.execute(sql, args)]
             # date/time/fp compare against LOCAL values (created_at is UTC, marks need a join per deal): done
             # after fetch, like the sort - the whole result set is already in memory for pagination.
-            if "date" in f or "time" in f:
+            if "date" in f or "time" in f or "since" in f:
                 def _keep_local(d) -> bool:
                     lt = d.created_at.astimezone()  # machine-local tz (Europe/Warsaw on the rig)
                     if "date" in f and lt.strftime("%Y-%m-%d") != f["date"]:
                         return False
                     if "time" in f and lt.strftime("%H:%M") < f["time"]:
                         return False
+                    if "since" in f and lt.strftime("%Y-%m-%d %H:00") < f["since"]:
+                        return False
                     return True
                 deals = [d for d in deals if _keep_local(d)]
-            deals.sort(key=lambda d: (not d.star, d.tier, -d.cons_net_usd, d.id))
             info = {r["id"]: r for r in st.conn.execute(
-                "select l.id, l.source, l.country, l.title, e.category from listings l "
+                "select l.id, l.source, l.country, l.title, l.url, e.category from listings l "
                 "left join extractions e on e.listing_id=l.id")}
             last = {r["deal_id"]: {"status": r["status"], "fp": bool(r["false_positive"])} for r in st.conn.execute(
                 "select deal_id, status, false_positive from marks where id in (select max(id) from marks group by deal_id)")}
@@ -226,15 +294,33 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) 
         if "fp" in f:
             want = f["fp"] == "yes"
             deals = [d for d in deals if bool((last.get(d.id) or {}).get("fp")) == want]
+        if "sort" in f:
+            deals.sort(key=lambda d: _skey(f["sort"], d, info.get(d.listing_ref)), reverse=f.get("dir") == "desc")
+        else:  # default order: starred first, then tier, then the best conservative net
+            deals.sort(key=lambda d: (not d.star, d.tier, -d.cons_net_usd, d.id))
+        shd = {}
+        for col in SORT_COLS:
+            q2 = {k: str(v) for k, v in f.items()}
+            q2["sort"] = col
+            q2["dir"] = "desc" if (f.get("sort") == col and f.get("dir", "asc") == "asc") else "asc"
+            shd[col] = "/?" + urlencode(q2)
+        arrows = {col: "" for col in SORT_COLS}
+        if "sort" in f:
+            arrows[f["sort"]] = " &#9650;" if f.get("dir", "asc") == "asc" else " &#9660;"
         total = len(deals)
         pages = max(1, -(-total // PAGE_SIZE))
         deals = deals[(page - 1) * PAGE_SIZE: page * PAGE_SIZE]
         rows = [{"d": d, "l": info.get(d.listing_ref), "mark": (last.get(d.id) or {}).get("status"),
                  "fp": bool((last.get(d.id) or {}).get("fp")), "cons_usd": _q2(d.cons_net_usd),
                  "exp_usd": _q2(d.exp_net_usd), "date": d.created_at.astimezone().strftime("%Y-%m-%d"),
-                 "time": d.created_at.astimezone().strftime("%H:%M")} for d in deals]
+                 "time": d.created_at.astimezone().strftime("%H:%M"),
+                 "ship": ("yes" if d.ship_pl == 1 else "no" if d.ship_pl == 0 else "-"),
+                 "url": (info[d.listing_ref]["url"] or "") if d.listing_ref in info else ""} for d in deals]
+        # "since" dropdown: every full hour of the last 7 days, newest first (local time, like the filters)
+        now_h = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0)
+        since_opts = [(now_h - timedelta(hours=i)).strftime("%Y-%m-%d %H:00") for i in range(168)]
         return render(request, "deals.html", rows=rows, f={k: str(v) for k, v in f.items()}, opts=opts,
-                      page_no=page, pages=pages, total=total,
+                      page_no=page, pages=pages, total=total, since_opts=since_opts, shd=shd, arrows=arrows,
                       qs=("&" + urlencode({k: str(v) for k, v in f.items()})) if f else "")
 
     # ---------------------------------------------------------------- deal card
@@ -433,12 +519,21 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None) 
             st.close()
         return render(request, "health.html", events=events, summary=summary, windows=windows)
 
+    # ---------------------------------------------------------------- stop the page
+    async def page_stop_post(request: Request):
+        """The "stop the page" button: stops ONLY the standalone page server (never the hunter). The reply is
+        the last thing this process sends; it terminates itself right after (see _self_term)."""
+        _same_origin(request, allowed_hosts or _auto_hosts())
+        page_stop()
+        return render(request, "stopped.html")
+
     async def http_error(request: Request, exc: HTTPException):
         return PlainTextResponse(f"{exc.status_code}: {exc.detail}\n", status_code=exc.status_code)
 
     return Starlette(
         routes=[Route("/", deals_page), Route("/deal/{id}", deal_page),
                 Route("/deal/{id}/mark", mark_post, methods=["POST"]),
+                Route("/page/stop", page_stop_post, methods=["POST"]),
                 Route("/rounds", rounds_page), Route("/playbook", playbook_page),
                 Route("/books", books_page), Route("/health", health_page), Route("/params", params_page)],
         exception_handlers={HTTPException: http_error})

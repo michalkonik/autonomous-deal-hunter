@@ -106,6 +106,8 @@ class Store:
                 self.ensure_table(f"alter table extractions add column {col}")
         if "false_positive" not in {r["name"] for r in self.conn.execute("pragma table_info(marks)")}:
             self.ensure_table("alter table marks add column false_positive integer not null default 0")
+        if "ship_pl" not in {r["name"] for r in self.conn.execute("pragma table_info(deals)")}:
+            self.ensure_table("alter table deals add column ship_pl integer")
 
     def ensure_table(self, sql: str) -> None:
         self.conn.execute(sql)
@@ -197,10 +199,10 @@ class Store:
         cur = self.conn.execute(
             """insert into deals (listing_ref, key, tier, star, effort, confidence, cons_net_pln, exp_net_pln,
                cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at,
-               verified_at, status) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               verified_at, status, ship_pl) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (d.listing_ref, d.key, d.tier, int(d.star), d.effort, d.confidence, str(d.cons_net_pln),
              str(d.exp_net_pln), str(d.cons_net_usd), str(d.exp_net_usd), str(d.capital_usd), d.breakdown_json,
-             d.evidence_json, json.dumps(d.reasons), _iso(d.created_at), _iso(d.verified_at), d.status))
+             d.evidence_json, json.dumps(d.reasons), _iso(d.created_at), _iso(d.verified_at), d.status, d.ship_pl))
         self.conn.commit()
         return cur.lastrowid
 

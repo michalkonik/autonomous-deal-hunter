@@ -71,6 +71,7 @@ class Deal:
     created_at: datetime
     verified_at: datetime | None = None
     status: str = "new"
+    ship_pl: int | None = None  # direct-to-Poland shipping: 1 yes, 0 no, None unknown (dh/shipping.py)
 
 
 # Comparable kinds, in order of trust (spec §6.2). Default weights live in dh/valuation.py and config/valuation.yaml.

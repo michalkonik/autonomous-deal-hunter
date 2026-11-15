@@ -17,6 +17,21 @@ active_ask_max_age_days: 3    # a tracked listing still counts as a live ask if 
 fx_max_back_days: 4           # cached NBP rate may be up to this many days older than the comp
 fx_stale_days: 3              # note "fx_stale" only when a recent comp's rate is older than this (weekends are normal)
 
+gate:                         # value gate (dh/valuegate.py): evidence-and-edge screen between pricing and saving.
+  enabled: true               # keep a tier only with evidence (sold comps / clear discount vs new) AND an edge
+  min_sold: 3                 # (nothing meaningfully cheaper, or deep discount vs the ask median); the rest
+  sold_recent_days: 180       # becomes a tier-5 watchlist item, pure market price is dropped outright.
+  retail_discount: 0.85
+  max_cheaper: 2
+  cheaper_tolerance: 0.05     # asks within this fraction of the buy price count as equal, not cheaper
+  deep_discount: 0.75
+  junk_fraction: 0.25         # prices below this fraction of the pool reference are variation traps
+  market_ask_ratio: 0.95      # outright drop: ask at or above this fraction of the ask median ...
+  market_retail_ratio: 0.90   # ... and at or above this fraction of the new-retail floor ...
+  market_min_cheaper: 10      # ... with at least this many strictly cheaper live asks around
+  min_real_asks: 5            # fewer cleaned asks than this: the pool is too thin to judge market price on
+  lookback_days: 90           # how far back the gate reads the key's comparables
+
 # Comparable channel and market (country) of each source. A per-adapter `channel:` key in sources.yaml
 # (adapters.<source>.channel) overrides the channel name.
 channels:
@@ -26,6 +41,14 @@ channels:
   sprzedajemy: {channel: sprzedajemy, market: PL}
   ebay_pl: {channel: ebay_pl, market: PL}
   ebay_de: {channel: ebay_de, market: DE}
+  ebay_gb: {channel: ebay_gb, market: GB}
+  ebay_fr: {channel: ebay_fr, market: FR}
+  ebay_it: {channel: ebay_it, market: IT}
+  ebay_es: {channel: ebay_es, market: ES}
+  ebay_ie: {channel: ebay_ie, market: IE}
+  ebay_at: {channel: ebay_at, market: AT}
+  ebay_ch: {channel: ebay_ch, market: CH}
+  ebay_be: {channel: ebay_be, market: BE}
   kleinanzeigen: {channel: kleinanzeigen, market: DE}
   bazos_cz: {channel: bazos_cz, market: CZ}
   bazos_sk: {channel: bazos_sk, market: SK}
@@ -33,6 +56,8 @@ channels:
   sbazar: {channel: sbazar, market: CZ}
   hardverapro: {channel: hardverapro, market: HU}
   marktplaats: {channel: marktplaats, market: NL}
+  2ememain: {channel: 2ememain, market: BE}
+  tori: {channel: tori, market: FI}
 
 # Part-out valuation of whole PCs (dh/partout.py): sum of per-part P25/median/P75, less a parting-out cost and the
 # outbound shipping of every part but the first (the net engine already charges one outbound leg).

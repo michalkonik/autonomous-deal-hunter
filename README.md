@@ -80,7 +80,8 @@ dh stop                                      # stop everything, release the mode
 ```
 
 - The web page is on **http://&lt;rig&gt;:8711** while the agent runs (`config/web.yaml`). Deals, deal cards with
-  Bought / Skipped / Sold buttons, rounds, playbook, books and health.
+  Bought / Skipped / Sold buttons, rounds, playbook, books and health. With the hunter stopped, `dh page start`
+  serves the same page alone until you stop it (`dh page stop` or the page's own button).
 - Push notifications: install the **ntfy** app and subscribe to the topic that `dh status` prints (a random
   24-character topic, generated on first use and kept in `config/local/notify.yaml`). A tier-1 push is titled
   `T1 ★ +$640 RTX 4090 24GB · OLX Kraków`; its body has the buy price, the exit range (P25-median and channel),

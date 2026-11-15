@@ -487,6 +487,36 @@
   sentinel: false
   min_pln: 4000
   value: rtx 5090
+- id: query.rtx_6070
+  kind: query
+  target: all
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  min_pln: 1200
+  note: next-gen RTX 60 series (pre-launch; kept so first listings and pre-orders are caught from day one)
+  value: rtx 6070
+- id: query.rtx_6080
+  kind: query
+  target: all
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  min_pln: 2500
+  note: next-gen RTX 60 series (pre-launch; kept so first listings and pre-orders are caught from day one)
+  value: rtx 6080
+- id: query.rtx_6090
+  kind: query
+  target: all
+  provenance: seed
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  min_pln: 4000
+  note: next-gen RTX 60 series flagship (pre-launch; kept so first listings and pre-orders are caught from day one)
+  value: rtx 6090
 - id: query.rx_6800
   kind: query
   target: all
@@ -577,6 +607,15 @@
   sentinel: false
   min_pln: 300
   value: rx 9070 xt
+- id: query.rx_9060_xt
+  kind: query
+  target: all
+  provenance: owner
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  min_pln: 700
+  value: rx 9060 xt
 - id: query.ddr4_32gb
   kind: query
   target: all

@@ -22,7 +22,7 @@ adapters:
       kleinanzeigen: [kleinanzeigen.de, classistatic.de]
       ebay: [ebayimg.com]
   vinted: {enabled: false}
-  ebay: {enabled: true, via: api}   # applies to ebay_de and ebay_pl; disabled at run time without keys (bw-secret ebay#client_id / #client_secret)
+  ebay: {enabled: true, via: api}   # applies to all ebay_* markets (DE, PL + GB, FR, IT, ES, IE, AT, CH, BE); disabled at run time without keys (bw-secret ebay#client_id / #client_secret). Foreign markets return only items the seller ships to PL.
   pepper_pl: {enabled: true, via: rss}
   hotukdeals: {enabled: true, via: rss}
   retail: {enabled: true}
@@ -31,6 +31,8 @@ adapters:
   kleinanzeigen: {enabled: true}
   hardverapro: {enabled: true}
   marktplaats: {enabled: true}
+  2ememain: {enabled: true}
+  tori: {enabled: true}
   # Bazos: search is disallowed by robots.txt; category listing pages only, filtered locally.
   bazos_cz: {enabled: true, pages: 2}
   bazos_sk: {enabled: true, pages: 2}

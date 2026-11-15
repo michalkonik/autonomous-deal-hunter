@@ -222,7 +222,7 @@ def test_context_checks_llama_swap_for_foreign_models(tmp_path, monkeypatch):
 FAKE_PGREP = r"""#!/usr/bin/env python3
 # Fake pgrep: parses options like procps (a pattern starting with '-' is an option unless it follows '--') and
 # prints the lines listed in $FAKE_PGREP_OUT, one "<pid> <cmdline>" per line.
-import os, sys
+import os, re, sys
 args, pattern, opts_done = sys.argv[1:], None, False
 for a in args:
     if not opts_done and a == "--":
@@ -235,7 +235,7 @@ for a in args:
         pattern = a
 if pattern is None:
     sys.exit(2)
-lines = [l for l in open(os.environ["FAKE_PGREP_OUT"]).read().splitlines() if pattern in l]
+lines = [l for l in open(os.environ["FAKE_PGREP_OUT"]).read().splitlines() if re.search(pattern, l)]
 print("\n".join(lines))
 sys.exit(0 if lines else 1)
 """
@@ -443,7 +443,8 @@ def test_start_stop_and_status_use_the_configured_unit(tmp_path, monkeypatch):
     runtime.stop(cfg(), tmp_path, run=sysrun, http_get=swap, out=out)
     assert ["systemctl", "--user", "stop", "deal-hunter-dev"] in sysrun.calls
     named = [c for c in sysrun.calls if c[0] == "systemctl" and c[2] != "show"]
-    assert named and all(c[-1] == "deal-hunter-dev" for c in named), named
+    # every systemctl call names the configured unit or its `-web` page unit — never the default name
+    assert named and all(c[-1] in ("deal-hunter-dev", "deal-hunter-dev-web") for c in named), named
     assert not any("deal-hunter" == c[-1] for c in sysrun.calls)
 
 
@@ -554,3 +555,85 @@ def test_post_round_makes_no_llama_swap_request_when_the_step_makes_no_llm_call(
 
 def test_the_suite_never_uses_the_live_unit_name():
     assert runtime.unit_name() == "deal-hunter-test"
+
+
+# ------------------------------------------------------- standalone page server (serve-web, `<unit>-web`)
+
+
+class Units:
+    """systemctl/systemd-run fake with PER-UNIT active state, so the hunter unit and its `-web` page unit
+    can be told apart (the shared Sys flag cannot)."""
+
+    def __init__(self):
+        self.calls, self.units = [], {}
+
+    def __call__(self, cmd, **kw):
+        self.calls.append(list(cmd))
+        out, rc = "", 0
+        if cmd[:3] == ["systemctl", "--user", "is-active"]:
+            ok = self.units.get(cmd[3], False)
+            out, rc = ("active\n", 0) if ok else ("inactive\n", 3)
+        elif cmd[:3] == ["systemctl", "--user", "is-enabled"]:
+            out = "enabled\n"
+        elif cmd[:3] == ["systemctl", "--user", "show"]:
+            ok = self.units.get(cmd[3], False)
+            out = f"ActiveState={'active' if ok else 'inactive'}\nMainPID={4242 if ok else 0}\n"
+        elif cmd[:3] == ["systemctl", "--user", "stop"]:
+            self.units[cmd[3]] = False
+        elif cmd[:3] == ["systemctl", "--user", "reset-failed"]:
+            pass
+        elif cmd[0] == "systemd-run":
+            self.units[next(c.split("=", 1)[1] for c in cmd if c.startswith("--unit="))] = True
+        elif cmd[0] == "pgrep":
+            out, rc = "", 1
+        return subprocess.CompletedProcess(cmd, rc, out, "")
+
+
+def test_web_unit_name_is_deriated():
+    assert runtime.web_unit_name() == "deal-hunter-test-web"
+
+
+def test_serve_pattern_ignores_the_page_server(fake_pgrep):
+    """`serve$` is anchored: a `serve-web` page server must never count as a leftover hunter agent."""
+    fake_pgrep("4242 /venv/bin/python -m dh.runtime serve-web")
+    assert runtime.serve_processes() == []
+
+
+def test_start_page_runs_the_web_unit_alone(tmp_path):
+    sysrun, out = Sys(), io.StringIO()
+    rc = runtime.start_page(cfg(), tmp_path, run=sysrun, out=out, python="/venv/bin/python", wait_s=0)
+    assert rc == 0, out.getvalue()
+    sr = next(c for c in sysrun.calls if c[0] == "systemd-run")
+    assert sr[:3] == ["systemd-run", "--user", "--unit=deal-hunter-test-web"]
+    assert "--setenv=DH_HUNTER_UNIT=deal-hunter-test" in sr  # the badge watches the hunter, not itself
+    assert sr[-4:] == ["/venv/bin/python", "-m", "dh.runtime", "serve-web"]
+    rc2 = runtime.start_page(cfg(), tmp_path, run=sysrun, out=out, wait_s=0)
+    assert rc2 == 0 and sum(c[0] == "systemd-run" for c in sysrun.calls) == 1  # already up: no second unit
+
+
+def test_stop_page_stops_only_the_web_unit():
+    sysrun, out = Sys(active=True), io.StringIO()
+    assert runtime.stop_page(run=sysrun, out=out) == 0
+    stops = [c[3] for c in sysrun.calls if c[:3] == ["systemctl", "--user", "stop"]]
+    assert stops == ["deal-hunter-test-web"]  # never the hunter's own unit
+    assert "stopped" in out.getvalue()
+
+
+def test_dh_start_and_stop_manage_the_page_unit(tmp_path):
+    sysrun, swap, out = Units(), Swap([ROLES[0]]), io.StringIO()
+    rc = runtime.start(cfg(), tmp_path, run=sysrun, http_get=swap, meminfo=meminfo(tmp_path, 30), out=out,
+                       python="/venv/bin/python", wait_s=0)
+    assert rc == 0, out.getvalue()
+    assert sysrun.units == {"deal-hunter-test": True, "deal-hunter-test-web": True}  # hunter + page together
+    out2 = io.StringIO()
+    rc = runtime.stop(cfg(), tmp_path, run=sysrun, http_get=Swap([]), out=out2)
+    assert rc == 0, out2.getvalue()
+    assert sysrun.units == {"deal-hunter-test": False, "deal-hunter-test-web": False}  # full stop kills both
+
+
+def test_status_reports_the_page_server(tmp_path):
+    sysrun = Units()
+    s = runtime.status(cfg(), tmp_path, run=sysrun, http_get=Swap([]))
+    assert s["page"] == {"unit": "deal-hunter-test-web", "running": False}
+    sysrun.units["deal-hunter-test-web"] = True
+    assert runtime.status(cfg(), tmp_path, run=sysrun, http_get=Swap([]))["page"]["running"] is True

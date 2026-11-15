@@ -53,7 +53,7 @@ from statistics import median
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
-from . import books, cards, dedupe, economics, extract, ledger, notify, partout, photos, risk as riskmod, tiering, valuation, verify
+from . import books, cards, dedupe, economics, extract, ledger, notify, partout, photos, risk as riskmod, shipping, tiering, valuation, valuegate, verify
 from . import triage as triagemod
 from .llm import LLMUnavailable
 from .bandit import Bandit, value_units
@@ -456,6 +456,7 @@ class Appraisal:
     tier: tiering.TierResult
     fxr: Any = None  # money.RecordingFx: every rate this appraisal used (stored in the evidence for replay)
     triage: dict | None = None  # the finalist triage result (dh.triage), recorded on the card
+    ship_pl: int | None = None  # direct-to-Poland shipping: 1/0/None (dh/shipping.py)
 
 
 # ------------------------------------------------------------------------------------------------ the round
@@ -488,6 +489,8 @@ class _Round:
         self.enabled_channels = list(ctx.cfg.economics.exit_channels.enabled)
         self.channels = valuation.Channels.from_config(ctx.cfg)
         self.params = valuation.Params.from_config(ctx.cfg)
+        self.gate = valuegate.GateParams.from_valuation(ctx.cfg["valuation"])  # dh/valuegate.py screen
+        self.gate_cache: dict[tuple, valuegate.MarketData] = {}  # raw market picture per (key, condition), once per round
         self.est_cache: dict[tuple, Any] = {}
         self.ledger_cache: dict[tuple, list] = {}  # (key, condition) -> ledger comparables, once per round (I5)
         self.ask_cache: dict = {}  # median-ask index per (key, currency) for clears_at
@@ -527,7 +530,7 @@ class _Round:
         return self.ctx.stop is not None and self.ctx.stop.is_set()
 
     async def _warm_rates(self) -> None:
-        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD"):
+        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF"):
             try:
                 self.to_pln_rates[ccy] = await self.fx.rate(ccy, self.today)
                 await self.fx.rate(ccy, self.today - timedelta(days=1))  # pins a dated row valuation can read
@@ -977,7 +980,7 @@ class _Round:
             if must_wait:
                 self.waiting -= 1
 
-    async def _partout(self, l: Listing, lid: int, ex: Extraction):
+    async def _partout(self, l: Listing, lid: int, ex: Extraction, condition: str | None = None):
         """Part-out exit estimate of a whole PC (cached per listing for the round). Uses the worker LLM for the parts
         the rules miss, within the round's LLM item budget and worker slots."""
         if lid in self.partout_cache:
@@ -990,9 +993,10 @@ class _Round:
         if client is not None:
             async with self._llm_slot():
                 est = await partout.value(l, ex, self.store, self.ctx.now(), client, params=self.params,
-                                          channels=self.channels)
+                                          channels=self.channels, condition=condition)
         else:
-            est = await partout.value(l, ex, self.store, self.ctx.now(), None, params=self.params, channels=self.channels)
+            est = await partout.value(l, ex, self.store, self.ctx.now(), None, params=self.params,
+                                      channels=self.channels, condition=condition)
         self.partout_cache[lid] = est
         if est is not None:
             self.stats.partout += 1
@@ -1003,7 +1007,7 @@ class _Round:
         cfg = self.cfg
         cond = ex.condition if ex.condition in ("new", "like_new") else "used"
         if ex.key == PC_KEY:
-            est = await self._partout(l, lid, ex)
+            est = await self._partout(l, lid, ex, cond)
             ests = {est.channel: est} if est is not None else {}
             if est is not None:  # effort sees the parts (>= 3 valued parts -> heavy)
                 ex = dataclasses.replace(ex, bundle_items=partout.parts_of(est))
@@ -1073,18 +1077,25 @@ class _Round:
         exp_usd = await fxr.pln_to_usd(net.exp_net_pln, self.today)
         cap_usd = net.capital_usd if net.capital_usd is not None else await fxr.pln_to_usd(net.capital_pln, self.today)
         effort = tiering.effort_class(l, ch, net.flags, est, extraction=ex)
+        ship = shipping.ship_pl(l)
+        if ship == 1 and effort == "heavy":
+            effort = "moderate"  # direct-to-PL shipping removes the forwarding leg (owner bonus 2026-11-07)
         conf, why = tiering.confidence(ex, est, rk2, verified_age_s, cap_usd, cfg.rules)
-        tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules)
+        tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules, ship_pl=ship == 1)
+        if ship == 1:
+            tr.reasons.append("ships directly to Poland: 5% floor bonus, no forwarding needed")
         if tr.tier is None:  # below the floor and not within 20%: a rising market can still make it a tier-4 watch
             tr = trend_signal(est.trend_30d, cons_usd, cap_usd, conf, cfg.rules, self.sc, tr.floor_usd) or tr
-        return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr, fxr)
+        return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr, fxr,
+                         ship_pl=ship)
 
     def _deal(self, a: Appraisal, evidence: str = "{}") -> Deal:
         return Deal(id=None, listing_ref=a.lid, key=a.ex.key, tier=a.tier.tier, star=a.tier.star, effort=a.effort,
                     confidence=a.confidence, cons_net_pln=a.net.cons_net_pln, exp_net_pln=a.net.exp_net_pln,
                     cons_net_usd=a.cons_usd, exp_net_usd=a.exp_usd, capital_usd=a.capital_usd,
                     breakdown_json=cards.breakdown_json(a.net), evidence_json=evidence,
-                    reasons=list(a.tier.reasons) + [f"confidence: {w}" for w in a.why], created_at=self.ctx.now())
+                    reasons=list(a.tier.reasons) + [f"confidence: {w}" for w in a.why], created_at=self.ctx.now(),
+                    ship_pl=a.ship_pl)
 
     def _verifier(self, l: Listing, ad):
         """The adapter that may detail-fetch / verify `l`: its own adapter, or, for a listing that arrived through the
@@ -1106,6 +1117,9 @@ class _Round:
         if a is None or a.tier.tier is None:
             if a is not None:
                 self.stats.drop("below_floor")
+            return None
+        a = self._value_gate(a)
+        if a is None:
             return None
         if self._cross_duplicate(a, await self._price_pln(l) or Decimal(0)):
             self.stats.duplicates += 1  # the same item on another listing / platform: no detail fetch, no deal
@@ -1167,6 +1181,7 @@ class _Round:
                     a2 = await self._appraise(l, lid, ex, price_pln, verified_age_s=0.0, stock_photo=stock)
                     if a2 is not None and a2.tier.tier is not None:
                         a2 = self._apply_triage(a2, tri)
+                        a2 = self._value_gate(a2)  # a changed price is a changed market picture: the screen runs again
                     if a2 is None or a2.tier.tier is None:
                         if changed:
                             self.stats.drop("price_changed_below_floor")
@@ -1176,6 +1191,27 @@ class _Round:
                     else:
                         a = a2
         return await self._save(a, arm, verified)
+
+    # ------------------------------------------------------------ value gate (dh/valuegate.py)
+    def _value_gate(self, a: Appraisal) -> Appraisal | None:
+        """Evidence-and-edge screen between pricing and saving: keeps the tier, forces it to the tier-5 watchlist
+        (stored and shown, never pushed, never re-fetched), or drops the listing outright. Skipped for part-out
+        PCs - their value is the sum of their parts, not one key's comparables."""
+        if not self.gate.enabled or a.ex.key is None or a.ex.key == PC_KEY:
+            return a
+        cond = a.ex.condition if a.ex.condition in ("new", "like_new") else "used"
+        ck = (a.ex.key, cond)
+        if ck not in self.gate_cache:
+            self.gate_cache[ck] = valuegate.collect(self.store, a.ex.key, cond, self.ctx.now(), self.gate)
+        v = valuegate.verdict(a.inp.buy_price, self.gate_cache[ck], self.gate)
+        if v.action == "drop":
+            self.stats.drop(f"value_gate_{v.code}")
+            return None
+        if v.action == "watch":
+            a.tier.tier = 5
+            a.tier.reasons.append(v.note)
+            a.why.append(v.note)
+        return a
 
     # ------------------------------------------------------------ finalist triage (dh/triage.py)
     async def _triage(self, l: Listing, lid: int, a: Appraisal) -> triagemod.Triage:
@@ -1247,10 +1283,10 @@ class _Round:
         self.store.conn.execute(
             """update deals set key=?, tier=?, star=?, effort=?, confidence=?, cons_net_pln=?, exp_net_pln=?,
                cons_net_usd=?, exp_net_usd=?, capital_usd=?, breakdown_json=?, evidence_json=?, reasons=?,
-               verified_at=null, status=case when status='gone' then 'new' else status end where id=?""",
+               ship_pl=?, verified_at=null, status=case when status='gone' then 'new' else status end where id=?""",
             (d.key, d.tier, int(d.star), d.effort, d.confidence, str(d.cons_net_pln), str(d.exp_net_pln),
              str(d.cons_net_usd), str(d.exp_net_usd), str(d.capital_usd), d.breakdown_json, d.evidence_json,
-             json.dumps(d.reasons), deal_id))
+             json.dumps(d.reasons), d.ship_pl, deal_id))
         self.store.conn.commit()
 
     def _pushed(self, deal_id: int) -> bool:

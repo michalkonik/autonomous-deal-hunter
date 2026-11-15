@@ -134,3 +134,10 @@ def test_long_tail_dropped_not_registered():
     for name in ("willhaben", "olx_ro", "olx_bg", "olx_pt"):
         assert name not in reg and name in DROPPED
     assert "forbidden" in DROPPED["willhaben"]
+
+
+def test_registry_eu_ebay_markets_registered():
+    reg = registry(load(ROOT), ROOT)
+    assert {"ebay_gb", "ebay_fr", "ebay_it", "ebay_es", "ebay_ie", "ebay_at", "ebay_ch", "ebay_be"} <= set(reg)
+    assert reg["ebay_gb"].country == "GB" and reg["ebay_gb"].currency == "GBP"
+    assert reg["ebay_ch"].currency == "CHF" and reg["ebay_be"].country == "BE"

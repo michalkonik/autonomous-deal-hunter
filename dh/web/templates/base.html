@@ -17,9 +17,10 @@ td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
 form.f{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin:8px 0}
 label{display:flex;flex-direction:column;font-size:.85rem;color:var(--mut)}
 input,select,button{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg)}
+textarea{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%;max-width:640px;min-width:320px;min-height:8rem;resize:vertical}
 button{background:var(--acc);color:#fff;border-color:var(--acc);cursor:pointer}button.alt{background:transparent;color:var(--acc)}
 pre{white-space:pre-wrap;overflow-x:auto;background:var(--card);padding:8px;border-radius:6px;font-size:.85rem}
 .tag{display:inline-block;padding:0 6px;border-radius:10px;background:var(--card);border:1px solid var(--line);font-size:.8rem}
 </style></head><body>
-<nav>{% for href,label,key in [("/","Deals","deals"),("/rounds","Rounds","rounds"),("/playbook","Playbook","playbook"),("/books","Books","books"),("/health","Health","health"),("/params","Current Parameters","params")] %}<a href="{{href}}"{% if page==key or (page=="deal" and key=="deals") %} class="on"{% endif %}>{{label}}</a>{% endfor %}</nav>
+<nav>{% for href,label,key in [("/","Deals","deals"),("/rounds","Rounds","rounds"),("/playbook","Playbook","playbook"),("/books","Books","books"),("/health","Health","health"),("/params","Current Parameters","params")] %}<a href="{{href}}"{% if page==key or (page=="deal" and key=="deals") %} class="on"{% endif %}>{{label}}</a>{% endfor %}<span style="flex:1"></span>{% if hunter is defined %}{% if hunter %}<span class="tag" style="color:var(--ok);border-color:var(--ok)">hunter: running</span>{% elif hunter is none %}<span class="tag">hunter: status unknown</span>{% else %}<span class="tag" style="color:var(--bad);border-color:var(--bad)">hunter: stopped</span>{% endif %}{% endif %}<form class="f" method="post" action="/page/stop" style="margin:0;align-items:center"><button class="alt" style="padding:2px 10px;font-size:.85rem" title="Stop only the background page server; the hunter keeps running">stop the page</button></form></nav>
 <main>{% block body %}{% endblock %}</main></body></html>

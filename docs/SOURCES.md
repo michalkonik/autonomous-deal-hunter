@@ -23,8 +23,11 @@ The registry is in `dh/sources/__init__.py` (`ADAPTER_NAMES`, `DROPPED`); the sw
 | Kleinanzeigen.de (DE) | `kleinanzeigen` | Plain HTML at low rate | Enabled |
 | HardverApro (HU) | `hardverapro` | Plain HTML, page 1 only | Enabled |
 | Marktplaats (NL) | `marktplaats` | HTML search page (embedded page data) | Enabled |
+| 2ememain.be (BE) | `2ememain` | HTML search page (embedded page data; same platform as Marktplaats) | Enabled |
+| Tori.fi (FI) | `tori` | JSON search endpoint allowed by robots.txt (Adevinta BAP API) | Enabled |
 | Bazos CZ, SK | `bazos_cz`, `bazos_sk` | Allowed category pages, filtered locally | Enabled |
 | eBay DE and PL | `ebay_de`, `ebay_pl` | Official Browse API | **Disabled until keys exist** |
+| eBay EU/EU-adjacent (GB, FR, IT, ES, IE, AT, CH, BE) | `ebay_gb`, `ebay_fr`, `ebay_it`, `ebay_es`, `ebay_ie`, `ebay_at`, `ebay_ch`, `ebay_be` | Official Browse API, filtered to sellers shipping to PL | **Disabled until keys exist** |
 | eBay sold prices | (Marketplace Insights) | Official API, limited release | **Disabled until the scope is granted** |
 | Pepper.pl, hotukdeals | `pepper_pl`, `hotukdeals` | RSS "hot" feeds | Enabled (feed sources) |
 | Retail price watch | `retail` | JSON-LD on shop pages: morele.net, x-kom.pl | Enabled (feed source) |
@@ -62,8 +65,10 @@ The HTML search page `/q/<query>/` is allowed and embeds the listings in `__NEXT
 `pages` pages (20 ads each) of the matching category (for example `pc.bazos.cz/graficka/`) and filters locally.
 The Bazos dataset can also seed price history (`python -m dh.seed bazos`).
 
-**eBay (DE, PL).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`
-(read once per run: restart the agent after adding them).
+**eBay (DE, PL, GB, FR, IT, ES, IE, AT, CH, BE).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`
+(read once per run: restart the agent after adding them). Foreign markets add `deliveryCountry:PL` to the search
+filter, so only items the seller ships to Poland are returned. (eBay's PT, FI, SE, NO, DK markets are not supported
+by the Browse API — those countries need their local marketplaces instead.)
 eBay web pages are never fetched. eBay's terms ban AI shopping agents and scrapers since February 2026, so the API
 is the only route. The API client is a documented exception to the web fetcher (it needs a POST token call and does
 not serve robots.txt): it still sends the honest User-Agent, paces calls, backs off 60 s doubling to 1 h on 429 or

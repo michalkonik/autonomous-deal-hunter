@@ -179,11 +179,15 @@ def test_flagship_signals():
     assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu:rtx-3070:8")).flags
     assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu-mobile:rtx-4090:16")).flags
     assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu:rx-7900-xtx:24")).flags
-    for k in ("rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090"):
+    for k in ("rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090",
+              "rtx-6080", "rtx-6090"):
         assert "origin_cn_hk" in assess(l=listing(country="HK"), e=ext(key=f"gpu:{k}:16")).flags, k
+    assert "origin_cn_hk" not in assess(l=listing(country="CN"), e=ext(key="gpu:rtx-6070:12")).flags
     nophoto = assess(l=listing(photos=[]))
     assert "no_photos_flagship" in nophoto.flags
     assert "no_photos_flagship" not in assess(l=listing(photos=[]), e=ext(key="gpu:rtx-4080:16")).flags
+    assert "no_photos_flagship" in assess(l=listing(photos=[]), e=ext(key="gpu:rtx-6090:32")).flags
+    assert "no_photos_flagship" not in assess(l=listing(photos=[]), e=ext(key="gpu:rtx-6080:20")).flags
     assert "stock_photo" in assess(stock_photo=True).flags
     assert assess(stock_photo=True).p_scam > assess().p_scam
 

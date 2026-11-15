@@ -78,7 +78,44 @@ async def test_backoff_after_429(tmp_path):
     assert f.blocked("a.test")
     ft.t += 2
     assert not f.blocked("a.test")
-    assert [k for _, k, _ in st.health].count("blocked") == 2
+    assert [k for _, k, _ in st.health].count("soft_backoff") == 2
+    assert [k for _, k, _ in st.health].count("blocked") == 0
+    assert not f.disabled("a.test")
+
+
+async def test_repeated_429_never_disables_and_honours_retry_after(tmp_path):
+    calls = []
+
+    def h(req):
+        calls.append(req.url.path)
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(429, text="slow down", headers={"Retry-After": "300"})
+    f, ft, st = make(tmp_path, h)
+    for _ in range(5):
+        r = await f.get("https://a.test/x", kind="html")
+        assert r.blocked
+        assert f.blocked("a.test")
+        ft.t += 902
+    assert not f.disabled("a.test")
+    # Retry-After 300 s beats the plain 60 s start on the first failure
+    assert "backoff 300s" in st.health[0][2]
+    assert [k for _, k, _ in st.health].count("soft_backoff") == 5
+    # soft cap: the doubling never exceeds 15 min
+    assert "backoff 900s" in st.health[-1][2]
+
+
+async def test_429_challenge_page_still_counts_as_block(tmp_path):
+    def h(req):
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(429, text="<title>captcha-delivery</title>")
+    f, ft, st = make(tmp_path, h)
+    for _ in range(3):
+        await f.get("https://a.test/x", kind="html")
+        ft.t += 4000
+    assert f.disabled("a.test")
+    assert [k for _, k, _ in st.health].count("blocked") == 3
 
 
 async def test_disable_after_3_blocks(tmp_path):
@@ -90,12 +127,15 @@ async def test_disable_after_3_blocks(tmp_path):
     f, ft, st = make(tmp_path, h)
     for _ in range(3):
         await f.get("https://a.test/x", kind="html")
-        ft.t += 4000
+        ft.t += 1000  # stay inside the disable cooldown: after the 3rd block the domain must be blocked
     assert f.disabled("a.test") and f.blocked("a.test")
     n = len(calls)
     r = await f.get("https://a.test/x", kind="html")
     assert r.blocked and len(calls) == n
     assert any(k == "disabled" for _, k, _ in st.health)
+    ft.t += 3601  # the disable cooldown expired (2026-11-07): the domain gets one retry with a fresh streak
+    assert not f.blocked("a.test") and not f.disabled("a.test")
+    assert any(k == "re_enabled" for _, k, _ in st.health)
 
 
 async def test_robots_disallow_respected(tmp_path):

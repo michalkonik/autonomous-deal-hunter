@@ -19,7 +19,7 @@ import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Awaitable, Callable
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 import httpx
 
@@ -29,8 +29,16 @@ from .base import Adapter, AdapterError, Query, filter_query, now_utc, price_of,
 UA = "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+GROUP_URL = "https://api.ebay.com/buy/browse/v1/item/get_items_by_item_group?item_group_id={}"
 SCOPE = "https://api.ebay.com/oauth/api_scope"
-MARKETS = {"EBAY_DE": ("ebay_de", "DE", "EUR"), "EBAY_PL": ("ebay_pl", "PL", "PLN"), "EBAY_US": ("ebay_us", "US", "USD")}
+MARKETS = {"EBAY_DE": ("ebay_de", "DE", "EUR"), "EBAY_PL": ("ebay_pl", "PL", "PLN"), "EBAY_US": ("ebay_us", "US", "USD"),
+           "EBAY_GB": ("ebay_gb", "GB", "GBP"), "EBAY_FR": ("ebay_fr", "FR", "EUR"),
+           "EBAY_IT": ("ebay_it", "IT", "EUR"), "EBAY_ES": ("ebay_es", "ES", "EUR"),
+           "EBAY_IE": ("ebay_ie", "IE", "EUR"), "EBAY_AT": ("ebay_at", "AT", "EUR"),
+           "EBAY_CH": ("ebay_ch", "CH", "CHF"), "EBAY_BE": ("ebay_be", "BE", "EUR")}
+# Foreign markets only return items the seller ships to Poland (verified filter: an unsupported filter value
+# produces a warning while deliveryCountry is accepted; total counts show it genuinely filters).
+SHIP_TO = "PL"
 FOR_PARTS_IDS = {"7000"}  # "For parts or not working"
 ALLOWED_API_HOSTS = frozenset({"api.ebay.com"})
 Request = Callable[..., Awaitable[tuple[int, str]]]
@@ -170,6 +178,8 @@ class EbayBrowse(Adapter):
         self._keys: tuple[str, str] | None | bool = False  # False = not resolved yet
         self.client = client or api_client_for("api.ebay.com")
         self._token: tuple[str, float] | None = None
+        #: source_id -> item group id for variation listings found by the last parse_search
+        self.variations: dict[str, str] = {}
 
     # ---------------------------------------------------------------- keys / health
     def _resolve(self) -> tuple[str, str] | None:
@@ -215,8 +225,11 @@ class EbayBrowse(Adapter):
         return tok
 
     def search_url(self, q: Query) -> str:
-        flt = f"itemLocationCountry:{self.country},buyingOptions:{{FIXED_PRICE}}"
-        return f"{SEARCH_URL}?{urlencode({'q': q.text, 'filter': flt, 'limit': self.limit})}"
+        parts = [f"itemLocationCountry:{self.country}"]
+        if self.country != SHIP_TO:
+            parts.append(f"deliveryCountry:{SHIP_TO}")
+        parts.append("buyingOptions:{FIXED_PRICE}")
+        return f"{SEARCH_URL}?{urlencode({'q': q.text, 'filter': ','.join(parts), 'limit': self.limit})}"
 
     async def search(self, query: Query, fetcher=None, to_pln=None) -> list[Listing]:
         if not self.enabled:
@@ -232,7 +245,41 @@ class EbayBrowse(Adapter):
             raise AdapterError(f"{self.name}: token rejected")
         if status != 200:
             raise AdapterError(f"{self.name}: search status {status}")
-        return filter_query(parse_search(text, self), query, to_pln or self.to_pln)
+        ls = filter_query(parse_search(text, self), query, to_pln or self.to_pln)
+        await self.price_variations(ls, tok)
+        return ls
+
+    async def price_variations(self, ls: list[Listing], tok: str) -> None:
+        """Variation listings show the price of their CHEAPEST option while the title advertises the strongest
+        one (observed: an 'RTX 5090' PC listed at 2399 whose 5090 option costs 6699; 999 buys the RTX 3050).
+        Ask the group endpoint and price at the HIGHEST option: a deal at that price is a real deal.
+        400 means the id is not a group after all; the warning note stays and the price is left untouched."""
+        for l in ls:
+            gid = self.variations.get(l.source_id)
+            if not gid:
+                continue
+            try:
+                status, text = await self.client.call("GET", GROUP_URL.format(gid), {
+                    "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
+            except AdapterError:
+                continue
+            if status != 200:
+                continue
+            try:
+                items = json.loads(text, parse_float=Decimal).get("items") or []
+            except ValueError:
+                continue
+            same = [Decimal(str(i["price"]["value"])) for i in items
+                    if (i.get("price") or {}).get("value") is not None
+                    and (i["price"].get("currency") or l.currency) == l.currency]
+            if not same:
+                continue
+            hi = max(same)
+            if hi > l.price:
+                l.description += f"; variation listing verified: {len(same)} options, price set to the highest option {hi} {l.currency}"
+                l.price = hi
+            else:
+                l.description += f"; variation listing verified: {len(same)} options, listed price is already the highest"
 
     async def active_comps(self, key: str, fetcher=None) -> list[CompRow]:
         """Active fixed-price asks for `key` on this marketplace as `active_ask` CompRows (ingest with
@@ -265,11 +312,21 @@ def _default_weight() -> float:
         return 0.3
 
 
+def _group_id(it: dict) -> str:
+    href = it.get("itemGroupHref") or ""
+    gid = (parse_qs(urlsplit(href).query).get("item_group_id") or [""])[0]
+    if not gid.isdigit():
+        segs = str(it.get("itemId") or "").split("|")
+        gid = segs[1] if len(segs) > 2 and segs[1].isdigit() else ""
+    return gid
+
+
 def parse_search(text: str, ad: EbayBrowse) -> list[Listing]:
     try:
         j = json.loads(text, parse_float=Decimal)
     except ValueError as e:
         raise AdapterError(f"{ad.name}: invalid JSON") from e
+    ad.variations = {}
     out: list[Listing] = []
     for it in j.get("itemSummaries") or []:
         opts = it.get("buyingOptions") or []
@@ -282,6 +339,11 @@ def parse_search(text: str, ad: EbayBrowse) -> list[Listing]:
         sel = it.get("seller") or {}
         cond = it.get("condition") or ""
         parts = [f"condition: {cond}"] if cond else []
+        if it.get("itemGroupType"):
+            gid = _group_id(it)
+            if gid:
+                parts.append("variation listing: price may be for the cheapest option, not the one in the title")
+                ad.variations[str(it["itemId"])] = gid
         if str(it.get("conditionId")) in FOR_PARTS_IDS:
             parts.append("for parts or not working")
         loc = it.get("itemLocation") or {}

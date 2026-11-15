@@ -52,7 +52,8 @@ from .store import Store
 log = logging.getLogger("dh.runtime")
 
 UNIT = "deal-hunter"  # the default unit name; `unit_name()` lets a second checkout on the same host use its own
-SERVE_PATTERN = "-m dh.runtime serve"
+WEB_SUFFIX = "-web"  # the page server's unit is <unit>-web: it keeps serving the page after `dh stop`
+SERVE_PATTERN = "-m dh.runtime serve$"  # pgrep regex: NOT the page server ("serve-web", its own unit)
 ROOT = Path(__file__).resolve().parents[1]
 _UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,99}$")
 
@@ -84,6 +85,11 @@ def unit_name(root: Path | None = None) -> str:
 
 def db_path(root: Path) -> Path:
     return Path(root) / "var" / "dh.db"
+
+
+def web_unit_name() -> str:
+    """The transient page-server unit of this checkout: `<unit>-web` (tests: deal-hunter-test-web)."""
+    return unit_name() + WEB_SUFFIX
 
 
 def state_path(root: Path) -> Path:
@@ -427,14 +433,73 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
         return 1
     web = cfg.get("web")
     port = (web.to_dict() if web is not None else {}).get("port", 8711)
+    if start_page(cfg, root, run=run, out=out, python=python) != 0:
+        print(f"warning: the hunter is up but the page server did not start; retry with `dh page start`", file=out)
     print(f"deal-hunter started (unit {unit}); web page on port {port}; stop with `dh stop`", file=out)
     return 0
+
+
+def web_is_active(run=subprocess.run) -> bool:
+    """The page server unit of this checkout (`<unit>-web`) is active."""
+    try:
+        return _sys(run, "systemctl", "--user", "is-active", web_unit_name()).stdout.strip() in (
+            "active", "activating", "reloading")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def start_page(cfg, root: Path, *, run=subprocess.run, out=sys.stdout, python: str | None = None,
+               wait_s: float = 0.0) -> int:
+    """(Re)start the standalone page server: a transient unit `<unit>-web` running `-m dh.runtime serve-web`.
+    It serves the same database without the agent, holds no agent lock and never touches the hunter unit;
+    `dh start` runs it next to the hunter, `dh page start` runs it alone (browse with the hunter stopped).
+    Only the mark forms write. Stopped by `dh page stop`, `dh stop` or the "stop the page" button."""
+    root = Path(root)
+    unit = web_unit_name()
+    web = cfg.get("web")
+    port = (web.to_dict() if web is not None else {}).get("port", 8711)
+    if web_is_active(run):
+        print(f"page server already running (unit {unit}, port {port})", file=out)
+        return 0
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        _sys(run, "systemctl", "--user", "reset-failed", unit)
+    cmd = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--property=KillMode=control-group",
+           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", f"--setenv=DH_UNIT_NAME={unit}",
+           f"--setenv=DH_HUNTER_UNIT={unit_name()}", "--setenv=PYTHONUNBUFFERED=1",
+           python or sys.executable, "-m", "dh.runtime", "serve-web"]
+    r = _sys(run, *cmd)
+    if r.returncode != 0:
+        print(f"systemd-run failed ({r.returncode}): {r.stderr.strip()}", file=out)
+        return 1
+    if wait_s:
+        time.sleep(wait_s)
+    if not web_is_active(run):
+        print(f"the page server did not stay up: see journalctl --user -u {unit}", file=out)
+        return 1
+    print(f"page server started (unit {unit}, port {port}); stop with `dh page stop` or the page's button",
+          file=out)
+    return 0
+
+
+def stop_page(*, run=subprocess.run, out=sys.stdout) -> int:
+    """Stop the page server unit only; the hunter unit is never touched."""
+    unit = web_unit_name()
+    was = web_is_active(run)
+    try:
+        r = _sys(run, "systemctl", "--user", "stop", unit, timeout=60)
+        print(f"systemctl --user stop {unit}: " + ("stopped" if was else "was not running")
+              + (f" ({r.stderr.strip()})" if r.returncode and r.stderr.strip() else ""), file=out)
+        return 0 if not web_is_active(run) else 1
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"systemctl stop {unit} failed: {e}", file=out)
+        return 1
 
 
 def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=sys.stdout) -> int:
     root = Path(root)
     unit = unit_name()
     was = is_active(run)
+    stop_page(run=run, out=out)  # the page server is the agent's too: a full stop stops it (never touches models)
     try:
         r = _sys(run, "systemctl", "--user", "stop", unit, timeout=150)
         print(f"systemctl --user stop {unit}: " + ("stopped" if was else "was not running")
@@ -478,6 +543,7 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
     out: dict[str, Any] = {"running": active, "unit": unit_name(), "state": show.get("ActiveState"),
                            "pid": int(show.get("MainPID") or 0) or None, "since": show.get("ActiveEnterTimestamp"),
                            "uptime_s": None, "processes": serve_processes(run)}
+    out["page"] = {"unit": web_unit_name(), "running": web_is_active(run)}
     try:
         stt = json.loads(state_path(root).read_text())
         out["started_at"] = stt.get("started_at")
@@ -653,7 +719,9 @@ class _QuietServer:
 
 
 async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, install_signals: bool = True,
-                      web: bool = True) -> int:
+                      web: bool = False) -> int:
+    """The agent itself: rounds loop + publisher. `web` embeds the page in this process for a manual
+    `serve`; the normal path is `dh start`, which runs the page in its own unit (`serve-web`) instead."""
     from .fetch import Fetcher
 
     root = Path(root)
@@ -789,11 +857,48 @@ def serve(root: Path | None = None) -> int:
     return asyncio.run(serve_async(dhconfig.load(root), root))
 
 
+async def serve_web_async(cfg, root: Path, *, stop: asyncio.Event | None = None,
+                          install_signals: bool = True) -> int:
+    """The page alone (unit `<unit>-web`): uvicorn only — no rounds, no publisher, no agent lock. It opens its
+    own SQLite connections per request like any reader, and only the mark forms write. SIGTERM or the page's
+    "stop the page" button sets `stop`; the server exits gracefully."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    root = Path(root)
+    stop = stop or asyncio.Event()
+    if install_signals:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+    db_path(root).parent.mkdir(parents=True, exist_ok=True)
+    w = cfg.get("web")
+    w = w.to_dict() if w is not None else {}
+    server = _QuietServer(uvicorn.Config(create_app(db_path(root), cfg, root, page_stop=stop.set),
+                                         host=str(w.get("host", "0.0.0.0")), port=int(w.get("port", 8711)),
+                                         log_level="warning", lifespan="off"))
+    task = asyncio.create_task(server.serve(), name="web")
+    await stop.wait()
+    server.should_exit = True
+    with contextlib.suppress(Exception):
+        await task
+    return 0
+
+
+def serve_web(root: Path | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = Path(root or root_dir())
+    return asyncio.run(serve_web_async(dhconfig.load(root), root))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["serve"]:
         return serve()
-    print("usage: python -m dh.runtime serve   (use `dh start` instead)", file=sys.stderr)
+    if argv[:1] == ["serve-web"]:
+        return serve_web()
+    print("usage: python -m dh.runtime serve|serve-web   (use `dh start` / `dh page` instead)", file=sys.stderr)
     return 2
 
 

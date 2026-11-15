@@ -134,7 +134,7 @@ async def main(argv: list[str]) -> int:
     print("search", res.status, "disallowed" if res.disallowed else "", "blocked" if res.blocked else "", url)
     if res.status != 200:
         return 1
-    body = trim_marktplaats(res.text) if a.source == "marktplaats" else trim(res.text, a.source, kind="search")
+    body = trim_marktplaats(res.text) if a.source in ("marktplaats", "2ememain") else trim(res.text, a.source, kind="search")
     (out / "search.html").write_text(body)
     print("  search.html", len(body), "bytes")
     parse = mod.parse_search

@@ -65,6 +65,10 @@ GPU = [
     ("RTX 3060", "gpu:rtx-3060:12"),
     ("ASUS TUF RTX4090 OC 24GB", "gpu:rtx-4090:24"),
     ("Grafikkarte NVIDIA GeForce RTX 5090 32GB Founders Edition", "gpu:rtx-5090:32"),
+   ("NVIDIA GeForce RTX 6090 Founders Edition 32GB", "gpu:rtx-6090:32"),
+   ("MSI GeForce RTX 6080 Gaming Trio 20GB", "gpu:rtx-6080:20"),
+   ("ASUS TUF GeForce RTX 6070 OC 16GB", "gpu:rtx-6070:16"),
+   ("Zotac RTX 6080 Solo", "gpu:rtx-6080:20"),
     ("ASUS Dual RTX 4060 Ti 16GB", "gpu:rtx-4060-ti:16"),
     ("Zotac RTX 4060 Ti 8 GB", "gpu:rtx-4060-ti:8"),
     ("Sapphire Nitro+ Radeon RX 7900 XT 20GB", "gpu:rx-7900-xt:20"),
@@ -350,6 +354,7 @@ def test_taxonomy_integrity():
     ("rtx-3060", [8, 12]), ("rtx-4060-ti", [8, 16]), ("rtx-4070-ti-super", [16]), ("rtx-5090", [32]),
     ("rx-7900-xtx", [24]), ("rx-7900-xt", [20]), ("rx-9070-xt", [16]), ("arc-b580", [12]),
     ("rtx-3080", [10, 12]), ("rtx-4090", [24]), ("rtx-5060-ti", [8, 16]), ("a100", [40, 80]),
+    ("rtx-6070", [12, 16]), ("rtx-6080", [20, 24]), ("rtx-6090", [32]),
 ])
 def test_known_vram(model, vram):
     e = {x["id"]: x for x in taxonomy.gpu_entries("gpu")}[model]

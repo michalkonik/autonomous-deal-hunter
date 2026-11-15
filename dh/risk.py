@@ -42,6 +42,13 @@ _TELEGRAM = re.compile(r"\btelegram\b|\bt\.me/", re.I)
 _URL = re.compile(r"https?://|\bwww\.", re.I)
 _PAYPAL_FF = re.compile(r"paypal.{0,30}(friends|family|freunde|znajomi|rodzin)|(friends|family|freunde|znajomi|rodzin).{0,30}paypal", re.I)
 _TRANSFER = re.compile(r"przelew\w*\s+na\s+konto")
+# "The listing is only a printed photo of the item, not the item" ads (multilingual; matched on ntext:
+# lowercase, diacritics-stripped). Owner ruling 2026-11-07 after ebay.es id 156679793176 ("Únicamente una
+# foto impresa en papel, no comprar") reached tier 3.
+_PHOTO_ONLY = re.compile(r"foto\s+impresa|no\s+comprar|solo\s+una?\s+foto\b|foto\s+de\s+papel|"
+                         r"only\s+(a\s+|the\s+|una?\s+)?(printed\s+|impresa\s+)?(photo|picture|foto)\b|"
+                         r"photo\s+only\b|foto\s+only\b|tylko\s+zdjecie|same\s+zdjecie|jen\s+obrazek|"
+                         r"pouze\s+obrazek|nur\s+(ein\s+)?foto\b|alleen\s+foto\b", re.I)
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[a-z]{2,}\b", re.I)
 
 # Payment advice per platform (I3 ruling). Platforms with a protected checkout: pay only through it (Allegro Lokalnie
@@ -54,8 +61,9 @@ _PHONE_FIRST = ("bazos", "hardverapro", "sprzedajemy", "marktplaats")
 
 _GPU_ID = re.compile(r"^gpu:([a-z0-9-]+):")
 # Desktop GPU ids the CN/HK-origin rule and the missing-photo rule apply to (taxonomy ids, explicit on purpose).
-_CN_HK_MODELS = frozenset({"rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090"})
-_NO_PHOTO_MODELS = frozenset({"rtx-4090", "rtx-4090d", "rtx-5090", "rtx-5090d"})
+_CN_HK_MODELS = frozenset({"rtx-4080", "rtx-4080-super", "rtx-4090", "rtx-4090d", "rtx-5080", "rtx-5090",
+                           "rtx-6080", "rtx-6090", "rx-9070-xt"})
+_NO_PHOTO_MODELS = frozenset({"rtx-4090", "rtx-4090d", "rtx-5090", "rtx-5090d", "rtx-6090"})
 
 
 @dataclass
@@ -199,6 +207,10 @@ def assess(listing: Listing, extraction: Extraction, estimate: Any, cfg: Any = N
         hard.append("box_only")
     if extraction.wanted_ad:
         hard.append("wanted_ad")
+    if _PHOTO_ONLY.search(ntext):
+        hard.append("photo_only")  # "for sale" is only a printed photo of the item (ebay.es 2026-11-07): never a deal
+    if "auction" in extraction.notes:
+        hard.append("auction")  # shown price is a rising bid, not a saleable buy-now price (owner feedback 2026-11-07)
     if (extraction.for_parts or extraction.condition == "for_parts") and not cfg.rules.repair.enabled:
         hard.append("for_parts")
     hard += _offplatform(ntext)  # normalised: lowercase, no diacritics
