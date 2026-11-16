@@ -646,3 +646,10 @@ def test_ebay_ship_to_pl_filter_on_foreign_markets(store):
         flt = pq(us(ebay.EbayBrowse(cc).search_url(Query(text="x"))).query)["filter"][0]
         assert flt == f"itemLocationCountry:{cn},deliveryCountry:PL,buyingOptions:{{FIXED_PRICE}}"
     assert "deliveryCountry" not in ebay.EbayBrowse("EBAY_PL").search_url(Query(text="x"))
+    for cc, cn in (("EBAY_US", "US"), ("EBAY_CA", "CA")):
+        flt = pq(us(ebay.EbayBrowse(cc).search_url(Query(text="x"))).query)["filter"][0]
+        assert flt == f"itemLocationCountry:{cn},deliveryCountry:PL,buyingOptions:{{FIXED_PRICE}}"
+    br = ebay.EbayBrowse("EBAY_US", location="BR", source_name="ebay_br")
+    assert br.name == "ebay_br" and br.marketplace == "EBAY_US" and br.currency == "USD"
+    flt = pq(us(br.search_url(Query(text="x"))).query)["filter"][0]
+    assert flt == "itemLocationCountry:BR,deliveryCountry:PL,buyingOptions:{FIXED_PRICE}"

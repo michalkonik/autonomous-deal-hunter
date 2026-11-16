@@ -23,7 +23,7 @@ adapters:
       kleinanzeigen: [kleinanzeigen.de, classistatic.de]
       ebay: [ebayimg.com]
   vinted: {enabled: false}
-  ebay: {enabled: true, via: api}   # all ebay_* markets. Keys: ebay#client_id / #client_secret, then ebay2, ebay3, … up to ebay8. A missing client_id ends the list. One key backs off on 429/403; extra keys switch on 429. Foreign markets return only items the seller ships to PL.
+  ebay: {enabled: true, via: api}   # all ebay_* markets, including ebay_us, ebay_ca, and ebay_br. Keys: ebay#client_id / #client_secret, then ebay2, ebay3, … up to ebay8. A missing client_id ends the list. One key backs off on 429/403; extra keys switch on 429. Foreign markets return only items the seller ships to PL. ebay_br is not an eBay site: the US catalog filtered to itemLocationCountry BR plus deliveryCountry PL. There is no EBAY_BR marketplace id.
   pepper_pl: {enabled: true, via: rss}
   hotukdeals: {enabled: true, via: rss}
   retail: {enabled: true}

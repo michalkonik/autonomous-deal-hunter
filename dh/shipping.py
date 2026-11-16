@@ -27,6 +27,22 @@ _SHIPS_TO_PL = frozenset(PL_SOURCES | {"pepper_pl", "refurbed", "taniekomputery"
 _CLASSIFIED_DOMESTIC_SHIP = frozenset({"kleinanzeigen", "marktplaats", "2ememain", "tori"})
 
 
+def inbound_pln(origin: str, table: dict, overrides: dict | None = None):
+    """Gross PLN to get the parcel to Poland. A per-country override wins over the PL / EU / non-EU table.
+
+    Overseas GPUs are not a 200 PLN European envelope. The override lives in valuation.yaml so the frozen
+    shipping table stays untouched."""
+    from decimal import Decimal
+
+    from . import economics
+    code = economics.norm_country(origin or "PL")
+    over = overrides or {}
+    if code in over:
+        return Decimal(str(over[code]))
+    key = "PL" if code == "PL" else ("EU" if code in economics.EU else "non_EU")
+    return Decimal(str((table or {}).get(key, 0)))
+
+
 def domestic_classified(source: str) -> bool:
     """True when this source's ships flag means domestic delivery, not a shipment to Poland."""
     return str(source or "") in _CLASSIFIED_DOMESTIC_SHIP

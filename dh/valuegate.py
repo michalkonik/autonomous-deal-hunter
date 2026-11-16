@@ -78,6 +78,7 @@ class GateParams:
     min_real_asks: int = 5
     lookback_days: int = 90
     min_return_on_capital: Decimal = Decimal("0.10")
+    min_net_usd: Decimal = Decimal("200")
     paperless_new_below_shop: bool = True
     min_under_low_ask: Decimal = Decimal("0.10")
 
@@ -93,7 +94,8 @@ class GateParams:
             if k in g:
                 g[k] = bool(g[k]) if k in ("enabled", "paperless_new_below_shop") else int(g[k])
         for k in ("retail_discount", "cheaper_tolerance", "deep_discount", "junk_fraction",
-                  "market_ask_ratio", "market_retail_ratio", "min_return_on_capital", "min_under_low_ask"):
+                  "market_ask_ratio", "market_retail_ratio", "min_return_on_capital", "min_under_low_ask",
+                  "min_net_usd"):
             if k in g:
                 g[k] = Decimal(str(g[k]))
         return cls(**g)
@@ -229,6 +231,18 @@ def paperless_new_watch(buy: Decimal, retail: Decimal | None, has_papers: bool, 
     return None
 
 
+def small_deal(cons_usd, p: GateParams) -> Verdict | None:
+    """Drop when the conservative net is known and under `min_net_usd`. None when the floor is off,
+    the net is unknown, or the net clears it. The owner does not want these stored as watches."""
+    if not p.enabled or p.min_net_usd <= 0 or cons_usd is None:
+        return None
+    net = Decimal(str(cons_usd))
+    if net >= p.min_net_usd:
+        return None
+    return Verdict("drop", "small_deal",
+                   f"small deal: conservative net {net} USD is under the {p.min_net_usd} USD floor")
+
+
 def thin_margin(cons_usd, capital_usd, p: GateParams) -> Verdict | None:
     """A watch when the conservative net is below `min_return_on_capital` of the capital. None when the gap
     is large enough, the check is off, or the caller did not pass both figures."""
@@ -286,6 +300,9 @@ def verdict(buy_pln: Decimal, md: MarketData, p: GateParams, *,
     edge_scarce = n_cheap <= p.max_cheaper
     edge_deep = med is not None and buy_pln <= p.deep_discount * med
     if (evidence_sold or evidence_retail) and (edge_scarce or edge_deep):
+        small = small_deal(cons_usd, p)
+        if small is not None:
+            return small
         thin = thin_margin(cons_usd, capital_usd, p)
         if thin is not None:
             return thin

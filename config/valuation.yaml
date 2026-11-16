@@ -38,6 +38,8 @@ gate:                         # value gate (dh/valuegate.py): evidence-and-edge 
   min_return_on_capital: 0.10 # a tier the owner acts on (1-4) needs a conservative net at least this share of the
                               # capital at risk; a thinner gap becomes a tier-5 watch. 0 turns the check off.
                               # The absolute floors in config/rules.yaml still apply.
+  min_net_usd: 200            # owner 2026-11-17: a deal under 200 USD conservative net is dropped, not watched.
+                              # 0 turns the floor off. Checked whenever the net is known.
   min_under_low_ask: 0.10     # the buy must be at least this far under the 2nd-cheapest sellable ask (the price
                               # a reseller actually competes with). At or near that ask is dropped, not watched.
   paperless_new_below_shop: true # a new item with no receipt and no guarantee must be strictly cheaper than the
@@ -62,6 +64,9 @@ channels:
   ebay_at: {channel: ebay_at, market: AT}
   ebay_ch: {channel: ebay_ch, market: CH}
   ebay_be: {channel: ebay_be, market: BE}
+  ebay_us: {channel: ebay_us, market: US}
+  ebay_ca: {channel: ebay_ca, market: CA}
+  ebay_br: {channel: ebay_br, market: BR}  # eBay has no Brazil site; these rows are US-catalog items located in BR
   kleinanzeigen: {channel: kleinanzeigen, market: DE}
   bazos_cz: {channel: bazos_cz, market: CZ}
   bazos_sk: {channel: bazos_sk, market: SK}
@@ -80,3 +85,10 @@ partout:
   max_components: 6
   min_comps: 3                # a part with fewer agreeing comps is unvalued (one stray ask is not a market price)
   exit_channel: allegro       # channel the parts are valued on (falls back like any other estimate)
+
+# Parcel inbound (PLN, gross) when the frozen non-EU default (200) is a European envelope, not a boxed
+# GPU from overseas. Duty and import VAT still come from the economics engine. An estimate, not a quote.
+inbound_pln_override:
+  US: 500
+  CA: 500
+  BR: 550
