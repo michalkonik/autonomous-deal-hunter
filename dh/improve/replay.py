@@ -166,6 +166,8 @@ class Judge:
         lang = (listing.country or "pl").lower()
         rules = rules_extract(listing.title, listing.description, lang, root=self.root)
         notes = [n for n in rules.notes if n.startswith("alias:")]
+        if "rules_rejected" in rules.notes:  # same early drop as scheduler._evaluate; it is an exclusion
+            return Outcome(rules.key, True, "rules_rejected", notes=notes)
         if rules.wanted_ad or rules.box_only or rules.for_parts:  # as the scheduler: the rules' key is kept
             return Outcome(rules.key, True, "bait", notes=notes)
         title = listing.title or ""

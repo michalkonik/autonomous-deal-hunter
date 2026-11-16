@@ -183,6 +183,23 @@ def test_serve_runs_rounds_until_stopped_and_closes_windows(tmp_path, monkeypatc
     assert st.open_windows() == []
 
 
+def test_remote_roles_are_not_warmed_and_do_not_block_start_on_ram(tmp_path):
+    data = cfg().to_dict()
+    data["models"] = {**data["models"], "providers": {
+        "grok": {"base_url": "https://api.x.ai/v1", "monthly_cap_usd": 5,
+                 "roles": {"worker": "grok-4.7", "senior": "grok-4.7", "advisor": "grok-4.7"}}}}
+    c = config.Config(data, REPO)
+    seen = []
+
+    async def post(url, body):
+        seen.append(body["model"])
+        return 200
+
+    assert asyncio.run(runtime.warm_models(c, post=post)) == {} and seen == []
+    reasons, _, warnings = runtime.preflight(c, http_get=Swap(["someone-elses-model"]), meminfo=meminfo(tmp_path, 1))
+    assert reasons == [] and any("no local role model" in w for w in warnings)
+
+
 def test_warm_models_one_request_per_role_model_never_raises():
     seen = []
 
@@ -629,6 +646,19 @@ def test_dh_start_and_stop_manage_the_page_unit(tmp_path):
     rc = runtime.stop(cfg(), tmp_path, run=sysrun, http_get=Swap([]), out=out2)
     assert rc == 0, out2.getvalue()
     assert sysrun.units == {"deal-hunter-test": False, "deal-hunter-test-web": False}  # full stop kills both
+
+
+def test_start_page_only_does_not_start_the_hunter(tmp_path, monkeypatch):
+    from dh import cli
+    calls = []
+    monkeypatch.setattr(cli, "_ctx", lambda: (tmp_path, cfg()))
+    monkeypatch.setattr("dh.runtime.start", lambda *a, **k: calls.append("hunter") or 0)
+    monkeypatch.setattr("dh.runtime.start_page", lambda *a, **k: calls.append("page") or 0)
+    assert cli.main(["start", "--page-only"]) == 0
+    assert calls == ["page"]
+    calls.clear()
+    assert cli.main(["start"]) == 0
+    assert calls == ["hunter"]
 
 
 def test_status_reports_the_page_server(tmp_path):

@@ -22,7 +22,7 @@ def h(hours: float) -> datetime:
 
 def lst(sid: str, price: str, *, source: str = SRC, currency: str = "PLN", posted: datetime | None = None,
         seen: datetime = T0) -> Listing:
-    return Listing(source=source, source_id=sid, url=f"https://example.test/{source}/{sid}", title=f"RTX 4090 {sid}",
+    return Listing(source=source, source_id=sid, url=f"https://example.test/{source}/{sid}", title=f"RTX 4090 ref{sid}",
                    description="", price=Decimal(price), currency=currency, country="PL", city=None, lat=None,
                    lon=None, seller_hash=None, seller_age_days=None, seller_ratings=None, seller_score=None,
                    ships=True, pickup_only=False, is_business=False, photos=[], posted_at=posted, seen_at=seen)
@@ -370,6 +370,63 @@ def test_active_asks(store):
     assert sorted(r.price for r in rows) == [Decimal("3000"), Decimal("3200"), Decimal("3400")]
     assert {r.kind for r in rows} == {"active_ask"} and {r.weight for r in rows} == {0.3}
     assert ledger.active_asks(store, KEY, "used", h(9 + 24 * 4)) == []  # not seen for 4 days
+
+
+def test_title_condition_keeps_new_and_used_pools_apart(store):
+    """A title or a structured condition field that says new never prices a used buy, and the reverse."""
+    import dataclasses
+    bare_used = lst("u1", "7000")
+    stated_new = dataclasses.replace(lst("n1", "9000"), title="RTX 4090 NEU")
+    stated_used = dataclasses.replace(lst("w1", "6000"), title="RTX 4090 uzywana")
+    bare_new = lst("b1", "9500")
+    like = dataclasses.replace(lst("l1", "7200"), title="RTX 4090 jak nowa")
+    field_new = dataclasses.replace(lst("d1", "8000"), description="condition: New")
+    field_neuf = dataclasses.replace(lst("f1", "51000"), description="condition: Neuf")
+    field_nuevo = dataclasses.replace(lst("s1", "50800"), description="condition: Nuevo")
+    sweep(store, h(4), [bare_used, stated_new, stated_used, bare_new, like, field_new, field_neuf, field_nuevo])
+    extract_all(store)
+    store.save_extraction(lid(store, "w1"), Extraction(key=KEY, category="gpu", certainty=0.95, condition="new"))
+    store.save_extraction(lid(store, "b1"), Extraction(key=KEY, category="gpu", certainty=0.95, condition="new"))
+    store.save_extraction(lid(store, "n1"), Extraction(key=KEY, category="gpu", certainty=0.95, condition="new"))
+    store.save_extraction(lid(store, "l1"), Extraction(key=KEY, category="gpu", certainty=0.95, condition="like_new"))
+    used_ids = {r.listing_id for r in ledger.active_asks(store, KEY, "used", h(5))}
+    new_ids = {r.listing_id for r in ledger.active_asks(store, KEY, "new", h(5))}
+    assert lid(store, "u1") in used_ids
+    assert lid(store, "l1") in used_ids  # like-new joins the used pool
+    assert lid(store, "n1") not in used_ids and lid(store, "d1") not in used_ids
+    assert lid(store, "f1") not in used_ids and lid(store, "s1") not in used_ids  # Neuf / Nuevo stay out of used
+    assert lid(store, "w1") not in new_ids
+    assert lid(store, "b1") in new_ids and lid(store, "n1") in new_ids
+    assert ledger.clears_at(store, KEY, "like_new", h(-24)) == []  # exact like-new query stays exact
+
+
+def test_server_ram_and_ancient_geforce_are_not_benchmarks(store):
+    """A stored LLM key must not price a desktop part from a server stick, or an RX 6800 XT from a 2004 GeForce."""
+    import dataclasses
+    good = lst("good", "7000")
+    server = dataclasses.replace(lst("srv", "14000"), title="Micron DDR5 64GB 2Rx4 RDIMM MTC40F2046S1RC64BD2")
+    ancient = dataclasses.replace(lst("old", "600"), title="NVIDIA GEFORCE 6800 XT 256MB GDDR3")
+    sweep(store, h(4), [good, server, ancient])
+    extract_all(store)
+    store.save_extraction(lid(store, "srv"), Extraction(key="ram:ddr5:64:1x64", category="ram", certainty=0.9,
+                                                       condition="used", method="llm"))
+    store.save_extraction(lid(store, "old"), Extraction(key="gpu:rx-6800-xt:16", category="gpu", certainty=0.95,
+                                                       condition="used", method="rules"))
+    assert ledger.active_asks(store, "ram:ddr5:64:1x64", "used", h(5)) == []
+    assert ledger.active_asks(store, "gpu:rx-6800-xt:16", "used", h(5)) == []
+    assert [r.price for r in ledger.active_asks(store, KEY, "used", h(5))] == [Decimal("7000")]
+
+
+def test_swap_and_wrong_model_titles_are_not_benchmarks(store):
+    """A stored extraction can miss the swap flag or keep a wrong key. The title is checked again at use."""
+    import dataclasses
+    good = lst("good", "7000")
+    swap = dataclasses.replace(lst("swap", "9999"), title="PS5 NEU gegen RTX 4090 24GB tauschen")
+    wrong = dataclasses.replace(lst("wrong", "8000"), title="RTX 4080 16GB")
+    sweep(store, h(4), [swap, wrong, good])
+    extract_all(store)
+    rows = ledger.active_asks(store, KEY, "used", h(5))
+    assert [r.price for r in rows] == [Decimal("7000")]
 
 
 def test_bundles_and_uncertain_matches_are_never_comparables(store):

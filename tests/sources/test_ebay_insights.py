@@ -127,3 +127,48 @@ def test_server_error_raises():
 def test_default_client_is_shared_accessor():
     ad = ei.EbayInsights(secret_fn=KEYS.get)
     assert ad.client is ebay.api_client_for("api.ebay.com")
+
+
+def test_scope_missing_on_one_key_uses_the_next(store):
+    import base64
+    keys = {"ebay#client_id": "cid1", "ebay#client_secret": "sec1",
+            "ebay2#client_id": "cid2", "ebay2#client_secret": "sec2"}
+    first = "Basic " + base64.b64encode(b"cid1:sec1").decode()
+
+    class Pool:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, method, url, headers, data, timeout):
+            self.calls.append((method, url, headers, data))
+            if "oauth2/token" in url:
+                if headers["Authorization"] == first:
+                    return 400, json.dumps({"error": "invalid_scope"})
+                return 200, json.dumps({"access_token": "tok2", "expires_in": 7200})
+            return 200, fixture_text("ebay", "sales_de.json")
+
+    rec = Pool()
+    ad = ei.EbayInsights(secret_fn=keys.get, client=client(rec), store=store)
+    rows = run(ad.sold_comps(KEY))
+    assert rows and ad.enabled
+    assert "not_granted" not in [k for _, k, _ in health(store)]
+    assert sum(1 for c in rec.calls if "oauth2/token" in c[1]) == 2
+
+
+def test_scope_missing_on_every_key_disables_once(store):
+    keys = {"ebay#client_id": "cid1", "ebay#client_secret": "sec1",
+            "ebay2#client_id": "cid2", "ebay2#client_secret": "sec2"}
+
+    class Pool:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, method, url, headers, data, timeout):
+            self.calls.append((method, url, headers, data))
+            return 400, json.dumps({"error": "invalid_scope"})
+
+    rec = Pool()
+    ad = ei.EbayInsights(secret_fn=keys.get, client=client(rec), store=store)
+    assert run(ad.sold_comps(KEY)) == [] and run(ad.sold_comps(KEY)) == []
+    assert not ad.enabled and len(rec.calls) == 2
+    assert health(store) == [("ebay_insights", "not_granted", "Marketplace Insights not granted")]

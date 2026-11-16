@@ -873,6 +873,19 @@ def test_pickup_origin_comes_from_config(tmp_path):
     assert 245 < km < 260
 
 
+def test_domestic_classified_is_priced_as_a_pickup(tmp_path):
+    """Tori's ships flag is Finland-only. A card in Pirkkala is a drive, not a 60 PLN parcel."""
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    tori = Listing(**{**listing().__dict__, "source": "tori", "country": "FI", "ships": True,
+                      "lat": 61.43872, "lon": 23.65689})
+    inbound, _, km = scheduler._Round(ctx)._shipping(tori, "gpu")
+    assert inbound == 0 and km > 1000
+    shop = Listing(**{**listing().__dict__, "source": "asgoodasnew", "country": "DE", "ships": True,
+                      "lat": 50.1, "lon": 8.6})
+    inbound, _, km = scheduler._Round(ctx)._shipping(shop, "gpu")
+    assert km is None and inbound > 0
+
+
 async def test_retention_keys_drive_the_daily_purge(tmp_path):
     ad = FakeAdapter([])
     ctx = make_ctx(tmp_path, ad, None)
@@ -948,11 +961,14 @@ class KleinanzeigenFake(FakeAdapter):
 
 
 async def test_mailbox_kleinanzeigen_listing_is_detailed_and_verified_by_the_real_adapter(tmp_path):
-    ka = Listing(**{**listing("m1", "RX 6800 używana", "900").__dict__, "source": "kleinanzeigen",
-                    "url": "https://www.kleinanzeigen.de/s-anzeige/m1"})
+    # Kleinanzeigen is a domestic classified: priced as a pickup, so the ad needs a location.
+    # The 40 PLN pickup trip puts a 900 PLN buy just under the $50 easy floor (tier 4, no detail).
+    ka = Listing(**{**listing("m1", "RX 6800 używana", "890").__dict__, "source": "kleinanzeigen",
+                    "url": "https://www.kleinanzeigen.de/s-anzeige/m1",
+                    "country": "PL", "lat": 50.0647, "lon": 19.9450})
     olx = Listing(**{**listing("m2", "RX 6800 używana", "900").__dict__, "source": "olx",
                      "url": "https://www.olx.pl/d/oferta/m2"})
-    real = KleinanzeigenFake([], alive=(True, Decimal("900")))
+    real = KleinanzeigenFake([], alive=(True, Decimal("890")))
     ctx = make_ctx(tmp_path, real, None, items=[])
     mail = FakeMail([ka], ctx.store)
     ctx.adapters["mailbox"] = mail

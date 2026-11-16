@@ -31,6 +31,115 @@ class PaidCapReached(LLMUnavailable):
     """A paid-endpoint role was asked for while paid use is off (cap 0) or the month's cap is spent."""
 
 
+class ProviderConflict(LLMError):
+    """One role is listed on two remote providers. The call would not know which bill to charge."""
+
+
+def _mapping(v: Any) -> dict:
+    if v is None:
+        return {}
+    if hasattr(v, "to_dict"):
+        v = v.to_dict()
+    return dict(v) if isinstance(v, dict) else {}
+
+
+class RemoteRoute:
+    """One role on one provider. An API key stays in bw-secret. A grok session stays in ~/.grok/auth.json."""
+
+    def __init__(self, provider: str, model: str, base_url: str, cap_usd: float, usd_in: float, usd_out: float,
+                 api_key_secret: str | None, pln_per_usd: float, auth: str = "api_key", wire: str = "chat"):
+        self.provider, self.model = provider, model
+        self.base_url = base_url.rstrip("/")
+        self.cap_usd, self.usd_in, self.usd_out = cap_usd, usd_in, usd_out
+        self.api_key_secret, self.pln_per_usd = api_key_secret, pln_per_usd
+        self.auth, self.wire = auth, wire
+
+
+def responses_body(chat: dict) -> dict:
+    """Chat-completions body -> xAI Responses body. One shot, no stored conversation."""
+    messages = chat.get("messages") or []
+    instructions, inp = "", []
+    for msg in messages:
+        if msg.get("role") == "system":
+            instructions = str(msg.get("content") or "")
+        else:
+            inp.append({"role": msg.get("role") or "user", "content": str(msg.get("content") or "")})
+    out: dict[str, Any] = {
+        "model": chat["model"], "input": inp, "temperature": chat.get("temperature", 0),
+        "max_output_tokens": chat.get("max_tokens", 600), "store": False,
+        # Short JSON tasks. grok-4.7 defaults to high, which spends thousands of tokens per call.
+        "reasoning": {"effort": "low"},
+    }
+    if instructions:
+        out["instructions"] = instructions
+    fmt = (chat.get("response_format") or {}).get("json_schema")
+    if fmt:
+        out["text"] = {"format": {"type": "json_schema", "name": fmt.get("name") or "reply",
+                                  "strict": bool(fmt.get("strict", True)), "schema": fmt.get("schema") or {}}}
+    return out
+
+
+def responses_result(data: dict) -> tuple[str, str | None, dict]:
+    """Responses JSON -> (text, finish_reason, usage with prompt_tokens and completion_tokens)."""
+    texts: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and part.get("text"):
+                texts.append(str(part["text"]))
+    if not texts and isinstance(data.get("output_text"), str):
+        texts.append(data["output_text"])
+    usage = data.get("usage") or {}
+    norm = {
+        "prompt_tokens": int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+        "completion_tokens": int(usage.get("output_tokens") or usage.get("completion_tokens") or 0),
+    }
+    finish = "length" if data.get("status") == "incomplete" else "stop"
+    return "".join(texts), finish, norm
+
+
+def provider_blocks(models) -> list[tuple[str, dict]]:
+    """Enabled remote endpoints. `paid_api` is the original single endpoint and is included only when enabled.
+    `providers.<name>` is any other OpenAI-compatible endpoint. `enabled: false` drops that block."""
+    m = _mapping(models)
+    out: list[tuple[str, dict]] = []
+    paid = _mapping(m.get("paid_api"))
+    if paid.get("enabled"):
+        out.append(("paid_api", paid))
+    for name in sorted(_mapping(m.get("providers"))):
+        block = _mapping(_mapping(m.get("providers"))[name])
+        if block.get("enabled") is False:
+            continue
+        out.append((str(name), block))
+    return out
+
+
+def remote_routes(models) -> dict[str, RemoteRoute]:
+    """role -> route. A role on two providers raises ProviderConflict instead of picking one in silence."""
+    routes: dict[str, RemoteRoute] = {}
+    seen: dict[str, list[str]] = {}
+    for name, block in provider_blocks(models):
+        for role, model in _mapping(block.get("roles")).items():
+            if not model:
+                continue
+            seen.setdefault(str(role), []).append(name)
+            if str(role) in routes:
+                continue
+            routes[str(role)] = RemoteRoute(
+                name, str(model), str(block.get("base_url") or ""),
+                float(block.get("monthly_cap_usd") or 0), float(block.get("usd_per_mtok_in") or 0),
+                float(block.get("usd_per_mtok_out") or 0),
+                str(block["api_key_secret"]) if block.get("api_key_secret") else None,
+                float(block.get("pln_per_usd") or 4.0),
+                str(block.get("auth") or "api_key"), str(block.get("wire") or "chat"))
+    dupes = {role: names for role, names in seen.items() if len(names) > 1}
+    if dupes:
+        detail = "; ".join(f"{role} on {', '.join(names)}" for role, names in sorted(dupes.items()))
+        raise ProviderConflict(f"a role is on more than one provider: {detail}")
+    return routes
+
+
 def wrap_untrusted(text: str) -> str:
     """Strip any listing tags from untrusted text, truncate to 4000 chars and wrap it in ONE <listing> block."""
     t = text or ""
@@ -110,14 +219,17 @@ class Client:
                  paid_spend: Callable[[], float] | None = None,
                  on_paid: Callable[[str, float], None] | None = None):
         models = cfg.models
-        pa = models.get("paid_api", {}) or {}
-        pa = pa.to_dict() if hasattr(pa, "to_dict") else pa
-        # paid roles: only with paid_api.enabled; each maps a role to a model on paid_api.base_url. The monthly cap
-        # (USD, default 0 = no paid call is ever made) is checked before EVERY paid call against the books'
-        # month-to-date paid spend (`paid_spend`) plus the not-yet-booked spend of this client (`paid_booked` clears what the books took).
+        pa = _mapping(models.get("paid_api", {}) or {})
+        # Remote roles: paid_api (the original one endpoint) plus models.providers (one block per provider).
+        # Each provider has its own monthly cap. Cap 0 means no call to that provider leaves the machine.
+        # The cap is checked before EVERY paid call against that provider's month-to-date books spend
+        # (`paid_spend(provider)`, or a zero-arg callable for the original paid_api) plus this client's
+        # not-yet-booked spend. `paid_booked` clears what the books took.
         self.paid = dict(pa) if pa.get("enabled") else {}
-        self.paid_roles = dict(self.paid.get("roles") or {})
+        self._routes = remote_routes(models)
+        self.paid_roles = {role: route.model for role, route in self._routes.items()}
         self._paid_spend, self._on_paid, self._paid_session = paid_spend, on_paid, 0.0
+        self._paid_session_by: dict[str, float] = {}
         self.base_url = str(models.base_url).rstrip("/")
         self.roles = dict(models.roles.to_dict() if hasattr(models.roles, "to_dict") else models.roles)
         to = models.get("timeouts", {}) or {}
@@ -145,37 +257,79 @@ class Client:
             self._open_until = self._clock() + self.breaker_cooldown
         return LLMUnavailable(f"transport error: {type(err).__name__}: {err}")
 
+    def provider_of(self, role: str) -> str | None:
+        route = self._routes.get(role)
+        return route.provider if route else None
+
+    def _month_spent(self, provider: str) -> float:
+        fn = self._paid_spend
+        if fn is None:
+            return 0.0
+        try:
+            return float(fn(provider))
+        except TypeError:
+            # Callers written for the original single endpoint pass a zero-arg callable. It is the paid_api total.
+            return float(fn()) if provider == "paid_api" else 0.0
+
     def paid_gate(self, role: str) -> None:
-        """Raise PaidCapReached unless a paid call for `role` is within the monthly cap (USD)."""
-        cap = float(self.paid.get("monthly_cap_usd", 0) or 0)
+        """Raise PaidCapReached unless a paid call for `role` is within that provider's monthly cap (USD)."""
+        route = self._routes[role]
+        cap = float(route.cap_usd or 0)
         if cap <= 0:
-            raise PaidCapReached(f"role {role!r} uses the paid API but models.paid_api.monthly_cap_usd is 0")
-        spent = (float(self._paid_spend()) if self._paid_spend else 0.0) + self._paid_session
+            raise PaidCapReached(f"role {role!r} uses provider {route.provider!r} but its monthly_cap_usd is 0")
+        spent = self._month_spent(route.provider) + self._paid_session_by.get(route.provider, 0.0)
         if spent >= cap:
-            raise PaidCapReached(f"paid API cap reached: ${spent:.2f} of ${cap:.2f} this month")
+            raise PaidCapReached(f"provider {route.provider} cap reached: ${spent:.2f} of ${cap:.2f} this month")
 
     def paid_booked(self, usd: float) -> None:
-        """The books recorded `usd` of this client's paid spend (a round's cost row): it is part of the month-to-date
-        total now, so it leaves the unbooked session counter (never counted twice)."""
+        """The books recorded `usd` of this client's paid spend (a round's cost rows): it is part of the
+        month-to-date total now, so it leaves the unbooked session counters (never counted twice)."""
         self._paid_session = max(0.0, self._paid_session - float(usd))
+        left = float(usd)
+        for name in sorted(self._paid_session_by):
+            take = min(self._paid_session_by[name], left)
+            self._paid_session_by[name] -= take
+            left -= take
+            if left <= 1e-12:
+                break
 
-    def _paid_headers(self) -> dict:
-        ref = self.paid.get("api_key_secret")
+    def _paid_headers(self, route: RemoteRoute) -> dict:
+        if route.auth in ("grok_session", "xai_oauth"):
+            from .grok_session import proxy_headers
+            return proxy_headers(self._session_token(route.auth), route.model)
+        ref = route.api_key_secret
         if not ref:
             return {}
         from .notify import bw_secret
         key = bw_secret(str(ref))
-        return {"Authorization": f"Bearer {key}"} if key else {}
+        if not key:
+            raise LLMError(f"provider {route.provider}: no API key at bw-secret {ref}")
+        return {"Authorization": f"Bearer {key}"}
+
+    def _session_token(self, auth: str = "grok_session") -> str:
+        fn = getattr(self, "_session_token_fn", None)
+        if fn is not None:
+            return fn()
+        if auth == "xai_oauth":
+            from .xai_oauth import access_token
+            return access_token()
+        from .grok_session import access_token
+        return access_token()
 
     async def _post(self, role: str, body: dict) -> tuple[str, str | None]:
         t0 = time.monotonic()
-        paid = role in self.paid_roles
+        route = self._routes.get(role)
         url, headers = self.base_url, {}
-        if paid:
+        wire = "chat"
+        if route is not None:
             self.paid_gate(role)
-            url, headers = str(self.paid["base_url"]).rstrip("/"), self._paid_headers()
+            if not route.base_url:
+                raise LLMError(f"provider {route.provider}: base_url is empty")
+            url, headers, wire = route.base_url, self._paid_headers(route), route.wire
+        path = "/responses" if wire == "responses" else "/chat/completions"
+        payload = responses_body(body) if wire == "responses" else body
         try:
-            r = await self._http.post(f"{url}/chat/completions", json=body, headers=headers)
+            r = await self._http.post(f"{url}{path}", json=payload, headers=headers)
         except httpx.TransportError as e:  # connect/read timeouts, connection refused, ...
             raise self._transport_failed(e) from None
         self._fails = 0
@@ -183,15 +337,19 @@ class Client:
             raise _HTTPFail(r.status_code, r.text[:300])
         try:
             data = r.json()
-            usage = data.get("usage") or {}
-            choice = data["choices"][0]
-            content, finish = choice["message"]["content"] or "", choice.get("finish_reason")
+            if wire == "responses":
+                content, finish, usage = responses_result(data)
+            else:
+                usage = data.get("usage") or {}
+                choice = data["choices"][0]
+                content, finish = choice["message"]["content"] or "", choice.get("finish_reason")
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
             raise ValueError(f"malformed completion: {e}") from None
-        if paid:
-            usd = (int(usage.get("prompt_tokens", 0)) * float(self.paid.get("usd_per_mtok_in", 0))
-                   + int(usage.get("completion_tokens", 0)) * float(self.paid.get("usd_per_mtok_out", 0))) / 1e6
+        if route is not None:
+            usd = (int(usage.get("prompt_tokens", 0)) * route.usd_in
+                   + int(usage.get("completion_tokens", 0)) * route.usd_out) / 1e6
             self._paid_session += usd
+            self._paid_session_by[route.provider] = self._paid_session_by.get(route.provider, 0.0) + usd
             if self._on_paid:
                 try:
                     self._on_paid(role, usd)
@@ -221,11 +379,12 @@ class Client:
                 "Reply again with one valid JSON object that follows the format.")
             body: dict[str, Any] = {
                 "model": model, "max_tokens": max_tokens, "temperature": 0,
-                # extraction needs no chain of thought; on reasoning models it would eat the token budget
-                "chat_template_kwargs": {"enable_thinking": False},
                 "messages": [{"role": "system", "content": system + ("" if strict else _JSON_ONLY)},
                              {"role": "user", "content": prompt}],
             }
+            if role not in self._routes:
+                # llama.cpp only. A remote provider rejects this field and the whole call would 400.
+                body["chat_template_kwargs"] = {"enable_thinking": False}
             if strict:
                 body["response_format"] = {"type": "json_schema",
                                            "json_schema": {"name": "reply", "strict": True, "schema": schema}}

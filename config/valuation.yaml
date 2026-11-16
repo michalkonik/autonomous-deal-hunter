@@ -16,6 +16,10 @@ lookback_days: 90             # how far back comps are read; the trend uses min(
 active_ask_max_age_days: 3    # a tracked listing still counts as a live ask if seen this recently
 fx_max_back_days: 4           # cached NBP rate may be up to this many days older than the comp
 fx_stale_days: 3              # note "fx_stale" only when a recent comp's rate is older than this (weekends are normal)
+outlier_low: 0.5              # kept for callers; the sellable cluster below is what actually drops comps
+outlier_high: 3.0             # kept for callers; a price several times the cheap cluster is not a benchmark
+sellable_band: 1.35           # asks within this multiple of a cluster's cheapest price are the same market
+sellable_junk: 0.15           # a cheap cluster below this fraction of the crowded cluster is accessories, not the product
 
 gate:                         # value gate (dh/valuegate.py): evidence-and-edge screen between pricing and saving.
   enabled: true               # keep a tier only with evidence (sold comps / clear discount vs new) AND an edge
@@ -31,9 +35,18 @@ gate:                         # value gate (dh/valuegate.py): evidence-and-edge 
   market_min_cheaper: 10      # ... with at least this many strictly cheaper live asks around
   min_real_asks: 5            # fewer cleaned asks than this: the pool is too thin to judge market price on
   lookback_days: 90           # how far back the gate reads the key's comparables
+  min_return_on_capital: 0.10 # a tier the owner acts on (1-4) needs a conservative net at least this share of the
+                              # capital at risk; a thinner gap becomes a tier-5 watch. 0 turns the check off.
+                              # The absolute floors in config/rules.yaml still apply.
+  min_under_low_ask: 0.10     # the buy must be at least this far under the 2nd-cheapest sellable ask (the price
+                              # a reseller actually competes with). At or near that ask is dropped, not watched.
+  paperless_new_below_shop: true # a new item with no receipt and no guarantee must be strictly cheaper than the
+                                 # same model's shop price. At or above that price, or with no shop price, it is a watch.
 
 # Comparable channel and market (country) of each source. A per-adapter `channel:` key in sources.yaml
 # (adapters.<source>.channel) overrides the channel name.
+# allegro and allegro_lokalnie are the preferred benchmark for a used exit (used asks) and a new exit
+# (new asks) whenever either has a recent comp. Other channels are used only when both are empty.
 channels:
   allegro: {channel: allegro, market: PL}
   allegro_lokalnie: {channel: allegro_lokalnie, market: PL}
@@ -65,4 +78,5 @@ partout:
   parting_cost: 0.12          # share of the parts' value lost to listing, haggling, returns and unsold leftovers
   heavy_parts: 3              # effort is heavy from this many detected parts (valued or not)
   max_components: 6
+  min_comps: 3                # a part with fewer agreeing comps is unvalued (one stray ask is not a market price)
   exit_channel: allegro       # channel the parts are valued on (falls back like any other estimate)

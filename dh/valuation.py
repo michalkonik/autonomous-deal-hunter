@@ -8,7 +8,10 @@ Sources of comparables (all in PLN; non-PLN rows are converted at the cached NBP
 All parameters come from config/valuation.yaml (no duplicated defaults in code). Weights: owner_sale 1.0,
 ebay_sold 1.0, probably_sold 0.5, active_ask 0.3 (price × the ask-to-sale ratio, 0.92), ask_history 0.2.
 
-Channel tiers, decided AFTER FX conversion (the first tier with a comp from the last `recent_days` wins):
+Channel tiers, decided AFTER FX conversion (the first tier with a comp from the last `recent_days` wins).
+A used or new exit prefers Allegro and Allegro Lokalnie of that same condition when either site has a
+recent comp (note "allegro_used" or "allegro_new", weight 1). One such comp is enough: a thin Allegro
+pool is not filled out with eBay or other asks. The tiers below run only when those two sites have none:
 - PL exit channel: own channel → all PL comps × 0.7 ("fallback_pl") → all EU comps incl. PL × 0.5 ("fallback_eu");
 - EU exit channel: own channel → all EU comps incl. PL × 0.7 ("fallback_eu");
 - any other or unknown market: own channel only.
@@ -28,10 +31,16 @@ its date (a weekend or holiday gap is normal NBP behaviour, not staleness), "fx_
 
 Quantiles use midpoint interpolation: each value sits at the middle of its weight on the cumulative-weight axis.
 With equal weights this reproduces the ordinary median.
+
+The quantiles use the sellable cluster, not the median of every ask (note `outlier_dropped:N`). Asks more
+than `sellable_band` above a cheaper cluster are prices nobody pays when cheaper stock is listed. A cheap
+cluster below `sellable_junk` of the crowded cluster is accessories (a cable next to a GPU), not the product.
+Fewer than three prices: nothing is dropped, so one price cannot vote itself out.
 """
 from __future__ import annotations
 
 import bisect
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -48,6 +57,9 @@ from .store import Store
 
 ROOT = Path(__file__).resolve().parents[1]
 SOLD_KINDS = frozenset({"owner_sale", "ebay_sold", "probably_sold"})
+# The Polish resale market. A used buy is compared to used asks here, a new buy to new asks here,
+# whenever either site has a recent comp. Other channels are the fallback only when both are empty.
+ALLEGRO_CHANNELS = frozenset({"allegro", "allegro_lokalnie"})
 EU_MARKETS = frozenset({"AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR", "HU", "IE", "IT",
                         "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK", "SI", "ES", "SE"})
 
@@ -66,6 +78,10 @@ class Params:
     active_ask_max_age_days: int
     fx_max_back_days: int
     fx_stale_days: int
+    outlier_low: Decimal
+    outlier_high: Decimal
+    sellable_band: Decimal
+    sellable_junk: Decimal
 
     @classmethod
     def from_config(cls, cfg: dhconfig.Config) -> "Params":
@@ -84,6 +100,10 @@ class Params:
             active_ask_max_age_days=int(d["active_ask_max_age_days"]),
             fx_max_back_days=int(d["fx_max_back_days"]),
             fx_stale_days=int(d["fx_stale_days"]),
+            outlier_low=Decimal(str(d["outlier_low"])),
+            outlier_high=Decimal(str(d["outlier_high"])),
+            sellable_band=Decimal(str(d["sellable_band"])),
+            sellable_junk=Decimal(str(d["sellable_junk"])),
         )
 
 
@@ -280,12 +300,38 @@ def _ledger_rows(store: Store, key: str, condition: str | None, now: datetime, p
     return rows
 
 
+def benchmark_condition(condition: str | None) -> str:
+    """The pool a candidate is priced against. Only a stated-new item is compared to new comps.
+    Like-new, used and unknown are compared to the used pool (like-new comps included, shop-new excluded)."""
+    return "new" if condition == "new" else "used"
+
+
 def _cond_ok(have: str | None, want: str | None) -> bool:
+    """None accepts every condition except for-parts. A used/unknown estimate accepts used, unknown,
+    missing and like-new comps, never shop-new. Any other request is an exact match (like-new stays exact)."""
     if want is None:
         return have != "for_parts"
     if want in ledger.USED_LIKE:
-        return have is None or have in ledger.USED_LIKE
+        return have is None or have in ledger.USED_LIKE or have == "like_new"
     return have == want
+
+
+def _allegro_tier(condition: str | None, channel: str, conv: list[_Conv],
+                 recent_from: datetime) -> tuple[str | None, float, list[_Conv]] | None:
+    """Allegro + Allegro Lokalnie comps for this condition, when any recent one converted.
+
+    None when the caller asked for every condition, or when the recent Allegro comps are already
+    exactly the exit channel (the ordinary own-channel tier prices those). A single recent comp
+    selects the pool: the estimate is not topped up from eBay or the rest of the EU.
+    """
+    if condition is None:
+        return None
+    pool = [c for c in conv if c.row.channel in ALLEGRO_CHANNELS]
+    recent = [c for c in pool if c.pln is not None and c.row.at >= recent_from]
+    if not recent or all(c.row.channel == channel for c in recent):
+        return None
+    note = "allegro_new" if condition == "new" else "allegro_used"
+    return note, 1.0, pool
 
 
 def _tiers(target: str | None, channel: str, p: Params, market_of) -> list[tuple[str | None, float, object]]:
@@ -309,6 +355,71 @@ class _Conv:
 
 def _wmedian(rows: list[tuple[Decimal, float]]) -> Decimal:
     return weighted_quantile([v for v, _ in rows], [w for _, w in rows], 0.5)
+
+
+def sellable_asks(prices: list[Decimal], *, band: Decimal = Decimal("1.35"),
+                  junk: Decimal = Decimal("0.15")) -> list[Decimal]:
+    """Asks a reseller can actually sell against.
+
+    The benchmark is the cheapest cluster that has at least two asks and is not accessory-cheap versus the
+    crowded cluster. A long tail of very expensive asks is ignored once that cheap cluster exists: those asks
+    do not clear, so they are not an exit. Fewer than three prices are returned unchanged.
+    """
+    ordered = sorted(Decimal(p) for p in prices)
+    n = len(ordered)
+    if n < 3 or band <= 1 or junk <= 0:
+        return ordered
+    # right[i] is the first index whose price is above ordered[i] * band. One forward scan.
+    right = [n] * n
+    j = 0
+    for i in range(n):
+        if j < i:
+            j = i
+        hi = ordered[i] * band
+        while j < n and ordered[j] <= hi:
+            j += 1
+        right[i] = j
+    best_i, best_len = 0, 1
+    for i in range(n):
+        length = right[i] - i
+        if length > best_len:
+            best_i, best_len = i, length
+    floor = median(ordered[best_i:right[best_i]]) * junk
+    for i in range(n):
+        if ordered[i] < floor:
+            continue
+        if right[i] - i >= 2:
+            return ordered[i:right[i]]
+    return ordered[best_i:right[best_i]]
+
+
+def _without_outliers(recent: list[tuple], low: Decimal, high: Decimal, *,
+                      band: Decimal = Decimal("1.35"), junk: Decimal = Decimal("0.15")) -> tuple[list[tuple], int]:
+    """Keep the sellable cluster. `low`/`high` stay in the signature for callers; the cluster rule replaces them.
+    Fewer than three prices: nothing is dropped."""
+    del low, high
+    # A sold price is a real exit. Only unsold asks get the cheap-cluster trim, so two bargain
+    # listings cannot erase a set of sales, and a tail of fantasy asks cannot set the exit.
+    sold = [u for u in recent if u[0].kind != "active_ask"]
+    asks = [u for u in recent if u[0].kind == "active_ask"]
+    if sold:
+        cap = median(pln for _, pln, _ in sold) * band
+        kept_asks = [a for a in asks if a[1] <= cap]
+    else:
+        kept_asks = asks
+    dropped = len(asks) - len(kept_asks)
+    if len(kept_asks) >= 3:
+        want = Counter(sellable_asks([pln for _, pln, _ in kept_asks], band=band, junk=junk))
+        trimmed = []
+        for row in kept_asks:
+            if want[row[1]] > 0:
+                want[row[1]] -= 1
+                trimmed.append(row)
+        dropped += len(kept_asks) - len(trimmed)
+        kept_asks = trimmed
+    if not dropped:
+        return recent, 0
+    return sold + kept_asks, dropped
 
 
 def estimate(store: Store, key: str, condition: str | None, channel: str, day: date | datetime, *,
@@ -363,13 +474,15 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
             pln = q2(pln * p.ask_to_sale_ratio)
         conv.append(_Conv(r, pln, gap))
 
-    # channel tier: the first with a converted comp from the last recent_days
-    chosen = None
-    for note, factor, pred in _tiers(ch.market_of(channel), channel, p, ch.market_of):
-        pool = [c for c in conv if pred(c.row)]
-        if any(c.pln is not None and c.row.at >= recent_from for c in pool):
-            chosen = (note, factor, pool)
-            break
+    # Allegro / Allegro Lokalnie of this condition, when any recent comp exists there.
+    # Otherwise the first channel tier with a converted comp from the last recent_days.
+    chosen = _allegro_tier(condition, channel, conv, recent_from)
+    if chosen is None:
+        for note, factor, pred in _tiers(ch.market_of(channel), channel, p, ch.market_of):
+            pool = [c for c in conv if pred(c.row)]
+            if any(c.pln is not None and c.row.at >= recent_from for c in pool):
+                chosen = (note, factor, pool)
+                break
     if chosen is None:
         return None
     note, factor, pool = chosen
@@ -383,6 +496,12 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         notes.append("fx_stale")
 
     recent = [u for u in used if u[0].at >= recent_from]
+    recent, n_out = _without_outliers(recent, p.outlier_low, p.outlier_high,
+                                     band=p.sellable_band, junk=p.sellable_junk)
+    if n_out:
+        notes.append(f"outlier_dropped:{n_out}")
+    if not recent:
+        return None
     vals = [pln for _, pln, _ in recent]
     ws = [w for _, _, w in recent]
     p25, p50, p75 = (q2(x) for x in weighted_quantiles(vals, ws, (0.25, 0.5, 0.75)))

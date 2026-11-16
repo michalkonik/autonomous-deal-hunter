@@ -224,6 +224,17 @@ def role_models(cfg) -> set[str]:
     return {str(v) for v in cfg.models.roles.to_dict().values() if v}
 
 
+def local_role_models(cfg) -> set[str]:
+    """Model names llama-swap must serve. A role listed on a remote provider is not one of them."""
+    roles = cfg.models.roles.to_dict()
+    try:
+        from .llm import remote_routes
+        remote = set(remote_routes(cfg.models))
+    except Exception:  # noqa: BLE001 - a conflict is reported by preflight; treat every role as local until then
+        remote = set()
+    return {str(v) for k, v in roles.items() if k not in remote and v}
+
+
 def llama_running(cfg, http_get=default_http_get) -> list[str] | None:
     """Model names llama-swap has loaded, or None when it cannot be reached."""
     try:
@@ -239,6 +250,17 @@ def preflight(cfg, *, http_get=default_http_get, meminfo: str | Path = "/proc/me
               need_llm: bool = True) -> tuple[list[str], list[str] | None, list[str]]:
     """(refusal reasons, models running before start or None, warnings)."""
     reasons, warnings = [], []
+    try:
+        from .llm import ProviderConflict, remote_routes
+        remote_routes(cfg.models)
+    except ProviderConflict as e:
+        reasons.append(str(e))
+    local = local_role_models(cfg)
+    if need_llm and not local and not reasons:
+        # Nothing will be loaded, so a model another workload already has is left alone, and the RAM floor
+        # (which exists so a local load cannot panic the box) does not apply.
+        warnings.append("no local role model: llama-swap will not be loaded or unloaded")
+        return reasons, llama_running(cfg, http_get), warnings
     need = float(cfg.models.get("min_free_ram_gb", 12))
     try:
         free = mem_available_gb(meminfo)
@@ -252,7 +274,7 @@ def preflight(cfg, *, http_get=default_http_get, meminfo: str | Path = "/proc/me
         if running is None:
             warnings.append(f"llama-swap at {swap_url(cfg)} is not reachable: rounds run on the rules matcher only")
         else:
-            foreign = [m for m in running if m not in role_models(cfg)]
+            foreign = [m for m in running if m not in local]
             if foreign:
                 reasons.append("llama-swap is running model(s) outside the configured roles: " + ", ".join(foreign)
                                + ". Not starting: loading the role models would evict another workload.")
@@ -345,7 +367,7 @@ def release_models(cfg, before: list[str] | None, *, http_get=default_http_get, 
     if not running:
         print("llama-swap: no model loaded", file=out)
         return False
-    roles = role_models(cfg)
+    roles = local_role_models(cfg)
     foreign = [m for m in running if m not in roles]
     if foreign:
         print("llama-swap: not unloading, other model(s) loaded: " + ", ".join(foreign), file=out)
@@ -372,7 +394,7 @@ async def warm_models(cfg, *, timeout_s: float = 300.0, post=None) -> dict[str, 
     import httpx
     base = str(cfg.models.base_url).rstrip("/")
     out: dict[str, str] = {}
-    for model in sorted(role_models(cfg)):
+    for model in sorted(local_role_models(cfg)):
         body = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}],
                 "chat_template_kwargs": {"enable_thinking": False}}
         try:
@@ -554,7 +576,9 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
     out["paused"] = None
     with contextlib.suppress(OSError, ValueError):
         out["paused"] = json.loads(paused_path(root).read_text())
-    out["llama_swap"] = {"url": swap_url(cfg), "running": llama_running(cfg, http_get), "roles": sorted(role_models(cfg))}
+    out["llama_swap"] = {"url": swap_url(cfg), "running": llama_running(cfg, http_get),
+                         "roles": sorted(local_role_models(cfg))}
+    out["providers"] = _provider_status(cfg)
     out["ntfy_topic"] = notify.topic(root)
     if db_path(root).is_file():
         st = Store(db_path(root))
@@ -607,6 +631,20 @@ def _db_status(st: Store, started_at: str | None) -> dict:
     return {"rounds_total": rounds_total, "rounds_since_start": since, "watched_hours": watched,
             "last_round": last_round, "deals_today": tiers, "health": {"blocked": blocked, "disabled": disabled},
             "llm_today": {"tokens": int(tok)}, "cost_today_pln": round(float(energy), 2)}
+
+
+def _provider_status(cfg) -> list[dict]:
+    """Remote providers for `dh status`. Names, caps and role models only: never a key."""
+    try:
+        from .llm import remote_routes
+        routes = remote_routes(cfg.models)
+    except Exception:  # noqa: BLE001 - a bad block is reported at start; status still renders
+        return []
+    grouped: dict[str, dict] = {}
+    for role, route in routes.items():
+        g = grouped.setdefault(route.provider, {"name": route.provider, "cap_usd": route.cap_usd, "roles": {}})
+        g["roles"][role] = route.model
+    return [grouped[k] for k in sorted(grouped)]
 
 
 def _log_repo(cfg) -> dict:
@@ -692,11 +730,11 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     if not no_llm:
         from .llm import Client
         ctx.llm = Client(cfg, on_usage=ctx.on_usage, on_paid=ctx.on_paid,
-                         paid_spend=lambda: books.paid_month_usd(store))
+                         paid_spend=lambda provider="paid_api": books.paid_month_usd(store, provider=provider))
 
         async def foreign_models() -> list[str]:
             running = await asyncio.to_thread(llama_running, cfg)
-            return [] if running is None else [m for m in running if m not in role_models(cfg)]
+            return [] if running is None else [m for m in running if m not in local_role_models(cfg)]
         ctx.llm_check = foreign_models
     return ctx
 

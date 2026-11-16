@@ -14,6 +14,15 @@ paid_api:
   usd_per_mtok_in: 0
   usd_per_mtok_out: 0
   pln_per_usd: 4.0            # only to show the spend in PLN in the books
+# More OpenAI-compatible providers, each with its own key and monthly cap. A role listed here is NOT loaded
+# on llama-swap. Put the real block in config/local/models.yaml. The key is a bw-secret reference, never the value.
+# Cap 0 refuses every call to that provider. enabled: false drops the whole block. One role, one provider.
+# providers:
+#   grok:    {base_url: https://api.x.ai/v1, api_key_secret: grok#api_key, monthly_cap_usd: 0, roles: {advisor: grok-4.7}}
+#   gemini:  {base_url: https://generativelanguage.googleapis.com/v1beta/openai, api_key_secret: gemini#api_key, monthly_cap_usd: 0, roles: {}}
+#   claude:  {base_url: https://api.anthropic.com/v1, api_key_secret: claude#api_key, monthly_cap_usd: 0, roles: {}}
+#   chatgpt: {base_url: https://api.openai.com/v1, api_key_secret: openai#api_key, monthly_cap_usd: 0, roles: {}}
+providers: {}
 min_free_ram_gb: 12
 timeouts: {connect_s: 5, read_s: 60}
 breaker: {failures: 3, cooldown_s: 120}

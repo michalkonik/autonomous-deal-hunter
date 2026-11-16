@@ -192,6 +192,95 @@ def test_ebay_api_backoff_and_disable(store):
     assert kinds.count("blocked") == 3 and "disabled" in kinds
 
 
+def _basic(cid, sec):
+    import base64
+    return "Basic " + base64.b64encode(f"{cid}:{sec}".encode()).decode()
+
+
+def test_two_keys_switch_on_quota_and_do_not_disable(store):
+    keys = {"ebay#client_id": "cid1", "ebay#client_secret": "sec1",
+            "ebay2#client_id": "cid2", "ebay2#client_secret": "sec2"}
+
+    class Rec:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, method, url, headers, data, timeout):
+            self.calls.append((method, url, headers, data))
+            auth = headers.get("Authorization", "")
+            if "oauth2/token" in url:
+                tok = "tok1" if auth == _basic("cid1", "sec1") else "tok2"
+                return 200, json.dumps({"access_token": tok, "expires_in": 7200})
+            if auth == "Bearer tok1":
+                return 429, "{}", {"retry-after": "90"}
+            return 200, fixture_text("ebay", "search_de.json")
+
+    rec = Rec()
+    t = [0.0]
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=keys.get, client=_client(rec, clock=lambda: t[0]))
+    ls = run(ad.search(Query(text="rtx 4090"), StoreFetcher(store)))
+    assert ls and not ad.client.disabled and ad.client.refusals == 0
+    auths = [c[2]["Authorization"] for c in rec.calls]
+    assert auths[0] == _basic("cid1", "sec1") and "Bearer tok1" in auths
+    assert auths[-2] == _basic("cid2", "sec2") and auths[-1] == "Bearer tok2"
+    kinds = [k for _, k, _ in _health(store)]
+    assert "quota" in kinds and "blocked" not in kinds and "disabled" not in kinds
+    # key 1 is cooling; the next search stays on key 2 and does not ask for a new token
+    n = len(rec.calls)
+    run(ad.search(Query(text="rtx 4090"), StoreFetcher(store)))
+    assert len(rec.calls) == n + 1 and rec.calls[-1][2]["Authorization"] == "Bearer tok2"
+
+
+def test_two_keys_both_cooling_back_off_without_another_call(store):
+    keys = {"ebay#client_id": "cid1", "ebay#client_secret": "sec1",
+            "ebay2#client_id": "cid2", "ebay2#client_secret": "sec2"}
+
+    class Rec:
+        def __init__(self):
+            self.calls = []
+
+        async def __call__(self, method, url, headers, data, timeout):
+            self.calls.append((method, url, dict(headers), data))
+            if "oauth2/token" in url:
+                who = "a" if headers.get("Authorization") == _basic("cid1", "sec1") else "b"
+                return 200, json.dumps({"access_token": who, "expires_in": 7200})
+            return 429, "{}", {"retry-after": "60"}
+
+    rec = Rec()
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=keys.get, client=_client(rec, clock=lambda: 0.0))
+    with pytest.raises(AdapterError, match="backing off"):
+        run(ad.search(Query(text="x"), StoreFetcher(store)))
+    n = len(rec.calls)
+    assert not ad.client.disabled
+    with pytest.raises(AdapterError, match="backing off"):
+        run(ad.search(Query(text="x"), StoreFetcher(store)))
+    assert len(rec.calls) == n
+
+
+def test_load_key_sets_stops_at_a_gap_and_skips_a_secretless_item():
+    def hole(ref):
+        return {"ebay#client_id": "a", "ebay#client_secret": "b",
+                "ebay3#client_id": "e", "ebay3#client_secret": "f"}.get(ref)
+    assert ebay.load_key_sets(hole) == [("a", "b")]
+
+    def skip(ref):
+        return {"ebay#client_id": "a", "ebay#client_secret": "b",
+                "ebay2#client_id": "c",
+                "ebay3#client_id": "e", "ebay3#client_secret": "f"}.get(ref)
+    assert ebay.load_key_sets(skip) == [("a", "b"), ("e", "f")]
+    seen = []
+
+    def eight(ref):
+        seen.append(ref)
+        item = ref.split("#", 1)[0]
+        n = 1 if item == "ebay" else int(item.replace("ebay", ""))
+        if n <= 8:
+            return "id" if ref.endswith("client_id") else "sec"
+        return "no"
+    assert len(ebay.load_key_sets(eight)) == 8
+    assert not any(s.startswith("ebay9") for s in seen)
+
+
 def test_query_for_key():
     assert ebay.query_for_key("gpu:rtx-4090:24") == "rtx 4090"
     assert ebay.query_for_key("ram:ddr5:32:2x16") == "ddr5 32gb"
@@ -463,7 +552,7 @@ def test_bw_secret_cached_per_process(monkeypatch):
     ebay.clear_secret_cache()
     a = ebay.EbayBrowse("EBAY_DE")
     assert a.enabled is False and ebay.EbayBrowse("EBAY_PL").enabled is False and a.enabled is False
-    assert sorted(calls) == ["ebay#client_id", "ebay#client_secret"]  # each ref looked up once
+    assert calls == ["ebay#client_id"]  # a missing id ends the list before the secret, and before ebay2
     ebay.clear_secret_cache()
 
 
@@ -507,6 +596,8 @@ def test_prefetch_resolves_ebay_keys_in_parallel_once_per_run(monkeypatch):
     calls, active, peak = [], [0], [0]
     lock = threading.Lock()
 
+    known = {"ebay#client_id": "cid", "ebay#client_secret": "sec"}
+
     def slow(ref):
         with lock:
             active[0] += 1
@@ -515,15 +606,18 @@ def test_prefetch_resolves_ebay_keys_in_parallel_once_per_run(monkeypatch):
         with lock:
             active[0] -= 1
         calls.append(ref)
-        return {"ebay#client_id": "cid", "ebay#client_secret": "sec"}[ref]
+        return known.get(ref)
     monkeypatch.setattr("dh.notify.bw_secret", slow)
+    ebay.clear_secret_cache()
     t0 = time.monotonic()
     ebay.prefetch_secrets()
-    assert time.monotonic() - t0 < 0.55 and peak[0] == 2  # both at once
-    assert sorted(calls) == ["ebay#client_id", "ebay#client_secret"]
+    # every candidate ref in one wave: 8 eBay items x 2 fields, plus the Allegro pair
+    assert time.monotonic() - t0 < 1.0 and peak[0] == len(ebay.KEY_REFS)
+    assert sorted(calls) == sorted(ebay.KEY_REFS)
     assert ebay.EbayBrowse("EBAY_DE").enabled is True and ebay.EbayBrowse("EBAY_PL").enabled is True
     ebay.prefetch_secrets()
-    assert len(calls) == 2  # cached: not asked again
+    assert len(calls) == len(ebay.KEY_REFS)  # cached: not asked again
+    ebay.clear_secret_cache()
 
 
 def test_build_context_prefetches_the_ebay_keys(tmp_path, monkeypatch):

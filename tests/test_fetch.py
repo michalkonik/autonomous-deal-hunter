@@ -138,6 +138,26 @@ async def test_disable_after_3_blocks(tmp_path):
     assert any(k == "re_enabled" for _, k, _ in st.health)
 
 
+async def test_obey_robots_false_fetches_a_disallowed_path_and_skips_robots_txt(tmp_path):
+    calls = []
+
+    def h(req):
+        calls.append(req.url.path)
+        if req.url.path == "/robots.txt":
+            return httpx.Response(200, text="User-agent: *\nDisallow: /\n")
+        return httpx.Response(200, text="<html>listing</html>")
+
+    ft, st = FakeTime(), FakeStore()
+    http = httpx.AsyncClient(transport=httpx.MockTransport(h))
+    cfg = {**CFG, "fetch": {**CFG["fetch"], "obey_robots": False}}
+    f = Fetcher(cfg, st, tmp_path, clock=ft.clock, sleep=ft.sleep, http=http)
+    r = await f.get("https://a.test/private/x", kind="html")
+    assert r.status == 200 and r.text == "<html>listing</html>" and not r.disallowed
+    assert calls == ["/private/x"]
+    assert await f.allowed("https://a.test/private/x")
+    assert not any(k.startswith("robots") for _, k, _ in st.health)
+
+
 async def test_robots_disallow_respected(tmp_path):
     calls = []
 

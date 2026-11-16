@@ -31,7 +31,8 @@ disappearance (one ask per listing; at least `min_asks` asks). Kind `probably_so
 config/valuation.yaml (0.5).
 Condition: the matcher leaves most classified titles at `unknown`; `unknown` is valued as `used`
 (`condition_filter`). Box-only, for-parts and wanted ads, bundles (whole PCs, lots) and matches with certainty
-< 0.7 are never comparables (`_SALEABLE`).
+< 0.7 are never comparables (`_SALEABLE`). A title that is a swap, or that the rules key to a different product,
+is not a benchmark either (`_benchmark_ok`), even when the stored extraction missed the flag.
 
 Observations: one row on first sighting and one on every price change (first price + every cut), not one per sweep.
 """
@@ -312,14 +313,55 @@ _SALEABLE = ("coalesce(e.box_only,0)=0 and coalesce(e.for_parts,0)=0 and coalesc
              "and coalesce(e.bundle_items,'[]') in ('[]','') "
              f"and coalesce(e.certainty,0) >= {COMP_MIN_CERTAINTY}")
 USED_LIKE = ("used", "unknown")  # a classified ad with no stated condition is valued as used
+# like-new comps join this pool. A direct like-new query stays exact (condition_filter's else branch).
+_USED_POOL_SQL = " and (e.condition is null or e.condition in ('used','unknown','like_new'))"
+
+
+def _stated_pool(condition: str | None) -> str | None:
+    """The benchmark pool the rules read off a title. Unknown means the stored condition is trusted."""
+    if condition == "new":
+        return "new"
+    if condition in ("used", "like_new"):
+        return "used"
+    return None
+
+
+@lru_cache(maxsize=8192)
+def _benchmark_ok(title: str, description: str, key: str, condition: str | None = None) -> bool:
+    """A listing may price `key` only when it is the same product and a real ask or sale.
+
+    Swap ads ("gegen … tauschen") and a title the rules key to a different model are rejected here, so a stale
+    extraction that stored the wrong key cannot become the benchmark. When `condition` is set, a title or a
+    structured condition field that says new can only price the new pool, and one that says used or like-new
+    can only price the used pool. `condition` None (the probably-sold median) does not split pools."""
+    from .match import _swap_ad, norm, rules_extract
+    if _swap_ad(norm(f"{title or ''}\n{description or ''}")):
+        return False
+    ex = rules_extract(title or "", "", "pl")
+    if "rules_rejected" in ex.notes or ex.wanted_ad or ex.box_only or ex.for_parts:
+        return False
+    if ex.key and ex.key != key:
+        return False
+    if condition is None:
+        return True
+    stated = rules_extract(title or "", description or "", "pl").condition
+    pool = _stated_pool(stated)
+    if pool is None:
+        return True
+    if condition == "new":
+        return pool == "new"
+    if condition in USED_LIKE:
+        return pool == "used"
+    return stated == condition
 
 
 def condition_filter(condition: str | None) -> tuple[str, list]:
-    """SQL fragment on extractions `e`: None = any; 'used'/'unknown' = used, unknown or missing; else exact."""
+    """SQL fragment on extractions `e`: None = any; 'used'/'unknown' = used, unknown, like-new or missing;
+    else exact (a direct like-new query does not widen)."""
     if condition is None:
         return "", []
     if condition in USED_LIKE:
-        return " and (e.condition is null or e.condition in ('used','unknown'))", []
+        return _USED_POOL_SQL, []
     return " and e.condition=?", [condition]
 
 
@@ -338,13 +380,14 @@ def _median_ask(store: Store, key: str, currency: str, t: datetime, window: time
     The reference computation (one query per listing); `median_ask` serves the same result from an index."""
     lo = t - window
     rows = store.conn.execute(
-        f"""select l.id, l.price, l.first_seen_at, l.last_seen_at from listings l
+        f"""select l.id, l.price, l.title, l.description, l.first_seen_at, l.last_seen_at from listings l
             join extractions e on e.listing_id=l.id
             where e.key=? and upper(l.currency)=? and {_SALEABLE}
             and l.first_seen_at <= ? and l.last_seen_at >= ?""",
         (key, currency.upper(), _iso(t), _iso(lo))).fetchall()
     asks = [_price_at(store, r["id"], t, r["price"]) for r in rows
-            if _t(r["first_seen_at"]) <= t and _t(r["last_seen_at"]) >= lo]
+            if _benchmark_ok(r["title"] or "", r["description"] or "", key)
+            and _t(r["first_seen_at"]) <= t and _t(r["last_seen_at"]) >= lo]
     return (median(asks) if asks else None), len(asks)
 
 
@@ -355,9 +398,11 @@ class _AskIndex:
     def __init__(self, store: Store, key: str, currency: str):
         args = (key, currency.upper())
         where = f"e.key=? and upper(l.currency)=? and {_SALEABLE}"
-        self.listings = [(r["id"], _t(r["first_seen_at"]), _t(r["last_seen_at"]), r["price"]) for r in store.conn.execute(
-            f"select l.id, l.price, l.first_seen_at, l.last_seen_at from listings l "
-            f"join extractions e on e.listing_id=l.id where {where}", args)]
+        self.listings = [(r["id"], _t(r["first_seen_at"]), _t(r["last_seen_at"]), r["price"])
+                         for r in store.conn.execute(
+            f"select l.id, l.price, l.title, l.description, l.first_seen_at, l.last_seen_at from listings l "
+            f"join extractions e on e.listing_id=l.id where {where}", args)
+                         if _benchmark_ok(r["title"] or "", r["description"] or "", key)]
         self.obs: dict[int, tuple[list[datetime], list[str]]] = {}
         for r in store.conn.execute(
                 f"select o.listing_id, o.seen_at, o.price from observations o join listings l on l.id=o.listing_id "
@@ -409,6 +454,8 @@ def clears_at(store: Store, key: str, condition: str | None, since: datetime, *,
     sql, args = sql + frag, args + extra
     out = []
     for r in store.conn.execute(sql + " order by l.disappeared_at, l.id", args).fetchall():
+        if not _benchmark_ok(r["title"] or "", r["description"] or "", key, condition):
+            continue
         gone = _t(r["disappeared_at"])
         starts = [t for t in (_t(r["posted_at"]), _t(r["appeared_at"])) if t is not None]
         if not starts:
@@ -440,6 +487,8 @@ def active_asks(store: Store, key: str, condition: str | None, now: datetime, *,
     sql, args = sql + frag, args + extra
     out = []
     for r in store.conn.execute(sql + " order by l.id", args).fetchall():
+        if not _benchmark_ok(r["title"] or "", r["description"] or "", key, condition):
+            continue
         price = Decimal(r["price"])
         out.append(CompRow(key=key, condition=r["cond"], channel=channel_of(r["source"]), kind="active_ask",
                            price=price, currency=r["currency"].upper(), at=_t(r["last_seen_at"]),

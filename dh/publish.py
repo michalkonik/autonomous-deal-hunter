@@ -23,12 +23,13 @@ from .cards import PUBLIC_COMP_KEYS, PUBLIC_KEYS, PUBLIC_LISTING_KEYS
 from .notify import health_once
 
 MARK_IMPORTS_SQL = """create table if not exists mark_imports (
-  deal_id integer primary key, hash text not null, outcome text not null
+  deal_id integer primary key, hash text not null, outcome text not null,
+  published_hash text
 )"""
 STATUSES = {"open", "bought", "skipped", "sold"}
 DEFAULT_OUTCOME = {"status": "open", "price_pln": None, "date": None, "note": ""}
 _FM = re.compile(r"\A---\n(.*?)\n---\n?(.*)\Z", re.S)
-GIT_ID = ["-c", "user.name=deal-hunter", "-c", "user.email=michal.konik.job@gmail.com"]
+GIT_ID = ["-c", "user.name=deal-hunter", "-c", "user.email=offlinelocalagents@gmail.com"]
 
 
 @dataclass
@@ -98,39 +99,89 @@ def _deal_id(name: str, text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def ensure_mark_imports(conn) -> None:
+    """Create mark_imports. published_hash is the outcome hash last written to the log card.
+    Existing databases gain the column. Commits only when it has to alter."""
+    conn.execute(MARK_IMPORTS_SQL)
+    cols = {r[1] for r in conn.execute("pragma table_info(mark_imports)")}
+    if "published_hash" not in cols:
+        conn.execute("alter table mark_imports add column published_hash text")
+        conn.commit()
+
+
+def _card_day(label: str) -> str | None:
+    m = re.search(r"(?:^|/)deals/(\d{4}-\d{2}-\d{2})/", label.replace("\\", "/"))
+    return m.group(1) if m else None
+
+
+def _owns_card(store, deal_id: int, label: str) -> bool:
+    """A `deals/<day>/` card belongs to this deal only when <day> is the deal's created day.
+
+    Deal ids were reused after a database reset, and the old log cards still say `outcome: open`.
+    Importing those cleared a later false-positive mark. A label with no day segment is accepted.
+    """
+    day = _card_day(label)
+    if day is None:
+        return True
+    deal = store.get_deal(deal_id)
+    if deal is None:
+        return False
+    return deal.created_at.astimezone(timezone.utc).strftime("%Y-%m-%d") == day
+
+
 def record_import(conn, deal_id: int, outcome: dict) -> None:
     """Record `outcome` as already imported for `deal_id` (so the publisher will not import a card edit that
     equals it as a second mark). Does NOT commit: call it in the same transaction as the `marks` insert.
-    The table must exist (`store.ensure_table(MARK_IMPORTS_SQL)`)."""
+    Keeps published_hash. That is still the previous log card until write_cards replaces it."""
+    ensure_mark_imports(conn)
     norm = parse_outcome(_with_outcome("---\ndeal_id: 0\n---\n", outcome))
-    conn.execute("insert or replace into mark_imports (deal_id, hash, outcome) values (?,?,?)",
-                 (deal_id, _ohash(norm), json.dumps(norm)))
+    prev = conn.execute("select published_hash from mark_imports where deal_id=?", (deal_id,)).fetchone()
+    published = prev[0] if prev is not None else None
+    conn.execute(
+        "insert or replace into mark_imports (deal_id, hash, outcome, published_hash) values (?,?,?,?)",
+        (deal_id, _ohash(norm), json.dumps(norm), published))
 
 
 def import_texts(store, items) -> tuple[int, set[int]]:
     """items: iterable of (label, text). Imports changed outcome blocks as marks via store.add_mark.
     Returns (imported, deal_ids of unparseable cards). A poison file never stops the import."""
-    store.ensure_table(MARK_IMPORTS_SQL)
+    ensure_mark_imports(store.conn)
     n, bad = 0, set()
     for label, text in items:
         did = None
         try:
             did = _deal_id(label, text)
-            if did is None:
+            if did is None or not _owns_card(store, did, label):
                 continue
             o = parse_outcome(text)
             if o is None:
                 continue
-            row = store.conn.execute("select hash from mark_imports where deal_id=?", (did,)).fetchone()
+            row = store.conn.execute(
+                "select hash, published_hash from mark_imports where deal_id=?", (did,)).fetchone()
             h = _ohash(o)
-            if (row is None and o == DEFAULT_OUTCOME) or (row is not None and row["hash"] == h):
+            if row is None and o == DEFAULT_OUTCOME:
+                continue
+            if row is not None and row["hash"] == h:
+                if row["published_hash"] is None:
+                    store.conn.execute(
+                        "update mark_imports set published_hash=? where deal_id=?", (h, did))
+                    store.conn.commit()
+                continue
+            # The card still shows the previous publish. A web mark updates the recorded hash before
+            # write_cards rewrites the file, so this is not a GitHub edit and must not clear the mark.
+            if row is not None and (row["published_hash"] is None or row["published_hash"] == h):
+                if row["published_hash"] is None:
+                    store.conn.execute(
+                        "update mark_imports set published_hash=? where deal_id=?", (h, did))
+                    store.conn.commit()
                 continue
             note = (o["note"] + (f" [date {o['date']}]" if o["date"] else "")).strip()
             # mark first, hash second: a crash in between can duplicate a mark on retry but never lose one
             store.add_mark(did, o["status"], None if o["price_pln"] is None else Decimal(o["price_pln"]),
                            note, "github")
-            store.conn.execute("insert or replace into mark_imports (deal_id, hash, outcome) values (?,?,?)",
-                               (did, h, json.dumps(o)))
+            store.conn.execute(
+                "insert or replace into mark_imports (deal_id, hash, outcome, published_hash) values (?,?,?,?)",
+                (did, h, json.dumps(o), h))
             store.conn.commit()
             n += 1
         except Exception as e:
@@ -228,7 +279,7 @@ def _with_outcome(text: str, o: dict) -> str:
 def write_cards(store, log_dir: Path, cards: list[CardFile], protect: set[int] = frozenset()) -> int:
     """Copy new/changed cards into the clone (sanitised), keeping any outcome already imported.
     Cards in `protect` (broken user edit) are left untouched this cycle."""
-    store.ensure_table(MARK_IMPORTS_SQL)
+    ensure_mark_imports(store.conn)
     changed = 0
     for c in cards:
         if c.deal_id in protect:
@@ -236,9 +287,12 @@ def write_cards(store, log_dir: Path, cards: list[CardFile], protect: set[int] =
         try:
             dest = _card_dest(log_dir, c)
             text = sanitize_md(c.path_md.read_text())
-            row = store.conn.execute("select outcome from mark_imports where deal_id=?", (c.deal_id,)).fetchone()
+            row = store.conn.execute(
+                "select outcome, published_hash from mark_imports where deal_id=?", (c.deal_id,)).fetchone()
+            outcome = None
             if row is not None:
-                text = _with_outcome(text, json.loads(row["outcome"]))
+                outcome = json.loads(row["outcome"])
+                text = _with_outcome(text, outcome)
             elif dest.is_file() and (cur := parse_outcome(dest.read_text())) not in (None, DEFAULT_OUTCOME):
                 text = _with_outcome(text, cur)  # unimported edit still on disk: keep it for the next import
             data = sanitize_json(c.path_json.read_text())
@@ -246,6 +300,13 @@ def write_cards(store, log_dir: Path, cards: list[CardFile], protect: set[int] =
             if not dest.is_file() or dest.read_text() != text:
                 dest.write_text(text)
                 changed += 1
+            if outcome is not None:
+                # Only after the file has this outcome. Import treats that hash as "already published".
+                h = _ohash(parse_outcome(_with_outcome("---\ndeal_id: 0\n---\n", outcome)))
+                if row["published_hash"] != h:
+                    store.conn.execute(
+                        "update mark_imports set published_hash=? where deal_id=?", (h, c.deal_id))
+                    store.conn.commit()
             jdest = dest.with_suffix(".json")
             if not jdest.is_file() or jdest.read_text() != data:
                 jdest.write_text(data)
@@ -400,7 +461,7 @@ async def sync(store, cfg, root: Path | None = None) -> dict:
     if pc.get("branch", BRANCH) != BRANCH:
         health_once(store, "publish", "bad_branch", f"publish.branch must be {BRANCH!r}, got {pc.get('branch')!r}")
         return res
-    store.ensure_table(MARK_IMPORTS_SQL)
+    ensure_mark_imports(store.conn)
     if not await _ensure_clone(log_dir, pc.get("remote"), store):
         return res
     if (await _git(log_dir, "symbolic-ref", "-q", "HEAD"))[1] != f"refs/heads/{BRANCH}":

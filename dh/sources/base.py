@@ -293,6 +293,13 @@ class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
         """Pure: fill description/photos/seller fields from a detail page body."""
         raise NotImplementedError
 
+    def empty_search(self, res) -> bool:
+        """True when the response is a real empty catalog, not a broken page.
+
+        IdoSell shops answer a query with no matches as HTTP 404 on `noproduct`. That is zero
+        listings. A 500, a block, or any other 404 stays a failure."""
+        return False
+
     def detail_price(self, html: str) -> Decimal | None:
         """Pure: current price on a detail page, or None when it can't be read."""
         return None
@@ -312,6 +319,8 @@ class Adapter(ABC):  # noqa: B024 (no abstract methods: see below)
         failed, last = 0, 0
         for url in urls:
             res = await self._get(fetcher, url)
+            if self.empty_search(res):
+                continue
             if res.status != 200:
                 failed, last = failed + 1, res.status
                 continue

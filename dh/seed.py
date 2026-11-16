@@ -7,8 +7,9 @@ CSV with a header (`title`, `price` or `price_string`, `link`, `datetime`) is ac
 
 Only GPU, RAM and SSD titles that the rules matcher keys with certainty ≥ 0.9 are kept; wanted ads, box-only,
 for-parts and bundles never are. Prices are CZK, converted to PLN at the NBP rate of the posting date.
-Rows go in as kind `ask_history` (weight 0.2 in valuation), channel `bazos_cz`, condition `used` unless the title
-says otherwise, `sold_at` = posting time, `ref` = the listing link. Re-running is idempotent (by ref).
+Rows go in as kind `ask_history` (weight 0.2 in valuation), channel `bazos_cz`. A title the rules call new is
+stored new; like-new, used and unknown join the used pool. `sold_at` = posting time, `ref` = the listing link.
+Re-running is idempotent (by ref).
 
 Usage (on the rig):
     python -m dh.seed bazos --db var/dh.db                       # download the PC section, then import
@@ -33,6 +34,7 @@ from typing import Iterator
 import httpx
 
 from .match import rules_extract
+from .valuation import benchmark_condition
 from .money import Fx, parse_price, q2
 from .store import Store
 
@@ -40,7 +42,7 @@ BAZOS_PC_URL = "https://jirkabalhar.cz/bazos/section_pc.csv.zip"
 CHANNEL = "bazos_cz"
 KIND = "ask_history"
 MAX_BYTES = 200 * 1024 * 1024
-USER_AGENT = "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
+USER_AGENT = "DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)"
 CATEGORIES = ("gpu", "ram", "ssd")
 # Placeholder prices ("1 Kč", "10 zł") are not asks. Below either floor a row is skipped.
 MIN_NATIVE = {"CZK": Decimal("50"), "PLN": Decimal("20")}
@@ -143,7 +145,7 @@ async def import_bazos(store: Store, path: Path, fx, *, categories: tuple[str, .
         if pln < MIN_PLN:
             counts["below_floor"] += 1
             continue
-        condition = e.condition if e.condition in ("new", "like_new") else "used"
+        condition = benchmark_condition(e.condition)
         store.add_comp(e.key, condition, CHANNEL, pln, when, KIND, link)
         counts["imported"] += 1
     return counts

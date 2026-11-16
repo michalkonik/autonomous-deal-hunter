@@ -9,6 +9,7 @@ The owner starts and stops the agent by hand. Nothing starts at boot.
 | Command | What it does |
 |---|---|
 | `dh start` | Checks free RAM (>= `models.min_free_ram_gb`, 12 GB) and that llama-swap runs no model outside the configured roles, then starts the transient user unit `deal-hunter` (rounds + log publisher) **and** the page server unit `deal-hunter-web` (the web page on :8711). Refuses, and says why, instead of evicting another workload. Also refuses while a foreground `dh round` runs. |
+| `dh start --page-only` | Starts only the web page. It does not start the hunter, so no round runs and nothing is searched. Same unit as `dh page start`. |
 | `dh page start\|stop\|status` | The page server alone: browse the deals with the hunter stopped. It is its own transient unit `<unit>-web` running `python -m dh.runtime serve-web`: same database, no agent, no lock, no models, and only the mark forms and the "stop the page" button ever write. `dh start` starts it next to the hunter; `dh stop` stops both. The nav badge shows whether the **hunter** is running while you browse. |
 | `dh status [--json]` | Running?, uptime, rounds, last round, deals today, health, llama-swap, ntfy topic, log repo, and the improvement loop (phase, cooldown, owner reviews; read-only). |
 | `dh stop` | Stops the unit and the page server, closes observation windows, unloads the role models only if nothing else is loaded and they were not already loaded before `dh start`, then checks that no process is left. |

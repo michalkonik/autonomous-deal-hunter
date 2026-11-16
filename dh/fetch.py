@@ -1,6 +1,7 @@
 """Polite per-domain fetcher: plain httpx, honest UA, robots.txt, backoff, gzip snapshots.
 
-No impersonation, no proxies, no challenge solving.
+No impersonation, no proxies, no challenge solving. `obey_robots` false skips robots.txt;
+a 403, a 429 or a challenge page is still a stop.
 
 - Per-domain lock; `min_interval_s` + 0..`jitter_s` between requests (raised to the site's Crawl-delay).
 - Block (403 or challenge page): backoff 60 s doubling, cap 1 h; 3 consecutive blocks disable the
@@ -33,7 +34,7 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
-DEFAULT_UA = "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
+DEFAULT_UA = "DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)"
 CHALLENGE_MARKERS = ("cf-chl", "just a moment", "datadome", "captcha-delivery", "_incapsula_")
 ROBOTS_FAIL_TTL_S = 300
 SOFT_CAP_S = 900
@@ -204,6 +205,9 @@ class Fetcher:
         self.disable_after = int(_opt(c, "disable_after_blocks", 3))
         self.disable_cooldown = float(_opt(c, "disable_cooldown_s", 3600))
         self.robots_ttl = float(_opt(c, "robots_ttl_s", 86400))
+        # Owner switch (2026-11-12): robots.txt is a politeness file, not a block. Default stays on so
+        # tests keep the old behaviour. sources.yaml sets this false for this hunter.
+        self.obey_robots = bool(_opt(c, "obey_robots", True))
         self.user_agent = str(_opt(c, "user_agent", DEFAULT_UA))
         self.max_crawl_delay = float(_opt(c, "max_crawl_delay_s", 60))
         timeout = float(_opt(c, "timeout_s", 30))
@@ -303,7 +307,7 @@ class Fetcher:
             # re-check state now that we hold the lock
             if self.blocked(domain):
                 return _Out("skipped")
-            if not robots:
+            if not robots and self.obey_robots:
                 ent = self._robots.get(domain)
                 if ent is not None and not self._rules_allow(ent, url):
                     return _Out("disallowed")
@@ -391,6 +395,8 @@ class Fetcher:
         return fail
 
     async def allowed(self, url: str) -> bool:
+        if not self.obey_robots:
+            return True
         parts = urlsplit(url)
         domain = parts.netloc.lower()
         ent = await self._robots_for(parts.scheme or "https", domain)
@@ -463,12 +469,13 @@ class Fetcher:
             return FetchResult(0, "", url), None
         if self.blocked(domain):
             return FetchResult(0, "", url, blocked=True), None
-        ent = await self._robots_for(parts.scheme, domain)
-        if self.blocked(domain):
-            return FetchResult(0, "", url, blocked=True), None
-        if not self._rules_allow(ent, url):
-            self._health(domain, "robots_disallow", url)
-            return FetchResult(0, "", url, disallowed=True), None
+        if self.obey_robots:
+            ent = await self._robots_for(parts.scheme, domain)
+            if self.blocked(domain):
+                return FetchResult(0, "", url, blocked=True), None
+            if not self._rules_allow(ent, url):
+                self._health(domain, "robots_disallow", url)
+                return FetchResult(0, "", url, disallowed=True), None
         out = await self._locked_request(domain, url, headers)
         if out.kind == "skipped":
             return FetchResult(0, "", url, blocked=True), None

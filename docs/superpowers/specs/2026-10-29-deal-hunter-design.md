@@ -1,6 +1,6 @@
 # Deal Hunter: design
 
-*Date: 2026-10-29. Status: draft for the owner's approval. Target repo: new private repo `michalkonik/deal-hunter`.*
+*Date: 2026-10-29. Status: draft for the owner's approval. Target repo: new private repo `michal-koniu/deal-hunter`.*
 *Research behind this design, in the session scratchpad. It gets copied to `docs/research/` in the repo:*
 - *`deal-tools-landscape.md`: products, open-source parts, platform access, economics, patterns, scams;*
 - *`self-improving-agents.md`: the self-improvement literature and its statistics.*

@@ -72,6 +72,13 @@ def test_pc_bait_never_pc_bundle(title):
 
 
 # ------------------------------------------------------------------ components
+def test_ram_snippet_keeps_the_kit_written_after_ddr():
+    """'64GB DDR5 2x32GB' is a 2x32 kit, not one 64GB module (those comps are server sticks)."""
+    title = "Gaming PC / RTX 4070Ti Super i7 14700K Z790 Wifi 64GB DDR5 2x32GB 4TB NVMe 1000W"
+    ram = [c for c in partout.rule_components(title) if c.kind == "ram"]
+    assert [(c.key) for c in ram] == ["ram:ddr5:64:2x32"]
+
+
 def test_rule_components():
     got = [(c.kind, c.key) for c in partout.rule_components(TITLE)]
     assert got == [("gpu", "gpu:rtx-4070:12"), ("cpu", "cpu:ryzen-7-5800x"), ("ram", "ram:ddr5:32:1x32"),
@@ -125,9 +132,9 @@ async def test_value_sums_parts_less_parting_and_extra_legs(store):
 async def test_two_parts_not_heavy_and_weakest_part_sets_evidence(store):
     t = "Gaming PC RTX 4070 12GB 32GB DDR5"
     seed(store, "gpu:rtx-4070:12", "2000", n=6)
-    seed(store, "ram:ddr5:32:1x32", "400", n=2)
+    seed(store, "ram:ddr5:32:1x32", "400", n=3)
     est = await partout.value(lst(t), rules_extract(t, "", "pl"), store, DAY)
-    assert est.n_effective == 2.0 and partout.effort_hint(est) is None and len(partout.parts_of(est)) == 2
+    assert est.n_effective == 3.0 and partout.effort_hint(est) is None and len(partout.parts_of(est)) == 2
     assert est.median_pln == Decimal("2112.00") - Decimal("15")  # 2400 * 0.88 - one extra leg
 
 
@@ -138,6 +145,16 @@ async def test_gpu_cpu_ram_is_heavy_even_with_the_cpu_unvalued(store):
     est = await partout.value(lst(t), rules_extract(t, "", "pl"), store, DAY)
     assert len(partout.parts_of(est)) == 3 and partout.effort_hint(est) == "heavy"
     assert "valued:2" in est.notes and "parts:3" in est.notes
+
+
+async def test_one_ask_does_not_price_a_part(store):
+    """A single Kleinanzeigen swap-priced ask must not become the GPU's market, nor a PC's exit."""
+    seed(store, "gpu:rtx-4070:12", "40000", n=1)
+    seed(store, "ram:ddr5:32:1x32", "400", n=4)
+    est = await partout.value(lst(), rules_extract(TITLE, "", "pl"), store, DAY)
+    assert est is not None and "thin_market:gpu:rtx-4070:12" in est.notes
+    assert "unvalued:gpu:rtx-4070:12" in est.notes and "part:gpu:rtx-4070:12" not in est.notes
+    assert est.median_pln == Decimal("352.00")  # 400 * 0.88, no extra leg (one valued part)
 
 
 async def test_none_without_comps_or_for_other_categories(store):
