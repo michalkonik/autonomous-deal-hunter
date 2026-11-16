@@ -103,10 +103,10 @@ async def check(listing: Listing, fetcher, store, *, now: datetime | None = None
     return [FLAG] if _reused(store, lid, seller, have, since) else []
 
 
-def purge(store, now: datetime | None = None) -> int:
-    """Delete hashes older than 90 days; returns the number of rows removed."""
+def purge(store, now: datetime | None = None, days: int = WINDOW_DAYS) -> int:
+    """Delete hashes older than `days` (default 90; sources.retention.photos_days); returns the rows removed."""
     ensure_schema(store)
-    cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=WINDOW_DAYS)).isoformat()
+    cutoff = ((now or datetime.now(timezone.utc)) - timedelta(days=days)).isoformat()
     n = store.conn.execute("delete from photo_hashes where seen_at < ?", (cutoff,)).rowcount
     store.conn.commit()
     return n

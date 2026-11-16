@@ -15,21 +15,26 @@ Guards (`dh start` and a foreground `dh round` refuse and say why, they never ev
 the models: `GET /unload` (POST answers 405 on this llama-swap build) ONLY when `/running` shows nothing but role
 models AND none of them was already loaded before `dh start` (recorded in var/run/state.json): `/unload` unloads
 everything, so a model somebody else was using is never touched. Finally it checks that nothing is left
-(`systemctl --user is-active` and `pgrep -f "dh.runtime serve"`).
+(`systemctl --user is-active` and `pgrep -af -- "-m dh.runtime serve"`, minus this process and its ancestors).
 
 `serve` = rounds loop (pacing `scheduler.round_interval_s`, start to start) + the web page (uvicorn on web.host:port,
 default 0.0.0.0:8711) + the log publisher loop, in one asyncio process. Startup recovery closes windows a crash left
 open. SIGTERM/SIGINT: the current round is cancelled, the web server and publisher stop, windows are closed, exit 0.
-A changed frozen file stops the rounds (health event `frozen_changed`), as dh/config.py requires.
+A changed frozen file PAUSES the rounds, as dh/config.py requires: health event `frozen_changed`, var/run/paused.json
+(`dh status` prints "PAUSED: frozen file changed (<path>)") and ONE ntfy push (default priority) to the owner. The
+web page and the publisher keep running. The rounds resume when the frozen files are back as they were at start
+(health event `frozen_restored`); to accept a deliberate change, `dh stop` and `dh start`.
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import os
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -39,32 +44,139 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import config as dhconfig
-from . import ledger, notify, publish, scheduler
+from . import books, ledger, notify, publish, scheduler
 from .bandit import Bandit
 from .config import FrozenChanged
 from .store import Store
 
 log = logging.getLogger("dh.runtime")
 
-UNIT = "deal-hunter"
-SERVE_PATTERN = "-m dh.runtime serve"
+UNIT = "deal-hunter"  # the default unit name; `unit_name()` lets a second checkout on the same host use its own
+WEB_SUFFIX = "-web"  # the page server's unit is <unit>-web: it keeps serving the page after `dh stop`
+SERVE_PATTERN = "-m dh.runtime serve$"  # pgrep regex: NOT the page server ("serve-web", its own unit)
 ROOT = Path(__file__).resolve().parents[1]
+_UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,99}$")
 
 
 def root_dir() -> Path:
     return Path(os.environ.get("DH_ROOT") or ROOT)
 
 
+def unit_name(root: Path | None = None) -> str:
+    """The systemd user unit this checkout runs as: $DH_UNIT_NAME, else config `runtime.unit_name`
+    (config/runtime.yaml, or config/local/runtime.yaml), else "deal-hunter". A second checkout on the same host (a
+    development clone) sets its own name, so its `dh round`, `dh start`, `dh stop` and `dh status` never take the
+    owner's unit for their own. The lock, pid and state files are under each checkout's own var/run already.
+    ValueError for a name systemd would not accept."""
+    name = os.environ.get("DH_UNIT_NAME")
+    if not name:
+        try:
+            rt = dhconfig.load(Path(root or root_dir())).get("runtime")
+            name = (rt.to_dict() if rt is not None else {}).get("unit_name")
+        except Exception:  # noqa: BLE001 - an unreadable config is reported by whatever loads it next
+            name = None
+    name = str(name or UNIT).strip()
+    name = name[: -len(".service")] if name.endswith(".service") else name
+    if not _UNIT_RE.match(name):
+        raise ValueError(f"invalid unit name {name!r} (DH_UNIT_NAME or runtime.unit_name): letters, digits and "
+                         "_ . : @ - only")
+    return name
+
+
 def db_path(root: Path) -> Path:
     return Path(root) / "var" / "dh.db"
+
+
+def web_unit_name() -> str:
+    """The transient page-server unit of this checkout: `<unit>-web` (tests: deal-hunter-test-web)."""
+    return unit_name() + WEB_SUFFIX
 
 
 def state_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "state.json"
 
 
+def paused_path(root: Path) -> Path:
+    """Written while the rounds are paused because a frozen file changed (read by `dh status`)."""
+    return Path(root) / "var" / "run" / "paused.json"
+
+
+def frozen_changes(cfg, frozen: dict) -> list[str]:
+    return dhconfig.frozen_changes(cfg, frozen)
+
+
+PAUSE_CHECK_MAX_S = 60.0
+
+
 def round_pid_path(root: Path) -> Path:
     return Path(root) / "var" / "run" / "round.pid"
+
+
+def agent_lock_path(root: Path) -> Path:
+    return Path(root) / "var" / "run" / "agent.lock"
+
+
+AGENT_LOCK_WAIT_S = 30.0  # serve waits this long for a lock held by another agent (serve, `dh round`)
+AGENT_LOCK_CLI_WAIT_S = 3600.0  # ... and up to this long while an owner CLI command holds it (it always ends)
+AGENT_LOCK_STEP_S = 1.0
+
+
+class AgentLock:
+    """THE single-writer lock of the agent (flock on var/run/agent.lock): held for its whole life by `serve` and by a
+    foreground `dh round`, and briefly by the CLI when it applies queued owner commands with no agent running
+    (`improve.apply_queued_now`). Only the holder mutates the improvement loop's state. The kernel drops the lock
+    when the process dies, so a crash never leaves it stale."""
+
+    def __init__(self, root: Path, role: str = "agent"):
+        self.path = agent_lock_path(root)
+        self.role = role  # "agent" (serve, `dh round`) or "cli" (an owner command): written next to the pid
+        self.fd: int | None = None
+
+    def acquire(self) -> bool:
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()} {self.role}".encode())
+        self.fd = fd
+        return True
+
+    def release(self) -> None:
+        if self.fd is not None:
+            import fcntl
+            with contextlib.suppress(OSError):
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+            self.fd = None
+
+    def __enter__(self) -> bool:
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def lock_holder(root: Path) -> tuple[int | None, str | None]:
+    """(pid, role) written by the current holder of the agent lock; (None, None) when unreadable."""
+    try:
+        parts = agent_lock_path(root).read_text().split()
+        return int(parts[0]), (parts[1] if len(parts) > 1 else None)
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
+def agent_lock_held(root: Path) -> bool:
+    """True when another process holds the agent lock (a probe: acquired and released at once)."""
+    lock = AgentLock(root)
+    if lock.acquire():
+        lock.release()
+        return False
+    return True
 
 
 def round_running(root: Path) -> int | None:
@@ -152,19 +264,76 @@ def _sys(run, *cmd: str, timeout: float = 60) -> subprocess.CompletedProcess:
 
 
 def is_active(run=subprocess.run) -> bool:
+    """This checkout's unit (`unit_name()`) is active."""
     try:
-        return _sys(run, "systemctl", "--user", "is-active", UNIT).stdout.strip() in ("active", "activating", "reloading")
+        return _sys(run, "systemctl", "--user", "is-active", unit_name()).stdout.strip() in ("active", "activating",
+                                                                                           "reloading")
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-def serve_processes(run=subprocess.run) -> list[str]:
+def _ppid(pid: int, run=subprocess.run) -> int | None:
+    """Parent pid from /proc (Linux), else from `ps`; None when unknown."""
     try:
-        r = _sys(run, "pgrep", "-af", SERVE_PATTERN)
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])  # the command name may contain spaces and parentheses
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        r = run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        return int(r.stdout.strip()) if r.stdout.strip() else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def own_lineage(pid: int | None = None) -> set[int]:
+    """This process and all its ancestors: a shell or wrapper whose command line happens to contain the serve
+    pattern (`bash -c '... -m dh.runtime serve'`) is the caller, not an agent."""
+    out: set[int] = set()
+    p: int | None = pid or os.getpid()
+    while p and p not in out and len(out) < 128:
+        out.add(p)
+        p = _ppid(p)
+    return out
+
+
+def _proc_root(pid: int) -> Path | None:
+    """The project root a serve process runs for: its DH_ROOT (set by `dh start`), else its working directory.
+    None when it cannot be read (another OS, another user, the process is gone)."""
+    try:
+        env = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+        for kv in env:
+            if kv.startswith(b"DH_ROOT="):
+                return Path(kv[len(b"DH_ROOT="):].decode(errors="replace")).resolve()
+        return Path(os.readlink(f"/proc/{pid}/cwd")).resolve()
+    except (OSError, ValueError):
+        return None
+
+
+def serve_processes(run=subprocess.run) -> list[str]:
+    """`pid cmdline` of every `python -m dh.runtime serve` process of THIS checkout (`root_dir()`), except this one
+    and its ancestors. A serve whose root can be read and is another checkout's (the owner's agent seen from a
+    development clone) is not ours; one whose root cannot be read is counted (belt and braces). The pattern
+    goes after `--`: it starts with "-m", which pgrep would otherwise parse as options (exit 2, nothing found)."""
+    try:
+        r = _sys(run, "pgrep", "-af", "--", SERVE_PATTERN)
     except (OSError, subprocess.SubprocessError):
         return []
-    me = str(os.getpid())
-    return [ln for ln in r.stdout.splitlines() if ln.strip() and ln.split()[0] != me]
+    if r.returncode not in (0, 1):
+        log.warning("pgrep failed (%s): %s", r.returncode, (r.stderr or "").strip()[:200])
+        return []
+    mine = own_lineage()
+    here = Path(root_dir()).resolve()
+    out = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split(None, 1)
+        if not parts or not parts[0].isdigit() or int(parts[0]) in mine:
+            continue
+        theirs = _proc_root(int(parts[0]))
+        if theirs is not None and theirs != here:
+            continue
+        out.append(ln.strip())
+    return out
 
 
 def release_models(cfg, before: list[str] | None, *, http_get=default_http_get, out=sys.stdout) -> bool:
@@ -224,13 +393,18 @@ async def warm_models(cfg, *, timeout_s: float = 300.0, post=None) -> dict[str, 
 def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, meminfo: str | Path = "/proc/meminfo",
           out=sys.stdout, python: str | None = None, wait_s: float = 3.0) -> int:
     root = Path(root)
+    unit = unit_name()
     if is_active(run):
-        print(f"deal-hunter is already running (systemctl --user status {UNIT})", file=out)
+        print(f"deal-hunter is already running (systemctl --user status {unit})", file=out)
         return 0
     rp = round_running(root)
     if rp is not None:
         print(f"dh start refused: a foreground `dh round` is running (pid {rp}); let it finish or stop it first",
               file=out)
+        return 1
+    if agent_lock_held(root):
+        print(f"dh start refused: another process holds the agent lock ({agent_lock_path(root)}): a foreground "
+              "`dh round`, a serve outside the unit, or an owner command being applied; retry when it ends", file=out)
         return 1
     reasons, running, warnings = preflight(cfg, http_get=http_get, meminfo=meminfo)
     for w in warnings:
@@ -243,9 +417,10 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     state_path(root).parent.mkdir(parents=True, exist_ok=True)
     state_path(root).write_text(json.dumps({"started_at": _now().isoformat(), "models_before": running or []}))
     with contextlib.suppress(OSError, subprocess.SubprocessError):
-        _sys(run, "systemctl", "--user", "reset-failed", UNIT)
-    cmd = ["systemd-run", "--user", f"--unit={UNIT}", "--collect", "--property=KillMode=control-group",
-           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", "--setenv=PYTHONUNBUFFERED=1",
+        _sys(run, "systemctl", "--user", "reset-failed", unit)
+    cmd = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--property=KillMode=control-group",
+           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", f"--setenv=DH_UNIT_NAME={unit}",
+           "--setenv=PYTHONUNBUFFERED=1",
            python or sys.executable, "-m", "dh.runtime", "serve"]
     r = _sys(run, *cmd)
     if r.returncode != 0:
@@ -254,23 +429,84 @@ def start(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, mem
     if wait_s:
         time.sleep(wait_s)
     if not is_active(run):
-        print(f"deal-hunter did not stay up: see journalctl --user -u {UNIT}", file=out)
+        print(f"deal-hunter did not stay up: see journalctl --user -u {unit}", file=out)
         return 1
     web = cfg.get("web")
     port = (web.to_dict() if web is not None else {}).get("port", 8711)
-    print(f"deal-hunter started (unit {UNIT}); web page on port {port}; stop with `dh stop`", file=out)
+    if start_page(cfg, root, run=run, out=out, python=python) != 0:
+        print(f"warning: the hunter is up but the page server did not start; retry with `dh page start`", file=out)
+    print(f"deal-hunter started (unit {unit}); web page on port {port}; stop with `dh stop`", file=out)
     return 0
+
+
+def web_is_active(run=subprocess.run) -> bool:
+    """The page server unit of this checkout (`<unit>-web`) is active."""
+    try:
+        return _sys(run, "systemctl", "--user", "is-active", web_unit_name()).stdout.strip() in (
+            "active", "activating", "reloading")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def start_page(cfg, root: Path, *, run=subprocess.run, out=sys.stdout, python: str | None = None,
+               wait_s: float = 0.0) -> int:
+    """(Re)start the standalone page server: a transient unit `<unit>-web` running `-m dh.runtime serve-web`.
+    It serves the same database without the agent, holds no agent lock and never touches the hunter unit;
+    `dh start` runs it next to the hunter, `dh page start` runs it alone (browse with the hunter stopped).
+    Only the mark forms write. Stopped by `dh page stop`, `dh stop` or the "stop the page" button."""
+    root = Path(root)
+    unit = web_unit_name()
+    web = cfg.get("web")
+    port = (web.to_dict() if web is not None else {}).get("port", 8711)
+    if web_is_active(run):
+        print(f"page server already running (unit {unit}, port {port})", file=out)
+        return 0
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        _sys(run, "systemctl", "--user", "reset-failed", unit)
+    cmd = ["systemd-run", "--user", f"--unit={unit}", "--collect", "--property=KillMode=control-group",
+           f"--working-directory={root}", f"--setenv=DH_ROOT={root}", f"--setenv=DH_UNIT_NAME={unit}",
+           f"--setenv=DH_HUNTER_UNIT={unit_name()}", "--setenv=PYTHONUNBUFFERED=1",
+           python or sys.executable, "-m", "dh.runtime", "serve-web"]
+    r = _sys(run, *cmd)
+    if r.returncode != 0:
+        print(f"systemd-run failed ({r.returncode}): {r.stderr.strip()}", file=out)
+        return 1
+    if wait_s:
+        time.sleep(wait_s)
+    if not web_is_active(run):
+        print(f"the page server did not stay up: see journalctl --user -u {unit}", file=out)
+        return 1
+    print(f"page server started (unit {unit}, port {port}); stop with `dh page stop` or the page's button",
+          file=out)
+    return 0
+
+
+def stop_page(*, run=subprocess.run, out=sys.stdout) -> int:
+    """Stop the page server unit only; the hunter unit is never touched."""
+    unit = web_unit_name()
+    was = web_is_active(run)
+    try:
+        r = _sys(run, "systemctl", "--user", "stop", unit, timeout=60)
+        print(f"systemctl --user stop {unit}: " + ("stopped" if was else "was not running")
+              + (f" ({r.stderr.strip()})" if r.returncode and r.stderr.strip() else ""), file=out)
+        return 0 if not web_is_active(run) else 1
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"systemctl stop {unit} failed: {e}", file=out)
+        return 1
 
 
 def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=sys.stdout) -> int:
     root = Path(root)
+    unit = unit_name()
     was = is_active(run)
+    stop_page(run=run, out=out)  # the page server is the agent's too: a full stop stops it (never touches models)
     try:
-        r = _sys(run, "systemctl", "--user", "stop", UNIT, timeout=150)
-        print(f"systemctl --user stop {UNIT}: " + ("stopped" if was else "was not running")
+        r = _sys(run, "systemctl", "--user", "stop", unit, timeout=150)
+        print(f"systemctl --user stop {unit}: " + ("stopped" if was else "was not running")
               + (f" ({r.stderr.strip()})" if r.returncode and r.stderr.strip() else ""), file=out)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"systemctl stop failed: {e}", file=out)
+    paused_path(root).unlink(missing_ok=True)  # a pause marker left by a crash
     if db_path(root).is_file():  # serve closes them on SIGTERM; this covers a crash
         st = Store(db_path(root))
         try:
@@ -293,7 +529,7 @@ def stop(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get, out=
 
 def _show(run) -> dict:
     try:
-        r = _sys(run, "systemctl", "--user", "show", UNIT, "-p", "ActiveState", "-p", "MainPID", "-p",
+        r = _sys(run, "systemctl", "--user", "show", unit_name(), "-p", "ActiveState", "-p", "MainPID", "-p",
                  "ActiveEnterTimestamp")
     except (OSError, subprocess.SubprocessError):
         return {}
@@ -304,9 +540,10 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
     root = Path(root)
     show = _show(run)
     active = is_active(run)
-    out: dict[str, Any] = {"running": active, "unit": UNIT, "state": show.get("ActiveState"),
+    out: dict[str, Any] = {"running": active, "unit": unit_name(), "state": show.get("ActiveState"),
                            "pid": int(show.get("MainPID") or 0) or None, "since": show.get("ActiveEnterTimestamp"),
                            "uptime_s": None, "processes": serve_processes(run)}
+    out["page"] = {"unit": web_unit_name(), "running": web_is_active(run)}
     try:
         stt = json.loads(state_path(root).read_text())
         out["started_at"] = stt.get("started_at")
@@ -314,6 +551,9 @@ def status(cfg, root: Path, *, run=subprocess.run, http_get=default_http_get) ->
             out["uptime_s"] = round((_now() - datetime.fromisoformat(stt["started_at"])).total_seconds())
     except (OSError, ValueError):
         out["started_at"] = None
+    out["paused"] = None
+    with contextlib.suppress(OSError, ValueError):
+        out["paused"] = json.loads(paused_path(root).read_text())
     out["llama_swap"] = {"url": swap_url(cfg), "running": llama_running(cfg, http_get), "roles": sorted(role_models(cfg))}
     out["ntfy_topic"] = notify.topic(root)
     if db_path(root).is_file():
@@ -387,6 +627,21 @@ def _log_repo(cfg) -> dict:
 # ------------------------------------------------------------------------------------------------ serve
 
 
+def _llm_ctx(ctx):
+    """The context for the improvement step: its LLM calls (reflection, advisor, an owner apply's live must-pass)
+    go through the same per-call foreign-model check as the round's (scheduler._CountingLLM), so a model another
+    workload loaded meanwhile is never swapped out by an advisor call. No llama-swap request unless a call is made."""
+    if getattr(ctx, "llm", None) is None or getattr(ctx, "llm_check", None) is None:
+        return ctx
+
+    def on_foreign(foreign: list[str]) -> None:
+        ctx.store.add_health("improve", "foreign_model", "improvement step without the LLM; llama-swap runs "
+                             + ", ".join(foreign))
+    out = copy.copy(ctx)
+    out.llm = scheduler._CountingLLM(ctx.llm, scheduler.RoundStats(), ctx.llm_check, on_foreign)
+    return out
+
+
 async def post_round(ctx, st, *, weekly: bool = True) -> None:
     """Hooks that run after every round (`serve` and `dh round`): the self-improvement step, then (serve only) the
     weekly report when 168 watched hours have passed. Neither can end the round loop: a failure becomes a health
@@ -395,7 +650,7 @@ async def post_round(ctx, st, *, weekly: bool = True) -> None:
     try:
         imp = ctx.cfg.get("improve")
         limit = float((imp.to_dict() if imp is not None else {}).get("post_round_timeout_s", 300))
-        await asyncio.wait_for(improve.after_round(ctx, st), limit if limit > 0 else None)
+        await asyncio.wait_for(improve.after_round(_llm_ctx(ctx), st), limit if limit > 0 else None)
     except asyncio.TimeoutError:
         log.error("improve.after_round exceeded %.0f s", limit)
         ctx.store.add_health("improve", "improve_timeout", f"after_round cut after {limit:.0f}s (improve.post_round_timeout_s)")
@@ -419,9 +674,10 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     """Everything a round needs, wired to the real modules (shared by `serve` and `dh round`)."""
     from .customs import Customs
     from .money import Fx
-    from .sources import registry
+    from .sources import ebay, registry
     from .sources.ebay_insights import EbayInsights
 
+    ebay.prefetch_secrets()  # the eBay keys, once per run and in parallel: never a blocking bw-secret inside a round
     root = Path(root)
     try:
         cards_dir = Path(str(cfg.publish.cards_dir))
@@ -430,12 +686,13 @@ def build_context(cfg, root: Path, store: Store, fetcher, *, dry: bool = False, 
     cards_dir = cards_dir if cards_dir.is_absolute() else root / cards_dir
     ctx = scheduler.RoundContext(
         cfg=cfg, root=root, store=store, fetcher=fetcher, adapters=registry(cfg, root), llm=None, fx=Fx(store),
-        customs=Customs(store), bandit=Bandit(store), rng=random.Random(), cards_root=cards_dir.parent,
+        customs=Customs(store), bandit=Bandit(store, **scheduler.bandit_kwargs(cfg)), rng=random.Random(), cards_root=cards_dir.parent,
         shots_root=root / "var" / "screenshots", dry=dry, stop=stop, frozen_digest=frozen,
         insights=EbayInsights(store=store))
     if not no_llm:
         from .llm import Client
-        ctx.llm = Client(cfg, on_usage=ctx.on_usage)
+        ctx.llm = Client(cfg, on_usage=ctx.on_usage, on_paid=ctx.on_paid,
+                         paid_spend=lambda: books.paid_month_usd(store))
 
         async def foreign_models() -> list[str]:
             running = await asyncio.to_thread(llama_running, cfg)
@@ -462,7 +719,9 @@ class _QuietServer:
 
 
 async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, install_signals: bool = True,
-                      web: bool = True) -> int:
+                      web: bool = False) -> int:
+    """The agent itself: rounds loop + publisher. `web` embeds the page in this process for a manual
+    `serve`; the normal path is `dh start`, which runs the page in its own unit (`serve-web`) instead."""
     from .fetch import Fetcher
 
     root = Path(root)
@@ -472,6 +731,24 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, stop.set)
     db_path(root).parent.mkdir(parents=True, exist_ok=True)
+    paused_path(root).unlink(missing_ok=True)  # a pause belongs to the run that saw the change
+    agent_lock = AgentLock(root)
+    t0 = time.monotonic()
+    deadline = t0 + AGENT_LOCK_WAIT_S
+    told = False
+    while not agent_lock.acquire():  # single writer: another serve, a foreground `dh round` or the CLI holds it
+        pid, role = lock_holder(root)
+        if role == "cli":  # an owner command (a queued apply may run a live must-pass for minutes): wait it out
+            deadline = max(deadline, t0 + AGENT_LOCK_CLI_WAIT_S)
+            if not told:
+                log.info("an owner command (pid %s) holds %s: waiting for it to finish", pid, agent_lock.path)
+                told = True
+        if time.monotonic() >= deadline or stop.is_set():
+            log.error("another process (pid %s, %s) holds %s (waited %.0f s); not serving", pid, role or "agent",
+                      agent_lock.path, time.monotonic() - t0)
+            return 1
+        with contextlib.suppress(asyncio.TimeoutError):  # the CLI applying a queued command holds it for a moment
+            await asyncio.wait_for(stop.wait(), AGENT_LOCK_STEP_S)
     frozen = dhconfig.frozen_digest(cfg._root) if getattr(cfg, "_root", None) else None
     store = Store(db_path(root))
     n = ledger.close_all_windows(store, _now())  # recovery: a crash may have left windows open
@@ -496,7 +773,39 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         server = _QuietServer(uvicorn.Config(create_app(db_path(root), cfg, root), host=str(w.get("host", "0.0.0.0")),
                                              port=int(w.get("port", 8711)), log_level="warning", lifespan="off"))
         tasks.append(asyncio.create_task(server.serve(), name="web"))
-    tasks.append(asyncio.create_task(publish.run_loop(store, cfg, root, stop), name="publish"))
+    # the publisher runs concurrently with the rounds: its OWN connection, so its commits can never end a
+    # transaction of the rounds' connection (an improvement step) half-way
+    pub_store = Store(db_path(root))
+    tasks.append(asyncio.create_task(publish.run_loop(pub_store, cfg, root, stop), name="publish"))
+
+    async def pause_for_frozen(e: FrozenChanged) -> None:
+        """Pause until the frozen files match the start digest again (or stop). One owner push per pause."""
+        paths = list(getattr(e, "paths", []) or []) or [str(e)]
+        store.add_health("runtime", "frozen_changed", str(e)[:500])
+        log.error("frozen layer changed, rounds PAUSED: %s", e)
+        paused_path(root).parent.mkdir(parents=True, exist_ok=True)
+        paused_path(root).write_text(json.dumps({"reason": "frozen file changed", "paths": paths,
+                                                 "since": _now().isoformat()}))
+        await notify.push_owner(cfg, root, "Deal Hunter PAUSED: frozen file changed",
+                                "The rounds are paused because a frozen file changed while the agent runs: "
+                                + ", ".join(paths) + ". Undo the change to resume, or `dh stop` and `dh start` to "
+                                "accept it.", store=store, priority="default")
+        check = min(PAUSE_CHECK_MAX_S, max(0.05, float(sc["round_interval_s"])))
+        while not stop.is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), check)
+            if stop.is_set():
+                return
+            try:
+                still = frozen_changes(cfg, frozen) if frozen is not None else []
+            except Exception as err:  # noqa: BLE001 - cannot tell: stay paused
+                log.warning("frozen check failed: %s", err)
+                continue
+            if not still:
+                paused_path(root).unlink(missing_ok=True)
+                store.add_health("runtime", "frozen_restored", "frozen files are back as at start: rounds resume")
+                log.info("frozen files restored, rounds resume")
+                return
 
     async def rounds() -> None:
         while not stop.is_set():
@@ -508,9 +817,8 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
             except asyncio.CancelledError:
                 raise
             except FrozenChanged as e:
-                store.add_health("runtime", "frozen_changed", str(e)[:500])
-                log.error("frozen layer changed, rounds stopped: %s", e)
-                return
+                await pause_for_frozen(e)
+                continue
             except Exception as e:  # noqa: BLE001 - a broken round is logged; the next one runs
                 log.exception("round failed")
                 store.add_health("runtime", "round_failed", f"{type(e).__name__}: {e}"[:500])
@@ -536,7 +844,10 @@ async def serve_async(cfg, root: Path, *, stop: asyncio.Event | None = None, ins
         if ctx.llm is not None:
             with contextlib.suppress(Exception):
                 await ctx.llm.aclose()
+        pub_store.close()
         store.close()
+        paused_path(root).unlink(missing_ok=True)
+        agent_lock.release()
     return 0
 
 
@@ -546,11 +857,48 @@ def serve(root: Path | None = None) -> int:
     return asyncio.run(serve_async(dhconfig.load(root), root))
 
 
+async def serve_web_async(cfg, root: Path, *, stop: asyncio.Event | None = None,
+                          install_signals: bool = True) -> int:
+    """The page alone (unit `<unit>-web`): uvicorn only — no rounds, no publisher, no agent lock. It opens its
+    own SQLite connections per request like any reader, and only the mark forms write. SIGTERM or the page's
+    "stop the page" button sets `stop`; the server exits gracefully."""
+    import uvicorn
+
+    from .web.app import create_app
+
+    root = Path(root)
+    stop = stop or asyncio.Event()
+    if install_signals:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+    db_path(root).parent.mkdir(parents=True, exist_ok=True)
+    w = cfg.get("web")
+    w = w.to_dict() if w is not None else {}
+    server = _QuietServer(uvicorn.Config(create_app(db_path(root), cfg, root, page_stop=stop.set),
+                                         host=str(w.get("host", "0.0.0.0")), port=int(w.get("port", 8711)),
+                                         log_level="warning", lifespan="off"))
+    task = asyncio.create_task(server.serve(), name="web")
+    await stop.wait()
+    server.should_exit = True
+    with contextlib.suppress(Exception):
+        await task
+    return 0
+
+
+def serve_web(root: Path | None = None) -> int:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = Path(root or root_dir())
+    return asyncio.run(serve_web_async(dhconfig.load(root), root))
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv[:1] == ["serve"]:
         return serve()
-    print("usage: python -m dh.runtime serve   (use `dh start` instead)", file=sys.stderr)
+    if argv[:1] == ["serve-web"]:
+        return serve_web()
+    print("usage: python -m dh.runtime serve|serve-web   (use `dh start` / `dh page` instead)", file=sys.stderr)
     return 2
 
 

@@ -30,22 +30,43 @@ Robustness:
   that is an older version is rewritten. A file that is no known version is a human edit: stored as a new baseline
   ("owner edit"), any change in flight is aborted, and the rounds go on.
 - Owner commands (rollback, maintenance, label, apply) are queued in `improve_commands`; `on_round` applies them
-  at its start and again right before saving. `_save` is a compare-and-swap on `improve_state.rev`; on a conflict
-  the round reloads, re-applies the queue and saves once more.
+  at its start and again after its own decision. SINGLE WRITER: only the agent-lock holder runs a step. One step =
+  one transaction, checked by `_attempt` before its commit; the `rev` compare-and-swap is an assertion. A step whose
+  transaction was ended under it (another coroutine committing on the same connection) or whose state was saved by
+  someone else is rolled back and reported (health event); its events are not returned.
+- No real I/O is awaited inside an open transaction: the reflection and advisor calls run before their step's first
+  write, an owner apply's LIVE must-pass before its step starts (`_prepare_live`); an apply whose live check does
+  not match the current champion, or that has no model, stays queued and is skipped: safety commands (rollback,
+  maintenance, label) never wait behind it.
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
+import logging
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from .. import config as dhconfig
+from .. import ledger
+from ..llm import LLMUnavailable
 from . import gates, monitor, probation, reflect, replay, shadow
 from .cusum import PoissonCusum, make
+from .playbook import migrate as pb_migrate
 from .playbook import (ROOT, Delta, Playbook, PlaybookError, active_version, ensure_baseline, prompt_sha, set_status,
                        version_sha)
+
+log = logging.getLogger(__name__)
+
+
+def _flat(s: str) -> str:
+    """Lowercased letters and digits only, so an adapter name and the host its fetcher records can be compared
+    ("allegro_lokalnie" vs "allegrolokalnie.pl"): punctuation is the only thing that separates most pairs."""
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
 
 STATE_SQL = "create table if not exists improve_state (key text primary key, value text not null)"
 COMMANDS_SQL = """create table if not exists improve_commands (
@@ -55,6 +76,9 @@ COMMANDS = ("rollback", "maintenance", "label", "apply")
 PHASES = ("idle", "shadow", "probation", "maintenance")
 PROPOSAL_COLUMNS = ("version_id integer", "stage text", "decided_at text", "detail text")
 BASE_COOLDOWN = gates.COOLDOWN_WATCHED_HOURS[0]
+NO_LIVE_MODEL = "apply waits for the running agent: its live must-pass needs the model"
+APPLY_EXPIRY_DAYS = 7  # improve.apply_expiry_days: a queued owner apply older than this is dropped, never applied
+STALE_LIVE = "apply waits for the next step: its live must-pass checked another champion"
 
 
 class InFlight(RuntimeError):
@@ -62,7 +86,19 @@ class InFlight(RuntimeError):
 
 
 class StateConflict(RuntimeError):
-    """Another writer saved the controller state since this one loaded it."""
+    """Another writer saved the controller state since this one loaded it (impossible under the agent lock)."""
+
+
+class StepAborted(RuntimeError):
+    """A step was rolled back because of a state conflict; nothing of it was applied."""
+
+
+class StepInterrupted(RuntimeError):
+    """The step's transaction was ended under it (a commit or rollback by someone else on the connection)."""
+
+
+class _Deferred(Exception):
+    """An owner command that cannot run in this step (an apply without its live check): it stays queued."""
 
 
 def _default() -> dict:
@@ -98,6 +134,33 @@ def enqueue(store, cmd: str, **args) -> int:
     return cur.lastrowid
 
 
+def pending_applies(store) -> list[dict]:
+    """Owner `apply` commands still queued: [{"command": id, "proposal": proposal_id, "queued_at": iso}]. Read only
+    (no schema change: it runs inside a step's transaction)."""
+    out = []
+    try:
+        rows = store.conn.execute("select id, args, created_at from improve_commands where applied_at is null "
+                                  "and cmd='apply' order by id").fetchall()
+    except sqlite3.OperationalError:  # no command was ever queued
+        return out
+    for r in rows:
+        with contextlib.suppress(ValueError, TypeError, KeyError):
+            out.append({"command": r["id"], "proposal": int(json.loads(r["args"] or "{}")["proposal_id"]),
+                        "queued_at": r["created_at"]})
+    return out
+
+
+def rollback_warning(pending: list[dict], version) -> str | None:
+    """The owner's rollback reply names the applies still queued: each re-makes its change on top of the rolled
+    back version when the agent applies it (after its live must-pass), so the rollback alone does not undo them."""
+    if not pending:
+        return None
+    what = ", ".join(f"command {p['command']} (proposal {p['proposal']})" for p in pending)
+    return (f"warning: {len(pending)} owner apply still queued: {what}. It will be re-applied on top of v{version} "
+            "at the agent's next round (after its live must-pass). Expect it, or let it expire "
+            "(improve.apply_expiry_days).")
+
+
 def command_result(store, cid: int) -> dict | None:
     store.ensure_table(COMMANDS_SQL)
     r = store.conn.execute("select applied_at, result from improve_commands where id=?", (cid,)).fetchone()
@@ -118,13 +181,19 @@ class Controller:
         monitor.migrate(store)
         reflect.migrate(store)
         shadow.migrate(store)
-        store.ensure_table(replay.EPOCHS_SQL)
+        replay.migrate(store)
+        pb_migrate(store)
+        ledger.migrate(store)  # every schema check runs here, never inside a step's transaction
         have = {r["name"] for r in store.conn.execute("pragma table_info(proposals)")}
         for col in PROPOSAL_COLUMNS:
             if col.split()[0] not in have:
                 store.ensure_table(f"alter table proposals add column {col}")
         self.rev = 0
         self._new: list[dict] = []
+        self._live: dict[int, tuple[str, dict]] = {}
+        self._deferred: set[str] = set()
+        self._applied = 0
+        self._c0 = 0
         self._sentinel_version = sentinel_version
         self.s = self._load()  # READ-ONLY construction: `dh status` never writes; on_round / commands write
 
@@ -132,7 +201,7 @@ class Controller:
         """First real use: the file becomes baseline v1 and the state starts (saved by the next _commit)."""
         if self.s["champion"] is not None:
             return
-        self.s["champion"] = ensure_baseline(self.store, self.root)
+        self.s["champion"] = ensure_baseline(self.store, self.root, commit=False)
         self.s["sentinel_version"] = self._sentinel_version or self.s["champion"]
         self.s["last_review_wh"] = wh
         # history from before the loop existed (older than a day) never counts towards a first alarm
@@ -162,44 +231,107 @@ class Controller:
             self.rev += 1
 
     def _commit(self) -> None:
-        """THE commit point: the state (CAS) and every pending row of this step (version statuses, proposals,
-        applied-command marks, health events) in ONE commit, then playbook/items.yaml. On a CAS conflict the newer
-        stored state is reloaded inside the same transaction and this step's changes (the fields it changed, its
-        events) are re-applied on top: nothing applied is dropped."""
+        """THE commit point of a step: the state (CAS on `rev`, an assertion: only the agent-lock holder writes) and
+        every row of the step (version statuses, proposals, labels, command marks, health events) in ONE commit,
+        then playbook/items.yaml. A conflict means a second writer, i.e. a bug: the whole step is rolled back (no
+        partial effect), a health event `improve_state_conflict` is recorded, the state is reloaded and the step
+        raises StepAborted (the next round goes on from the stored state)."""
         try:
             self._save_cas()
         except StateConflict:
-            mine = {k: v for k, v in self.s.items() if k != "events" and self._snap.get(k) != v}
-            theirs = self._load()
-            theirs.update(mine)
-            theirs["events"] = theirs["events"] + [e for e in self._new if e not in theirs["events"]]
-            self.s = theirs
-            self._event(self.clock(), "state_conflict", note="another writer saved first; merged this step on top")
-            self._save_cas()
+            self.store.conn.rollback()
+            self.store.conn.execute("insert into health (source, kind, detail) values (?,?,?)",
+                                    ("improve", "improve_state_conflict",
+                                     "the controller state changed under the agent-lock holder; step rolled back"))
+            self.store.conn.commit()
+            self.s = self._load()
+            raise StepAborted("improve_state_conflict") from None
         self.store.conn.commit()
         self._snap = copy.deepcopy(self.s)
         if self.s.get("file_pending"):
             self._sync_file()
-            # the write is done: from now on a different file can only be a human edit or a hand revert
+            # the write is done (or deliberately skipped): a different file is from now on a human edit
             self.s["file_pending"] = None
-            self._save_cas()
-            self.store.conn.commit()
-            self._snap = copy.deepcopy(self.s)
+            try:
+                self._save_cas()
+                self.store.conn.commit()
+                self._snap = copy.deepcopy(self.s)
+            except StateConflict:  # assertion only: leave file_pending stored, _reconcile repairs it
+                self.store.conn.rollback()
+                self.s = self._load()
 
     def _sync_file(self) -> None:
-        """Bring playbook/items.yaml in line with the champion after a commit that changed it."""
+        """Write playbook/items.yaml for the new champion ONLY over our own content: the file must still be the old
+        version (or already the new one, or marked invalid by _reconcile). Anything else is the owner's edit made
+        meanwhile: it is left alone and the next _reconcile records it as an owner edit."""
         fp = self.s.get("file_pending") or {}
         try:
             on_disk = Playbook.from_file(self.root).sha()
         except PlaybookError:
             on_disk = None
-        if on_disk != fp.get("to"):
+        if on_disk == fp.get("to"):
+            return
+        if fp.get("force") or on_disk == fp.get("from"):
             self.champion().activate(self.root)
 
+    def _io_done(self) -> None:
+        """Called by a step right after its model call, before its first write: whatever ran on the connection while
+        it awaited (nothing of the step was pending) is not the step's own writes."""
+        if not self.store.conn.in_transaction:
+            self._c0 = self.store.conn.total_changes
+
+    def _sp(self, sql: str) -> None:
+        """A savepoint statement of the step; failing means the step's transaction is gone."""
+        try:
+            self.store.conn.execute(sql)
+        except sqlite3.OperationalError as e:
+            raise StepInterrupted(f"{sql}: {e}") from None
+
+    async def _attempt(self, coro) -> bool:
+        """Run one step: its writes and the state commit together or not at all. Before the COMMIT, a step that
+        wrote rows must still have its transaction open (nobody committed or rolled back on the connection in
+        between; a command's savepoint vanishing is the same signal); otherwise the step is rolled back and reported
+        (`improve_step_interrupted`). Events of a step that did not commit are not returned by `on_round`.
+        The transaction is opened by the step's first write (never at its start: a read snapshot held across the
+        step would make the first write fail as soon as another process committed meanwhile)."""
+        conn = self.store.conn
+        n0 = len(self._new)
+        self._c0 = conn.total_changes
+        try:
+            await coro
+            if conn.total_changes != self._c0 and not conn.in_transaction:
+                raise StepInterrupted("the step wrote rows but its transaction was no longer open before the commit")
+            self._commit()
+            return True
+        except StepAborted:
+            del self._new[n0:]
+            return False
+        except StepInterrupted as e:
+            log.error("improvement step interrupted: %s", e)
+            conn.rollback()
+            conn.execute("insert into health (source, kind, detail) values (?,?,?)",
+                         ("improve", "improve_step_interrupted",
+                          f"the step's transaction was ended under it ({e}); step rolled back"[:500]))
+            conn.commit()
+            self.s = self._load()
+            del self._new[n0:]
+            return False
+        except BaseException:
+            conn.rollback()
+            self.s = self._load()
+            del self._new[n0:]
+            raise
+
     def _champion_changed(self, old: int | None, new: int) -> None:
-        """Record the file write this commit owes (a crash before it is repaired, not mistaken for an edit)."""
-        self.s["file_pending"] = {"from": version_sha(self.store, old) if old else None,
-                                  "to": version_sha(self.store, new)}
+        """Record the file write this commit owes (a crash before it is repaired, not mistaken for an edit). When a
+        write is already owed (several champion changes in one step, or a crash being recovered), the file on disk
+        is still that write's ORIGINAL content: keep its `from` (and `force`), only the target moves."""
+        to = version_sha(self.store, new)
+        fp = self.s.get("file_pending")
+        if fp:
+            self.s["file_pending"] = {**fp, "to": to}
+        else:
+            self.s["file_pending"] = {"from": version_sha(self.store, old) if old else None, "to": to}
         self.s["champion"] = new
 
     def _event(self, wh: float, what: str, **kw) -> dict:
@@ -276,7 +408,7 @@ class Controller:
         """Make state, versions and the file agree (start of every round and of every owner command)."""
         active = active_version(self.store)
         if active is None:
-            active = ensure_baseline(self.store, self.root)
+            active = ensure_baseline(self.store, self.root, commit=False)
         # 1. a change in flight must still be the one that is live (probation) or waiting (shadow)
         if self.phase == "probation" and (self.s["champion"] != active
                                           or self._version_status(self.s["champion"]) != "promoted"):
@@ -305,6 +437,7 @@ class Controller:
         except PlaybookError as e:
             self._health("playbook_file_invalid", str(e))
             self._champion_changed(self.s["champion"], self.s["champion"])
+            self.s["file_pending"]["force"] = True
             self._event(wh, "file_restored", version=active)
             return
         have, want = file_pb.sha(), version_sha(self.store, self.s["champion"])
@@ -325,6 +458,7 @@ class Controller:
         if errs:
             self._health("owner_edit_invalid", "; ".join(errs[:5]))
             self._champion_changed(self.s["champion"], self.s["champion"])  # the file is restored after the commit
+            self.s["file_pending"]["force"] = True
             self._event(wh, "owner_edit_rejected", errors=errs[:5])
             return
         known = self.store.conn.execute("select id from playbook_versions where sha=? order by id desc limit 1",
@@ -349,80 +483,196 @@ class Controller:
 
     # ------------------------------------------------------------ owner commands
     async def apply_commands(self, wh: float) -> int:
+        """Apply the queued owner commands inside the current step (`_attempt`): each command's effects and its
+        applied mark go into the step's one transaction (a failing command is undone alone, via a savepoint, and
+        marked failed). A command that cannot run now (an apply without its live check) stays queued and is skipped;
+        every other command still applies, in queue order (safety commands never wait behind an apply). Returns the
+        number applied."""
+        self._deferred: set[str] = set()
         rows = self.store.conn.execute("select * from improve_commands where applied_at is null order by id").fetchall()
+        done = 0
         for r in rows:
             args = json.loads(r["args"] or "{}")
+            if r["cmd"] == "apply" and self._expired(r["created_at"]):
+                if not self.store.conn.in_transaction:
+                    self.store.conn.execute("begin")
+                self.store.conn.execute("update improve_commands set applied_at=?, result=? where id=?", (
+                    _now(), json.dumps({"ok": False, "expired": True, "error": (
+                        f"expired: queued at {r['created_at']}, more than {self._expiry_days():g} days ago, and never "
+                        "applied; the proposal still waits for review: `dh playbook --apply "
+                        f"{args.get('proposal_id')}` again to apply it")}), r["id"]))
+                done += 1
+                continue
+            before, n_ev = copy.deepcopy(self.s), len(self._new)
+            if not self.store.conn.in_transaction:  # an outermost savepoint's RELEASE would COMMIT the step early
+                self.store.conn.execute("begin")
+            self._sp("savepoint improve_cmd")
             try:
-                result = await self._command(r["cmd"], args, wh)
+                result = await self._command(r["cmd"], args, wh, cid=r["id"])
+            except StepInterrupted:
+                raise
+            except _Deferred as e:
+                self._sp("rollback to savepoint improve_cmd")
+                self._sp("release savepoint improve_cmd")
+                self.s = before
+                del self._new[n_ev:]
+                self._deferred.add(str(e))
+                continue
             except Exception as e:  # noqa: BLE001 - a bad command is reported, never retried forever
+                self._sp("rollback to savepoint improve_cmd")
+                self._sp("release savepoint improve_cmd")
+                self.s = before
+                del self._new[n_ev:]
                 result = {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]}
+            else:
+                self._sp("release savepoint improve_cmd")
             self.store.conn.execute("update improve_commands set applied_at=?, result=? where id=?",
                                     (_now(), json.dumps(result, default=str), r["id"]))
-        return len(rows)  # the marks are committed by the caller's _commit, together with the effects
+            done += 1
+        return done
 
-    async def _command(self, cmd: str, args: dict, wh: float) -> dict:
+    def _expiry_days(self) -> float:
+        imp = self.cfg.get("improve") if self.cfg is not None else None
+        return float((imp.to_dict() if imp is not None else {}).get("apply_expiry_days", APPLY_EXPIRY_DAYS))
+
+    def _expired(self, created_at: str | None) -> bool:
+        """A queued owner apply older than improve.apply_expiry_days (wall clock: the owner's intent ages even
+        while the agent is stopped)."""
+        try:
+            at = datetime.fromisoformat(str(created_at))
+        except (TypeError, ValueError):
+            return False
+        at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - at).total_seconds() > self._expiry_days() * 86400
+
+    async def _prepare_live(self) -> None:
+        """The LIVE must-pass of every queued owner apply, run BEFORE the step opens its transaction: no model call
+        is ever awaited inside a step. Kept per command with the sha of the challenger it checked; `_apply_owner`
+        uses it only for that exact challenger (otherwise the apply waits for the next step)."""
+        self._live = {}
+        if self.llm is None:
+            return
+        rows = self.store.conn.execute("select id, args, created_at from improve_commands where applied_at is null "
+                                       "and cmd='apply' order by id").fetchall()
+        for r in rows:
+            if self._expired(r["created_at"]):  # dropped by the step: never spend a live must-pass on it
+                continue
+            try:
+                built = self._owner_challenger(int(json.loads(r["args"] or "{}")["proposal_id"]))
+            except Exception:  # noqa: BLE001 - a bad command is reported by the step itself
+                continue
+            if built is None:
+                continue
+            delta, challenger = built
+            try:
+                live = await gates.must_pass_live(challenger, self.llm, delta.item.id, cfg=self.cfg)
+            except Exception as e:  # noqa: BLE001 - an unreachable model never approves anything
+                live = {"ok": False, "failed": [], "why": [f"live must-pass raised {type(e).__name__}: {e}"[:300]],
+                        "calls": 0, "unavailable": 1, "reached_changed_prompt": 0}
+            self._live[r["id"]] = (challenger.sha(), live)
+
+    def _owner_challenger(self, pid: int) -> tuple[Delta, Playbook] | None:
+        """The challenger an owner apply would promote: the proposal's delta re-made on the current champion
+        (read only). None when the proposal does not wait for owner review; PlaybookError when it no longer applies."""
+        r = self.store.conn.execute("select status, payload from proposals where id=?", (pid,)).fetchone()
+        if r is None or r["status"] != "owner_review":
+            return None
+        delta = Delta.from_dict(json.loads(r["payload"])["delta"])
+        champ = self.champion()
+        return delta, champ.apply(champ.make_delta(delta.op, delta.item, hypothesis=delta.hypothesis,
+                                                   evidence=delta.evidence, predicted_effect=delta.predicted_effect))
+
+    async def _command(self, cmd: str, args: dict, wh: float, cid: int | None = None) -> dict:
         if cmd == "rollback":
             return self._force_rollback(int(args["version"]), wh)
         if cmd == "maintenance":
             self._set_maintenance(bool(args["on"]), wh, args.get("reason", "owner"))
             return {"ok": True, "phase": self.phase, "maintenance": self.s["maintenance"]}
         if cmd == "label":
-            w = shadow.label(self.store, int(args["id"]), str(args["truth"]), source="owner")
+            w = shadow.label(self.store, int(args["id"]), str(args["truth"]), source="owner", commit=False)
             return {"ok": True, "winner": w}
         if cmd == "apply":
-            return await self._apply_owner(int(args["proposal_id"]), wh)
+            return await self._apply_owner(int(args["proposal_id"]), wh, cid)
         raise ValueError(f"unknown command {cmd!r}")
 
-    async def process_commands(self) -> int:
-        """Apply the queued owner commands now (the CLI does this when the agent is not running)."""
-        self.s = self._load()
-        self._new = []
-        wh = self.clock()
+    async def _commands_step(self, wh: float) -> None:
         self._init(wh)
         self._reconcile(wh)
-        n = await self.apply_commands(wh)
-        self._commit()
-        return n
+        self._applied = await self.apply_commands(wh)
+
+    async def process_commands(self) -> int:
+        """The command step alone, in one transaction. Call it only while holding the agent lock (the CLI does so
+        through `improve.apply_queued_now`). An apply whose live check was made against a champion an earlier
+        command changed gets one more step (its live check re-run first). Returns the number of commands applied."""
+        self._new = []
+        total = 0
+        for _ in range(3):
+            self.s = self._load()
+            await self._prepare_live()
+            wh = self.clock()
+            self._applied = 0
+            if not await self._attempt(self._commands_step(wh)):
+                return total
+            total += self._applied
+            if STALE_LIVE not in self._deferred:
+                break
+        return total
 
     # ------------------------------------------------------------ the round hook
     async def on_round(self, round_stats: dict | None, *, champion_n: int, sentinel_n: int,
                        candidates: list[int] | None = None, round_id: int | None = None,
                        deals_n: int | None = None) -> list[dict]:
-        """Called once after every round. Returns the events it produced."""
+        """Called once after every round, by the agent-lock holder. Four steps, each ONE transaction:
+        1. commands: reconcile, then the queued owner commands (durable before the round's own work can fail);
+        2. observe: the round's counts, failure report, shadow scoring or probation watch (and their decisions);
+        3. decide (idle / maintenance): triggers and at most one proposal; its LLM call runs before any write;
+        4. commands queued while the round ran."""
         self.s = self._load()
         wh = self.clock()
         self._new = []
-        self._init(wh)
-        self._reconcile(wh)
-        await self.apply_commands(wh)
-        self._commit()  # commands and reconciliation are durable before the round's own work can fail
-        replay.record_prompt_epoch(self.store, prompt_sha(self.champion()), datetime.now(timezone.utc))
-        health = self._take_health()
+        await self._prepare_live()  # an owner apply's live model call, before any step opens its transaction
+        if not await self._attempt(self._commands_step(wh)):
+            return list(self._new)
         rid = round_id if round_id is not None else (round_stats or {}).get("round_id")
-        if rid is not None:
-            monitor.record(self.store, rid, wh, self.s["champion"], champion_n, sentinel_n, len(candidates or []),
-                           deals_n=deals_n, health=health)
+        ctx = {"alarm": None}
+        if not await self._attempt(self._observe_step(round_stats, rid, wh, champion_n, sentinel_n,
+                                                      candidates or [], deals_n, ctx)):
+            return list(self._new)
+        if self.phase in ("idle", "maintenance"):
+            if not await self._attempt(self._decide_step(wh, ctx["alarm"])):
+                return list(self._new)
+        await self._prepare_live()
+        await self._attempt(self.apply_commands(wh))
+        return list(self._new)
+
+    async def _observe_step(self, round_stats, rid, wh, champion_n, sentinel_n, candidates, deals_n, ctx) -> None:
         failures = reflect.collect_failures(self.store, rid, since_mark_id=self.s["last_mark_id"]) if rid else []
-        if failures:
-            rep = await reflect.round_report(round_stats or {}, failures, llm=self.llm, playbook=self.champion())
-            reflect.store_report(self.store, rep, wh)
+        rep = (await reflect.round_report(round_stats or {}, failures, llm=self.llm, playbook=self.champion())
+               if failures else None)  # the model call happens before this step writes anything
+        self._io_done()
+        replay.record_prompt_epoch(self.store, prompt_sha(self.champion()), datetime.now(timezone.utc), commit=False)
+        health = self._take_health()
+        if rid is not None:
+            monitor.record(self.store, rid, wh, self.s["champion"], champion_n, sentinel_n, len(candidates),
+                           deals_n=deals_n, health=health, commit=False)
+        if rep is not None:
+            reflect.store_report(self.store, rep, wh, commit=False)
         m = self.store.conn.execute("select coalesce(max(id),0) from marks").fetchone()[0]
         self.s["last_mark_id"] = max(self.s["last_mark_id"], int(m))
         if self.phase == "shadow":
-            await self._shadow_round(candidates or [], rid, wh)
+            await self._shadow_round(candidates, rid, wh)
         elif self.phase == "probation":
             await self._probation_round(champion_n, sentinel_n, wh)
         else:
             for k, v in health.items():
                 self.s["health_pending"][k] = self.s["health_pending"].get(k, 0) + v
-            alarm = self._watch(champion_n, sentinel_n, wh)
+            ctx["alarm"] = self._watch(champion_n, sentinel_n, wh)
             self._check_mde(wh)
-            trig = self._trigger(wh, alarm)
-            if trig is not None:
-                await self._reflect_and_propose(trig[0], trig[1], wh)
-        await self.apply_commands(wh)  # an owner command that arrived during this round
-        self._commit()
-        return list(self._new)
+
+    async def _decide_step(self, wh: float, alarm: str | None) -> None:
+        trig = self._trigger(wh, alarm)
+        if trig is not None:
+            await self._reflect_and_propose(trig[0], trig[1], wh)
 
     def _take_health(self) -> dict[str, int]:
         rows = self.store.conn.execute("select id, source, kind from health where id > ? and source != 'improve' "
@@ -496,15 +746,24 @@ class Controller:
                 self._event(wh, "trigger_in_cooldown", trigger=trigger,
                             left_wh=round(self.s["cooldown_until_wh"] - wh, 2))
             return  # the trigger stays pending (a due weekly review is not lost)
+        cause = trigger.split(":", 1)[1] if trigger.startswith("failures:") else None
+        try:
+            d = await reflect.propose(trigger, evidence, self.champion(), llm=self.llm,
+                                      rejected=reflect.rejected_ideas(self.store))
+        except LLMUnavailable as e:
+            # no answer is not "no proposal": the cluster is not consumed, no cooldown, the trigger stays pending
+            self._io_done()
+            last = self.s["events"][-1] if self.s["events"] else {}
+            if last.get("event") != "advisor_unavailable" or last.get("trigger") != trigger:
+                self._event(wh, "advisor_unavailable", trigger=trigger, why=str(e)[:200])
+            return
+        self._io_done()  # the advisor call ran before this step wrote anything
         if trigger == "weekly":
             self.s["last_review_wh"] = wh
         if trigger.startswith("health:"):
             self.s["health_pending"] = {}
-        cause = trigger.split(":", 1)[1] if trigger.startswith("failures:") else None
-        d = await reflect.propose(trigger, evidence, self.champion(), llm=self.llm,
-                                  rejected=reflect.rejected_ideas(self.store))
         if d is None:
-            reflect.consume(self.store, cause, 0)  # stamped: the same cluster does not call the advisor again
+            reflect.consume(self.store, cause, 0, commit=False)  # stamped: the cluster does not call the advisor again
             self.s["cooldown_until_wh"] = max(self.s["cooldown_until_wh"], wh + BASE_COOLDOWN)
             self._event(wh, "no_proposal", trigger=trigger, cooldown_wh=BASE_COOLDOWN)
             return
@@ -517,11 +776,9 @@ class Controller:
         self.s = self._load()
         self._new = []
         wh = self.clock()
-        self._init(wh)
-        self._reconcile(wh)
-        self._commit()
-        await self._run(delta, trigger, wh)
-        self._commit()
+        await self._prepare_live()
+        if await self._attempt(self._commands_step(wh)):
+            await self._attempt(self._run(delta, trigger, wh))
         return self.status()
 
     async def _run(self, delta: Delta, trigger: str, wh: float, cause: str | None = None) -> None:
@@ -536,9 +793,8 @@ class Controller:
         payload = {"trigger": trigger, "delta": delta.to_dict(), "door": delta.door(), "stage": "proposed"}
         cur = self.store.conn.execute("insert into proposals (kind, payload, status, stage) values (?,?,?,?)",
                                       (delta.item.kind, json.dumps(payload, default=str), "proposed", "proposed"))
-        self.store.conn.commit()
         pid = cur.lastrowid
-        reflect.consume(self.store, cause, pid)
+        reflect.consume(self.store, cause, pid, commit=False)
         self.s["proposal_id"] = pid
         self.s["delta_sources"] = _sources_of(delta.item)
         try:
@@ -551,13 +807,13 @@ class Controller:
             return self._reject(wh, res.stage, res.detail)
         if res.stage == "owner_review":  # ruling 5: the loop never promotes a prompt change
             vid = challenger.save_version(self.store, status="candidate", parent=self.s["champion"], delta=delta,
-                                          proposal_id=pid)
+                                          proposal_id=pid, commit=False)
             self._proposal(pid, "owner_review", "owner_review", res.detail, version_id=vid)
             self._event(wh, "owner_review", proposal=pid, note="apply with the 'apply' command after reading it")
             self.s["proposal_id"] = None
             return
         vid = challenger.save_version(self.store, status="shadow", parent=self.s["champion"], delta=delta,
-                                      proposal_id=pid)
+                                      proposal_id=pid, commit=False)
         self.s.update(challenger=vid, door=res.detail.get("door") or delta.door())
         self._proposal(pid, "shadow", "offline", res.detail, version_id=vid)
         if self.s["door"] == "arm":  # a query nobody ran cannot be shadowed: the bandit's trial + the CUSUM judge it
@@ -567,24 +823,31 @@ class Controller:
             self.s["shadow_started_wh"] = wh
             self._event(wh, "shadow_started", proposal=pid, version=vid)
 
-    async def _apply_owner(self, pid: int, wh: float) -> dict:
-        """Owner command: promote a prompt proposal waiting for review, after a must-pass run with the LIVE model."""
+    async def _apply_owner(self, pid: int, wh: float, cid: int | None = None) -> dict:
+        """Owner command: promote a prompt proposal waiting for review, after a must-pass run with the LIVE model.
+        That run happened before the step (`_prepare_live`); without it (no model, or it checked another champion)
+        the command waits in the queue (`_Deferred`), it is never consumed."""
         if self.phase in ("shadow", "probation"):
             return {"ok": False, "error": f"one change in flight: proposal {self.s['proposal_id']} is in {self.phase}"}
-        r = self.store.conn.execute("select status, payload from proposals where id=?", (pid,)).fetchone()
+        r = self.store.conn.execute("select status from proposals where id=?", (pid,)).fetchone()
         if r is None or r["status"] != "owner_review":
             return {"ok": False, "error": f"proposal {pid} is not waiting for owner review"}
         if self.llm is None:
-            return {"ok": False, "error": "the live model is needed: start the agent (or pass an LLM client)"}
-        delta = Delta.from_dict(json.loads(r["payload"])["delta"])
-        champ = self.champion()
+            raise _Deferred(NO_LIVE_MODEL)
         try:
-            challenger = champ.apply(champ.make_delta(delta.op, delta.item, hypothesis=delta.hypothesis,
-                                                      evidence=delta.evidence, predicted_effect=delta.predicted_effect))
+            delta, challenger = self._owner_challenger(pid)
         except PlaybookError as e:
             self._proposal(pid, "rejected", "owner_apply", {"errors": [str(e)]})
             return {"ok": False, "error": str(e)}
-        live = await gates.must_pass_live(challenger, self.llm, delta.item.id, cfg=self.cfg)
+        pre = self._live.get(cid) if cid is not None else None
+        if pre is None or pre[0] != challenger.sha():
+            raise _Deferred(STALE_LIVE)
+        live = pre[1]
+        if live.get("unavailable"):
+            # some live calls got no answer (model down, swapped out, or refused because another workload's model
+            # is loaded): the run proves nothing either way, and cases may have failed only for want of the model.
+            # The owner's apply waits for the next step instead of being rejected for good.
+            raise _Deferred(NO_LIVE_MODEL)
         detail = {"live_must_pass": live, "applied_at_wh": round(wh, 2)}
         if not live["ok"]:
             self._proposal(pid, "rejected", "owner_live_must_pass", detail)
@@ -592,7 +855,7 @@ class Controller:
             return {"ok": False, "error": "; ".join(live["why"]), "failed": live["failed"],
                     "unavailable": live["unavailable"], "reached_changed_prompt": live["reached_changed_prompt"]}
         vid = challenger.save_version(self.store, status="shadow", parent=self.s["champion"], delta=delta,
-                                      proposal_id=pid)
+                                      proposal_id=pid, commit=False)
         self.s.update(proposal_id=pid, challenger=vid, door="llm", delta_sources=[])
         self._proposal(pid, "probation", "owner_applied", detail, version_id=vid)
         self._promote(wh)
@@ -602,8 +865,8 @@ class Controller:
         pid = self.s["proposal_id"]
         champ, chall = self.champion(), Playbook.load(self.s["challenger"], store=self.store)
         await shadow.score_round(champ, chall, candidates, store=self.store, proposal_id=pid, round_id=rid,
-                                 cfg=self.cfg)
-        shadow.auto_label(self.store, pid)
+                                 cfg=self.cfg, commit=False)
+        shadow.auto_label(self.store, pid, commit=False)
         verdict, d = shadow.decide(self.store, pid, wh - float(self.s["shadow_started_wh"] or wh))
         if verdict == "promote":
             ok, bad = await gates.must_pass_ok(chall, cfg=self.cfg)
@@ -663,12 +926,53 @@ class Controller:
         named = set(self.s.get("delta_sources") or [])
         control = monitor.sentinel_sources(self.sentinel_playbook()) - named
 
-        def on(key: str, sources: set[str]) -> bool:
-            src = key.split("|", 1)[0]
-            return any(s == src or s in src for s in sources)
-        if any(on(k, control) for k in rising):
+        if any(self._source_matches(k, control, self._source_identities()) for k in rising):
             return []  # the control group is unhealthy too: the sites changed, not the playbook
         return sorted(rising)
+
+    def _source_identities(self) -> dict[str, set[str]]:
+        """adapter name -> every string its health events can carry (its own domain included).
+
+        Health events are recorded by the fetcher under a HOST ("allegrolokalnie.pl",
+        "www.kleinanzeigen.de", "pc.bazos.cz", "api.ebay.com") while playbook items and deltas name the
+        ADAPTER ("allegro_lokalnie", "kleinanzeigen", "bazos_cz", "ebay_de"). Best effort: without the
+        registry only the names are known and matching still works for the host-less sources."""
+        cached = getattr(self, "_src_ids", None)
+        if cached is not None:
+            return cached
+        ids: dict[str, set[str]] = {}
+        try:
+            from ..sources import registry
+            for name, ad in registry(self.cfg, self.root).items():
+                ids[str(name)] = {str(name)}
+                dom = str(getattr(ad, "domain", "") or "")
+                if dom:
+                    ids[str(name)].add(dom)
+        except Exception as e:  # noqa: BLE001 - registry needs a full config; name-only matching is enough
+            log.debug("improve: source domains unavailable (%s), matching names only", type(e).__name__)
+        self._src_ids = ids
+        return ids
+
+    @classmethod
+    def _source_matches(cls, key: str, sources: set[str], ids: dict[str, set[str]] | None = None) -> bool:
+        """Does a health key "<source>|<kind>" belong to one of these source names?
+
+        A plain substring test misses the pairs that share no punctuation: "allegro_lokalnie" is NOT inside
+        "allegrolokalnie.pl". A control-group source missed this way is read as "the delta caused it" and
+        silently rolls back an unrelated proposal (observed 2026-11-01: proposal 1 targeted sprzedajemy only
+        and was killed by allegrolokalnie.pl|blocked). So: exact name, the adapter's own domain, or a
+        punctuation-free form of either inside the punctuation-free host."""
+        src = key.split("|", 1)[0]
+        if src in sources:
+            return True
+        flat_src = _flat(src)
+        ids = ids or {}
+        for s in sources:
+            for token in ids.get(s, (s,)):
+                flat = _flat(str(token))
+                if flat and (flat == flat_src or flat in flat_src):
+                    return True
+        return False
 
     def _rollback(self, wh: float, why: list) -> None:
         """Version status and state in ONE transaction, then the file."""
@@ -757,4 +1061,9 @@ class Controller:
         self._champion_changed(old, vid)
         self._rest()
         self._event(wh, "owner_rollback", to=version, as_version=vid)
-        return {"ok": True, "version": vid, "to": version}  # committed with the command mark by the caller
+        out = {"ok": True, "version": vid, "to": version}  # committed with the command mark by the caller
+        pend = pending_applies(self.store)
+        if pend:
+            out["pending_applies"] = pend
+            out["warning"] = rollback_warning(pend, version)
+        return out

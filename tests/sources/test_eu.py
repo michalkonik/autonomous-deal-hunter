@@ -13,6 +13,7 @@ from dh.sources import bazos as bz
 from dh.sources import hardverapro as hv
 from dh.sources import kleinanzeigen as ka
 from dh.sources import marktplaats as mp
+from dh.sources import ememain as em
 from dh.sources.base import filter_query, price_of
 
 from pathlib import Path
@@ -357,7 +358,7 @@ def test_search_and_detail_redact_contact_and_flag_it():
     assert al.ADAPTER.parse_detail(fresh, "<div class='mlc-offer__description'>Sprzedam</div>").contact_in_text is False
 
 
-def test_redacted_listing_still_trips_risk_offplatform_flag():
+def test_redacted_listing_still_trips_the_risk_contact_feature():
     from dh import config, risk
     from dh.models import Extraction
     l = al.parse_search(fixture_text("allegro_lokalnie", "search.html"))[0]
@@ -365,4 +366,77 @@ def test_redacted_listing_still_trips_risk_offplatform_flag():
     assert "600" not in d.description and d.contact_in_text
     cfg = config.load(Path(__file__).resolve().parents[2])
     r = risk.assess(d, Extraction(key=None, category=None, certainty=0.9, condition="used"), None, cfg)
-    assert r.hard_exclude and "offplatform_phone" in r.flags
+    # final review I3 ruling: a (redacted) phone number is the score feature contact_in_text, not a hard exclude
+    assert not r.hard_exclude and "contact_in_text" in r.flags
+
+
+# ---------------------------------------------------------------- 2ememain (BE)
+def test_2ememain_search_parses_fixture():
+    ls = em.parse_search(fixture_text("2ememain", "search.html"))
+    check_listings(ls, "EUR", n=8)
+    assert all(l.url.startswith("https://www.2ememain.be/v/") for l in ls)
+    assert all(l.seller_hash and l.photos for l in ls)
+
+
+def test_2ememain_price_and_flag_mutations():
+    html = fixture_text("2ememain", "search.html")
+    data = json.loads(re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S).group(1))
+    n = len(em.parse_search(html))
+    assert n >= 5
+
+    def mutate(fn):
+        d = json.loads(json.dumps(data))
+        fn(d["props"]["pageProps"]["searchRequestAndResponse"]["listings"])
+        return f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(d)}</script>'
+
+    def zero(ls):
+        next(i for i in ls if i.get("priceInfo", {}).get("priceType") == "FIXED" and i["priceInfo"]["priceCents"])[
+            "priceInfo"]["priceCents"] = 0
+
+    def reserved(ls):
+        next(i for i in ls if i.get("priceInfo", {}).get("priceType") == "FIXED" and i["priceInfo"]["priceCents"])[
+            "reserved"] = True
+
+    def wanted(ls):
+        next(i for i in ls if i.get("priceInfo", {}).get("priceType") == "FIXED")["title"] = "RECHERCHE : RTX 3070"
+
+    def no_url(ls):
+        next(i for i in ls if i.get("priceInfo", {}).get("priceType") == "FIXED")["vipUrl"] = None
+
+    for fn in (zero, reserved, wanted, no_url):
+        assert len(em.parse_search(mutate(fn))) == n - 1, fn.__name__
+
+
+def test_2ememain_dates_french():
+    from dh.sources.ememain import _posted
+    assert _posted("Aujourd'hui") is not None
+    assert _posted("Hier") is not None
+    from zoneinfo import ZoneInfo
+    d = _posted("18 oct. 26")
+    loc = d.astimezone(ZoneInfo("Europe/Brussels"))
+    assert loc.year == 2026 and loc.month == 10 and loc.day == 18
+    assert _posted("18 oct. 2026") == d
+    assert _posted("il y a 2 jours") is None
+
+
+def test_2ememain_layout_change_is_an_error_not_empty():
+    with pytest.raises(AdapterError, match="__NEXT_DATA__"):
+        em.parse_search("<html>interstitial</html>")
+
+
+def test_2ememain_uses_allowed_html_page():
+    ad = em.ADAPTER
+    f = FakeFetcher(default=Res(200, fixture_text("2ememain", "search.html")))
+    assert len(run(ad.search(Query("rtx 4090"), f))) >= 5
+    assert f.urls == ["https://www.2ememain.be/q/rtx+4090/"]
+
+
+def test_2ememain_detail_and_alive():
+    ad = em.ADAPTER
+    html = fixture_text("2ememain", "detail.html")
+    l = em.parse_search(fixture_text("2ememain", "search.html"))[0]
+    d = ad.parse_detail(l, html)
+    assert d.description and d.photos
+    ok, price = run(ad.alive(l, FakeFetcher(default=Res(200, html, l.url))))
+    assert ok and price > 0
+    assert run(ad.alive(l, FakeFetcher(default=Res(410)))) == (False, None)

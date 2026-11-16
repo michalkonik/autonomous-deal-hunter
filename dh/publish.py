@@ -8,6 +8,7 @@ before anything can fail.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import re
@@ -39,6 +40,7 @@ class CardFile:
     star: bool
     cons_net_usd: Decimal
     created_at: datetime
+    status: str = "new"
 
 
 # ---------- outcome blocks ----------
@@ -207,7 +209,7 @@ def scan_cards(store, cards_dir: Path) -> list[CardFile]:
             d = store.get_deal(deal_id)
             if d is None:
                 continue
-            out.append(CardFile(md, js, deal_id, d.tier, d.star, d.cons_net_usd, d.created_at))
+            out.append(CardFile(md, js, deal_id, d.tier, d.star, d.cons_net_usd, d.created_at, d.status or "new"))
         except Exception as e:
             health_once(store, "publish", "bad_card", f"{js}: {e!r}")
     return out
@@ -253,20 +255,23 @@ def write_cards(store, log_dir: Path, cards: list[CardFile], protect: set[int] =
 
 
 def index_order(cards: list[CardFile]) -> list[CardFile]:
-    """Star and tier 1 first, then by tier, then conservative net (desc)."""
-    return sorted(cards, key=lambda c: (not (c.star or c.tier == 1), c.tier, -c.cons_net_usd, c.deal_id))
+    """Live deals first (gone ones last), then star and tier 1, then by tier, then conservative net (desc)."""
+    return sorted(cards, key=lambda c: (c.status == "gone", not (c.star or c.tier == 1), c.tier, -c.cons_net_usd,
+                                        c.deal_id))
 
 
 def _line(c: CardFile, log_dir: Path) -> str:
     rel = _card_dest(log_dir, c).relative_to(log_dir).as_posix()
     star = "★ " if c.star else ""
-    return f"- {star}T{c.tier} +${c.cons_net_usd:.0f} · [{c.path_md.stem}]({rel}) · {c.created_at:%Y-%m-%d}"
+    gone = " · **gone**" if c.status == "gone" else ""
+    return f"- {star}T{c.tier} +${c.cons_net_usd:.0f} · [{c.path_md.stem}]({rel}) · {c.created_at:%Y-%m-%d}{gone}"
 
 
 def write_reports(store, log_dir: Path, cards: list[CardFile]) -> None:
     ordered = index_order(cards)
     (log_dir / "INDEX.md").write_text(
-        "# Deal Hunter index\n\nStar and tier-1 first, then by tier and conservative net.\n\n"
+        "# Deal Hunter index\n\nStar and tier-1 first, then by tier and conservative net; deals marked **gone** (the "
+        "listing is gone or failed re-verification) come last.\n\n"
         + ("\n".join(_line(c, log_dir) for c in ordered) or "_no deals yet_") + "\n")
     days: dict[str, list[CardFile]] = {}
     weeks: dict[str, list[CardFile]] = {}
@@ -356,6 +361,34 @@ async def _origin_items(log_dir: Path):
     return items
 
 
+KEEP_DIRS = ("deals", "weekly")  # what the clone publishes that the local card dir may no longer regenerate
+
+
+def _published_files(log_dir: Path) -> dict[str, bytes]:
+    """Every card and weekly report in the clone's working tree (relative path -> bytes)."""
+    out: dict[str, bytes] = {}
+    for d in KEEP_DIRS:
+        for f in sorted((log_dir / d).rglob("*")) if (log_dir / d).is_dir() else []:
+            if f.is_file():
+                with contextlib.suppress(OSError):
+                    out[f.relative_to(log_dir).as_posix()] = f.read_bytes()
+    return out
+
+
+def _restore_missing(log_dir: Path, keep: dict[str, bytes]) -> int:
+    """After a reset to origin: put back every kept file origin does not have (a card whose local source is gone,
+    a weekly report not pushed yet). A file origin has is origin's (its marks were imported before the reset);
+    regenerable cards are rewritten from the card dir right after anyway. Returns the number restored."""
+    n = 0
+    for rel, data in keep.items():
+        dest = log_dir / rel
+        if not dest.exists():
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+            n += 1
+    return n
+
+
 async def sync(store, cfg, root: Path | None = None) -> dict:
     """One publish cycle. Never raises on git/network failure."""
     root = Path(root or ".")
@@ -387,9 +420,12 @@ async def sync(store, cfg, root: Path | None = None) -> dict:
             n, b = import_texts(store, await _origin_items(log_dir))
             res["marks"] += n
             bad |= b
+            keep = _published_files(log_dir)  # the reset must not lose what only the clone has
             rrc, rout = await _git(log_dir, "reset", "--hard", f"origin/{BRANCH}")
             if rrc != 0:
                 health_once(store, "publish", "reset_failed", rout[:500])
+            else:
+                res["restored"] = _restore_missing(log_dir, keep)
         else:
             health_once(store, "publish", "fetch_failed", fout[:500])
     n, b = import_marks(store, log_dir)
@@ -470,7 +506,11 @@ async def run_loop(store, cfg, root: Path, stop: asyncio.Event) -> None:
         try:
             await sync(store, cfg, root)
         except Exception as e:  # the round must never die because of the publisher
-            health_once(store, "publish", "sync_error", repr(e)[:500])
+            try:  # its own connection (serve): a busy database must not end the loop either
+                health_once(store, "publish", "sync_error", repr(e)[:500])
+            except Exception:  # noqa: BLE001
+                with contextlib.suppress(Exception):
+                    store.conn.rollback()
         try:
             await asyncio.wait_for(stop.wait(), interval)
         except asyncio.TimeoutError:

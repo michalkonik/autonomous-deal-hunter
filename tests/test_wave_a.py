@@ -169,3 +169,39 @@ def test_books_track_paid_spend_by_month(tmp_path):
                              llm={"calls": 1, "prompt_tokens": 1, "completion_tokens": 1, "paid_usd": 0.25}, fetches=0)
     assert out["paid_api_pln"] == Decimal("1.00")
     assert books.paid_month_usd(st, now) == pytest.approx(0.25)
+
+
+def test_paid_cap_counts_spend_once_across_rounds_and_a_month_boundary(tmp_path):
+    """books.paid_month_usd is the paid_spend; each round's cost row is booked and then leaves the client's unbooked
+    counter, so books + unbooked == the truth (no double count), and a new month starts again from zero."""
+    st = Store(tmp_path / "t.db")
+    clock = [datetime(2026, 10, 30, 12, tzinfo=timezone.utc)]
+    cfg = Config({"books": {"tariff_pln_kwh": 1.1, "base_w": 100}, **_paid_cfg(1.0).to_dict()})
+    c = Client(cfg, transport=httpx.MockTransport(lambda r: _reply()),
+               paid_spend=lambda: books.paid_month_usd(st, clock[0]))  # $0.025 per call
+    usage = {"paid_usd": 0.0}
+    c._on_paid = lambda role, usd: usage.__setitem__("paid_usd", usage["paid_usd"] + usd)
+
+    def end_round(started):
+        rid = st.log_round(started)
+        books.record_round(st, rid, cfg, seconds=1, gpu_watts=[], llm={"paid_usd": usage["paid_usd"]}, fetches=0)
+        c.paid_booked(usage["paid_usd"])
+        usage["paid_usd"] = 0.0
+
+    for _ in range(20):  # round 1: 20 calls = $0.50
+        asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA))
+    end_round(clock[0])
+    assert books.paid_month_usd(st, clock[0]) == pytest.approx(0.5) and c._paid_session == pytest.approx(0.0)
+    for _ in range(19):  # round 2: 19 more = $0.475; truth $0.975 < cap. A double count would have refused at ~$0.5+
+        asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA))
+    end_round(clock[0] + timedelta(minutes=10))
+    assert books.paid_month_usd(st, clock[0]) == pytest.approx(0.975)
+    with pytest.raises(PaidCapReached):  # one more would reach $1.00: refused only now (0.975 + 0.025 is allowed once, then 1.0 >= cap)
+        asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA))
+        asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA))
+    # month rollover: the books' month-to-date restarts at 0, the cap is open again
+    clock[0] = datetime(2026, 11, 1, 0, 5, tzinfo=timezone.utc)
+    c.paid_booked(usage["paid_usd"])
+    usage["paid_usd"] = 0.0
+    assert books.paid_month_usd(st, clock[0]) == 0.0 and c._paid_session == pytest.approx(0.0)
+    assert asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA)) == {"a": 1}

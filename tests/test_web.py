@@ -15,14 +15,15 @@ from dh.store import Store
 from dh.web.app import create_app
 
 
-def build(tmp_path, hosts=("testserver",)):
+def build(tmp_path, hosts=("testserver",), **kw):
     data = load_cfg_data()
     data["publish"] = {"cards_dir": "var/cards/deals"}
     data["web"] = {"allowed_hosts": list(hosts)}
     cfg = config.Config(data)
     db = tmp_path / "t.db"
     st = Store(db)
-    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms(),
+                     **kw)
     return st, TestClient(app, raise_server_exceptions=False), cfg
 
 
@@ -93,9 +94,9 @@ def test_filters_and_bad_values(tmp_path):
     assert "KEY-ONE" not in c.get("/?country=DE").text
     assert "KEY-ONE" not in c.get("/?source=olx").text
     assert "KEY-TWO" not in c.get("/?category=gpu").text
-    assert "KEY-TWO" not in c.get("/?since=2026-10-25").text
+    assert "KEY-TWO" not in c.get(f"/?date={NOW.astimezone().strftime('%Y-%m-%d')}").text  # only today's local day
     assert "KEY-ONE" in c.get("/?bogus=1&tier=").text
-    for q in ("tier=9", "tier=x", "since=yesterday"):
+    for q in ("tier=9", "tier=x", "date=yesterday"):
         assert c.get("/?" + q).status_code == 400
 
 
@@ -151,8 +152,8 @@ def test_books_realised_net_from_sold_deals(tmp_path):
     d, res, _ = make_deal(st)
     d2, _, _ = make_deal(st, sid="2", seller="s2", key="OPEN-ONE")
     assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
-    inp = replace(net_inputs(), exit_price_cons_pln=Decimal("3000"), exit_price_exp_pln=Decimal("3000"))
-    want = asyncio.run(economics.net(inp, cfg, FakeFx(), FakeCustoms())).cons_net_pln
+    inp = replace(net_inputs(), exit_price_cons_pln=Decimal("3000"), exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms())).cons_net_pln
     assert want != res.cons_net_pln
     t = c.get("/books").text
     assert f"{want:.2f} PLN" in t and "Realised net" in t and "Forecast: expected net" in t
@@ -272,8 +273,8 @@ def test_pagination(tmp_path):
     d, _, _ = make_deal(st)
     st.conn.executemany(
         "insert into deals select null, listing_ref, key || ?, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
-        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
-        " from deals where id=?", [(f"-{i:03d}", d.id) for i in range(104)])
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status,"
+        " ship_pl from deals where id=?", [(f"-{i:03d}", d.id) for i in range(104)])
     st.conn.commit()
     p1, p2 = c.get("/").text, c.get("/?page=2").text
     assert p1.count('href="/deal/') == 100 and "page 1 of 2" in p1 and "next" in p1
@@ -286,15 +287,15 @@ def test_pagination(tmp_path):
 def test_books_realised_net_margin_scheme_hand_computed(tmp_path):
     """Private PL seller, no VAT invoice, PLN, allegro exit: margin scheme. Sold at 3000, hand computation:
     fees 8% x 3000 + 1 = 241.00; VAT due 23/123 x (3000 - 2000) = 186.99; input VAT on services
-    23/123 x (241 + 25) = 45.07 + 4.67 = 49.74; returns reserve 5% x 3000 = 150; risk haircut 0.02 x 2000 = 40;
-    pre-tax = 3000 - 241 - 2000 - 20 - 186.99 + 49.74 - 25 - 150 - 40 = 386.75; tax 23.9% = 92.43;
-    realised net = 294.32 PLN."""
+    23/123 x (241 + 25) = 45.07 + 4.67 = 49.74. A completed sale has NO returns reserve and NO risk haircut
+    (final review minor): pre-tax = 3000 - 241 - 2000 - 20 - 186.99 + 49.74 - 25 = 576.75; tax 23.9% = 137.84;
+    realised net = 438.91 PLN."""
     st, c, _ = build(tmp_path)
     d, _, lst = make_deal(st)
     assert lst.is_business is False and not json.loads(d.evidence_json)["net_inputs"]["has_vat_invoice"]
     post(c, d.id, status="sold", price_pln="3000")
     t = c.get("/books").text
-    assert 'class="n">294.32</td>' in t and "294.32 PLN" in t
+    assert 'class="n">438.91</td>' in t and "438.91 PLN" in t
 
 
 def test_existing_card_only_touched_via_set_outcome(tmp_path, monkeypatch):
@@ -311,8 +312,277 @@ def test_pagination_links_urlencoded(tmp_path):
     d, _, _ = make_deal(st)
     st.conn.executemany(
         "insert into deals select null, listing_ref, key, tier, star, effort, confidence, cons_net_pln, exp_net_pln,"
-        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status"
-        " from deals where id=?", [(d.id,)] * 101)
+        " cons_net_usd, exp_net_usd, capital_usd, breakdown_json, evidence_json, reasons, created_at, verified_at, status,"
+        " ship_pl from deals where id=?", [(d.id,)] * 101)
     st.conn.commit()
-    t = c.get("/?source=kleinanzeigen&since=2026-01-01").text
-    assert 'href="/?page=2&amp;source=kleinanzeigen&amp;since=2026-01-01"' in t
+    day = NOW.astimezone().strftime("%Y-%m-%d")
+    t = c.get(f"/?source=kleinanzeigen&date={day}").text
+    assert f'href="/?page=2&amp;source=kleinanzeigen&amp;date={day}"' in t
+
+
+# ------------------------------------------------------------------ final review I2 + minor: realised net
+
+
+def no_reserve(cfg):
+    data = cfg.to_dict()
+    return config.Config({**data, "economics": {**data["economics"], "returns_reserve": 0}})
+
+
+def test_books_realised_net_uses_the_bought_price(tmp_path):
+    """The owner's Bought mark price (PLN) replaces the listing price; no haircut, no returns reserve."""
+    st, c, cfg = build(tmp_path)
+    d, _, _ = make_deal(st)
+    assert post(c, d.id, status="bought", price_pln="1800").status_code == 303
+    assert post(c, d.id, status="sold", price_pln="3000").status_code == 303
+    inp = replace(net_inputs(), buy_price=Decimal("1800"), buy_ccy="PLN", exit_price_cons_pln=Decimal("3000"),
+                  exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms()))
+    assert all(l.pln == 0 for l in want.lines_cons if l.label in ("returns reserve", "risk haircut"))
+    t = c.get("/books").text
+    assert f'class="n">{want.cons_net_pln:.2f}</td>' in t
+
+
+def test_books_realised_net_replays_the_recorded_fx_and_handles_the_buy_currency(tmp_path):
+    """A EUR purchase is replayed at the rate the deal was valued with (evidence fx_rates), not today's; a Bought
+    price in PLN replaces the EUR price (buy currency PLN, no second FX conversion)."""
+    from dh.money import FixedFx
+    st, c, cfg = build(tmp_path)
+    d, _, _ = make_deal(st)
+    ev = json.loads(d.evidence_json)
+    ev["net_inputs"].update(buy_price="470", buy_ccy="EUR")
+    day = ev["net_inputs"]["day"]
+    ev["fx_rates"] = [{"currency": "EUR", "day": day, "rate": "4.10", "effective_date": day},
+                      {"currency": "USD", "day": day, "rate": "3.60", "effective_date": day}]
+    st.conn.execute("update deals set evidence_json=? where id=?", (json.dumps(ev), d.id))
+    st.conn.commit()
+    post(c, d.id, status="sold", price_pln="3000")
+    inp = replace(cards.inputs_from_json(ev["net_inputs"]), exit_price_cons_pln=Decimal("3000"),
+                  exit_price_exp_pln=Decimal("3000"), p_scam=0.0)
+    fixed = FixedFx.from_evidence(ev)
+    want = asyncio.run(economics.net(inp, no_reserve(cfg), fixed, FakeCustoms())).cons_net_pln
+    live = asyncio.run(economics.net(inp, no_reserve(cfg), FakeFx(), FakeCustoms())).cons_net_pln
+    assert want != live  # FakeFx (the web's live FX here) has EUR 4.3951
+    assert f'class="n">{want:.2f}</td>' in c.get("/books").text
+    post(c, d.id, status="bought", price_pln="2050")
+    post(c, d.id, status="sold", price_pln="3000")
+    inp2 = replace(inp, buy_price=Decimal("2050"), buy_ccy="PLN")
+    want2 = asyncio.run(economics.net(inp2, no_reserve(cfg), fixed, FakeCustoms())).cons_net_pln
+    assert f'class="n">{want2:.2f}</td>' in c.get("/books").text
+
+
+def test_gone_deal_is_shown_as_gone(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    st.conn.execute("update deals set status='gone' where id=?", (d.id,))
+    st.conn.commit()
+    assert "gone" in c.get("/").text
+    assert "gone" in c.get(f"/deal/{d.id}").text.lower()
+
+
+def test_deal_page_shows_usd_rate_and_triage(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    ev = json.loads(d.evidence_json)
+    ev["fx_usd"] = {"rate": "3.7012", "date": "2026-10-28"}
+    ev["triage"] = {"verdict": "demote", "reasons": ["<b>stock photos</b>"]}
+    st.conn.execute("update deals set evidence_json=? where id=?", (json.dumps(ev), d.id))
+    st.conn.commit()
+    t = c.get(f"/deal/{d.id}").text
+    assert "3.7012 PLN per USD (NBP mid, 2026-10-28)" in t and "<b>demote</b>" in t
+    assert "<b>stock photos</b>" not in t and "&lt;b&gt;stock photos" in t  # model output is escaped
+
+
+# ------------------------------------------------------------------ web fixes 2026-11-03 (LAN 403, date/time, false positive, params)
+
+
+def build_dyn(tmp_path, monkeypatch, ips=("203.0.113.7",)):
+    """App WITHOUT a web.allowed_hosts override: the allowlist is the machine's current addresses
+    (`_local_ipv4s` monkeypatched to a fake LAN IP)."""
+    from dh.web import app as webapp
+    monkeypatch.setattr(webapp, "_local_ipv4s", lambda: set(ips))
+    monkeypatch.setattr(webapp, "_HOSTS_CACHE", None)
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    cfg = config.Config(data)
+    db = tmp_path / "t.db"
+    st = Store(db)
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    return st, TestClient(app, raise_server_exceptions=False)
+
+
+def test_mark_accepted_from_current_local_interface_ip(tmp_path, monkeypatch):
+    st, c = build_dyn(tmp_path, monkeypatch)
+    d, _, _ = make_deal(st)
+    r = c.post(f"/deal/{d.id}/mark", data={"status": "bought"}, follow_redirects=False,
+               headers={"Origin": "http://203.0.113.7:8711", "Host": "203.0.113.7:8711"})
+    assert r.status_code == 303  # the 2026-11-03 bug: LAN IP missing from the startup allowlist -> 403
+    r = c.post(f"/deal/{d.id}/mark", data={"status": "bought"},
+               headers={"Origin": "http://evil.example:8711", "Host": "evil.example:8711"})
+    assert r.status_code == 403  # DNS-rebinding style foreign Host is still refused
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 1
+
+
+def test_default_allowed_hosts_include_local_interfaces(monkeypatch):
+    from dh.web.app import default_allowed_hosts
+    monkeypatch.setattr("dh.web.app._local_ipv4s", lambda: {"192.168.0.39"})
+    h = default_allowed_hosts()
+    assert "192.168.0.39" in h and "localhost" in h and "127.0.0.1" in h
+
+
+def test_date_time_columns_and_filters(tmp_path):
+    st, c, _ = build(tmp_path)
+    d1, _, _ = make_deal(st, sid="1", seller="1", key="KEY-ONE")
+    make_deal(st, sid="2", seller="2", key="KEY-TWO", created=NOW - timedelta(days=10))
+    loc = d1.created_at.astimezone()  # the table and filters show/compare LOCAL time
+    day, hm = loc.strftime("%Y-%m-%d"), loc.strftime("%H:%M")
+    assert day in c.get("/").text  # the new Date column renders
+    day2 = (NOW - timedelta(days=10)).astimezone().strftime("%Y-%m-%d")
+    t = c.get(f"/?date={day}").text
+    assert "KEY-ONE" in t and "KEY-TWO" not in t
+    t = c.get(f"/?date={day2}").text
+    assert "KEY-TWO" in t and "KEY-ONE" not in t
+    assert "KEY-ONE" in c.get(f"/?date={day}&time={hm}").text  # at exactly that minute: included
+    late = (loc + timedelta(minutes=2)).strftime("%H:%M")
+    assert "KEY-ONE" not in c.get(f"/?date={day}&time={late}").text
+    assert "KEY-ONE" in c.get(f"/?time={hm}").text  # time alone filters time-of-day, any date
+    loc2 = (NOW - timedelta(days=10)).astimezone()
+    if loc2.strftime("%H:%M") < hm:  # keep the assertion meaningful for both deals' local times
+        assert "KEY-TWO" not in c.get(f"/?time={hm}").text
+    for q in ("date=yesterday", "time=25:70", "time=14", "fp=maybe"):
+        assert c.get("/?" + q).status_code == 400
+
+
+def test_false_positive_mark_tag_and_filter(tmp_path):
+    st, c, _ = build(tmp_path)
+    d1, _, _ = make_deal(st, sid="1", seller="1", key="KEY-FP")
+    d2, _, _ = make_deal(st, sid="2", seller="2", key="KEY-CLEAN")
+    assert post(c, d1.id, status="skipped", reason="not a deal", false_positive="1").status_code == 303
+    assert post(c, d2.id, status="bought").status_code == 303
+    assert st.conn.execute("select false_positive from marks where deal_id=?", (d1.id,)).fetchone()[0] == 1
+    assert st.conn.execute("select false_positive from marks where deal_id=?", (d2.id,)).fetchone()[0] == 0
+    t = c.get(f"/deal/{d1.id}").text
+    assert "false positive" in t and 'name="false_positive"' in t  # tag shown, checkbox in all forms
+    assert c.get(f"/deal/{d2.id}").text.count('name="false_positive"') == 3
+    yes, no = c.get("/?fp=yes").text, c.get("/?fp=no").text
+    assert "KEY-FP" in yes and "KEY-CLEAN" not in yes
+    assert "KEY-CLEAN" in no and "KEY-FP" not in no
+
+
+def test_marks_false_positive_migration(tmp_path):
+    """A pre-existing DB whose marks table lacks the column migrates on open; old rows read as false_positive=0."""
+    import sqlite3
+    db = tmp_path / "old.db"
+    con = sqlite3.connect(db)
+    con.execute("create table marks (id integer primary key, deal_id integer not null, status text, price_pln text,"
+                " note text, source text, created_at text default current_timestamp)")
+    con.execute("insert into marks (deal_id, status) values (7, 'bought')")
+    con.commit()
+    con.close()
+    st = Store(db)
+    assert st.conn.execute("select false_positive from marks where deal_id=7").fetchone()[0] == 0
+    st.add_mark(8, "skipped", None, "x", "web", false_positive=True)
+    assert st.conn.execute("select false_positive from marks where deal_id=8").fetchone()[0] == 1
+
+
+def test_params_page(tmp_path):
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    data["web"] = {"allowed_hosts": ["testserver"]}
+    data.setdefault("sources", {}).setdefault("adapters", {})["imap_probe"] = {"user": "IMSECRETMARKER42"}
+    cfg = config.Config(data)
+    db = tmp_path / "t.db"
+    st = Store(db)
+    pb = tmp_path / "playbook"
+    pb.mkdir()
+    (pb / "items.yaml").write_text("- {id: q.gpu, kind: query, target: allegro, value: rtx 4090 sentinel, min_pln: 1000}\n")
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.get("/params")
+    assert r.status_code == 200
+    t = r.text
+    assert "Current Parameters" in t and "Deals" in t  # nav entry present
+    assert "allegro" in t and "rtx 4090 sentinel" in t  # shops + playbook queries rendered
+    assert "disabled" in t  # vinted/willhaben are disabled in the shipped config
+    assert "PL" in t and "IMSECRETMARKER42" not in t  # countries shown, secrets never
+    assert "Tier-1 minimum" in t and "gemma" in t
+
+
+# ----------------------------------------------------------- new UI: url column, since, badge, page stop, textareas
+
+
+def test_offer_url_column(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    html = c.get("/").text
+    assert '<a href="https://www.kleinanzeigen.de/s-anzeige/x/1"' in html and "offer url" in html
+    st.conn.execute("update listings set url='javascript:alert(1)' where id=?", (d.listing_ref,))
+    st.conn.commit()
+    assert "javascript" not in c.get("/").text  # not http(s): no link, nothing echoed
+
+
+def test_since_dropdown_filters_by_hour(tmp_path):
+    st, c, _ = build(tmp_path)
+    make_deal(st, sid="1", seller="1", key="KEY-ONE")
+    make_deal(st, sid="2", seller="2", key="KEY-TWO", created=NOW - timedelta(days=10))
+    html = c.get("/").text
+    assert 'name="since"' in html and "all time" in html and '<input name="date"' not in html
+    h = NOW.astimezone().strftime("%Y-%m-%d %H:00")
+    both = c.get("/", params={"since": h}).text
+    assert "KEY-ONE" in both and "KEY-TWO" not in both
+    nxt = (NOW.astimezone() + timedelta(hours=1)).strftime("%Y-%m-%d %H:00")
+    assert "KEY-ONE" not in c.get("/", params={"since": nxt}).text
+    for q in ("since=x", "since=2026-10-29", "since=2026-10-29%2013:30", "since=2026-13-45%2008:00"):
+        assert c.get("/?" + q).status_code == 400
+
+
+def test_hunter_badge_states(tmp_path):
+    for state, want in ((True, "hunter: running"), (False, "hunter: stopped"), (None, "hunter: status unknown")):
+        p = tmp_path / str(state)
+        p.mkdir()
+        _, c, _ = build(p, hunter_status=lambda s=state: s)
+        assert want in c.get("/").text
+
+    def boom():
+        raise RuntimeError("systemctl missing")
+    p = tmp_path / "boom"
+    p.mkdir()
+    _, c, _ = build(p, hunter_status=boom)
+    assert "hunter: status unknown" in c.get("/").text  # a broken probe never breaks the page
+
+
+def test_default_hunter_status_watches_the_hunter_unit(tmp_path, monkeypatch):
+    from dh.web import app as webapp
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append(cmd)
+        return type("R", (), {"stdout": "inactive\n"})()
+    monkeypatch.setenv("DH_HUNTER_UNIT", "deal-hunter")
+    monkeypatch.setattr(webapp.subprocess, "run", fake_run)
+    assert webapp._default_hunter_status() is False
+    assert seen[0][-1] == "deal-hunter"  # the hunter's unit, not the page unit itself
+
+    def raiser(cmd, **kw):
+        raise OSError("no systemd")
+    monkeypatch.setattr(webapp.subprocess, "run", raiser)
+    assert webapp._default_hunter_status() is None
+
+
+def test_page_stop_button(tmp_path):
+    stops = []
+    _, c, _ = build(tmp_path, page_stop=lambda: stops.append(1))
+    r = c.post("/page/stop", headers={"Origin": "http://testserver"})
+    assert r.status_code == 200 and stops == [1] and "Page server stopped" in r.text
+    assert c.post("/page/stop").status_code == 403  # the same CSRF rule as the mark forms
+    assert c.post("/page/stop", headers={"Origin": "http://evil.example"}).status_code == 403
+    assert stops == [1]
+
+
+def test_feedback_fields_are_resizable_textareas(tmp_path):
+    st, c, _ = build(tmp_path)
+    d, _, _ = make_deal(st)
+    html = c.get(f"/deal/{d.id}").text
+    assert '<textarea name="note"' in html and '<textarea name="reason"' in html
+    assert '<input name="note"' not in html and '<input name="reason"' not in html
+    assert "resize:vertical" in html  # drag the corner to enlarge (owner: one-line inputs hid the text)
+    assert post(c, d.id, status="skipped", reason="multi\nline reason").status_code == 303

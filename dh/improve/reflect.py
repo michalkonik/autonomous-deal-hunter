@@ -14,10 +14,11 @@ the delta, computes the inverse, validates caps and drops a repeat of a rejected
 from __future__ import annotations
 
 import json
+import weakref
 import re
 from datetime import datetime, timedelta, timezone
 
-from ..llm import LLMError, wrap_untrusted
+from ..llm import LLMError, LLMUnavailable, wrap_untrusted
 from . import gates
 from .playbook import EDITABLE_PROMPT_TARGETS, Delta, Item, Playbook, PlaybookError
 
@@ -61,8 +62,14 @@ _TEXT_HINTS = [(re.compile(r"scam|oszust|fake|podr[oó]b|fa[lł]szyw|phishing", 
                (re.compile(r"price|cena|overvalued|zawy[zż]on|valuation|za drogo|too expensive", re.I), "valuation_miss")]
 
 
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
 def migrate(store) -> None:
+    if store in _MIGRATED:
+        return
     store.ensure_table(FAILURES_SQL)
+    _MIGRATED.add(store)
 
 
 # ------------------------------------------------------------------ evidence (code)
@@ -145,14 +152,15 @@ async def round_report(round_stats: dict, failures: list[dict], *, llm=None, pla
             "summary": summary or ", ".join(f"{k} {v}" for k, v in sorted(by.items())) or "no failures"}
 
 
-def store_report(store, report: dict, watched_h: float) -> None:
+def store_report(store, report: dict, watched_h: float, commit: bool = True) -> None:
     migrate(store)
     now = datetime.now(timezone.utc).isoformat()
     for f in report["failures"]:
         store.conn.execute("insert into improve_failures (round_id, ref, kind, cause, source, detail, watched_h, at) "
                            "values (?,?,?,?,?,?,?,?)", (report.get("round_id"), f["ref"], f.get("kind"), f["cause"],
                                                          f.get("source"), str(f.get("detail", ""))[:300], watched_h, now))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
 
 
 def open_clusters(store) -> dict[str, list[dict]]:
@@ -164,13 +172,14 @@ def open_clusters(store) -> dict[str, list[dict]]:
     return out
 
 
-def consume(store, cause: str | None, proposal_id: int) -> None:
+def consume(store, cause: str | None, proposal_id: int, commit: bool = True) -> None:
     migrate(store)
     if cause is None:
         return
     store.conn.execute("update improve_failures set proposal_id=? where proposal_id is null and cause=?",
                        (proposal_id, cause))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
 
 
 # ------------------------------------------------------------------ proposals
@@ -244,7 +253,8 @@ def is_repeat(d: Delta, rejected: list[dict]) -> bool:
 
 async def propose(trigger: str, evidence: list[dict], playbook: Playbook, *, llm, rejected: list[dict] | None = None,
                   role: str = "advisor") -> Delta | None:
-    """At most one typed delta for `trigger`, or None (no model, no fitting proposal, or a repeat)."""
+    """At most one typed delta for `trigger`, or None (no model, no fitting proposal, or a repeat). LLMUnavailable
+    propagates: the caller keeps the trigger pending instead of treating the silence as "nothing to propose"."""
     if llm is None or playbook.get("prompt.propose") is None:
         return None
     rejected = rejected or []
@@ -257,6 +267,8 @@ async def propose(trigger: str, evidence: list[dict], playbook: Playbook, *, llm
             + wrap_untrusted("\n".join(f"{e.get('ref')} [{e.get('cause')}] {e.get('detail', '')}" for e in evidence[:40])))
     try:
         out = await llm.chat_json(role, playbook.get("prompt.propose").value, user, PROPOSAL_SCHEMA, max_tokens=900)
+    except LLMUnavailable:
+        raise  # no answer at all (model down, swapped out, another workload's model loaded): not "no proposal"
     except LLMError:
         return None
     d = build_delta(out, playbook, trigger)

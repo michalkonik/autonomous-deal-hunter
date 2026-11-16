@@ -3,9 +3,11 @@
 No impersonation, no proxies, no challenge solving.
 
 - Per-domain lock; `min_interval_s` + 0..`jitter_s` between requests (raised to the site's Crawl-delay).
-- Block (403/429 or challenge page): backoff 60 s doubling, cap 1 h; 3 consecutive blocks disable the
-  domain for the session. 5xx / network errors are soft failures: backoff 60 s doubling, cap 15 min,
-  never disable.
+- Block (403 or challenge page): backoff 60 s doubling, cap 1 h; 3 consecutive blocks disable the
+  domain for the session. A bare 429 (rate limit, no challenge) is a SOFT failure, never a block:
+  backoff honours `Retry-After`, doubles 60 s, cap 15 min, and never disables the domain — rate limits
+  recover on their own and must not cost the source for the whole session. 5xx / network errors are
+  soft failures too: backoff 60 s doubling, cap 15 min, never disable.
 - Block state and robots rules are re-checked after acquiring the domain lock, so concurrent callers
   cannot all hit a domain that the first one just found blocked.
 - robots.txt: own RFC 9309-style matcher (UA group selection, `*`, `$`, longest match, Allow wins ties).
@@ -186,6 +188,7 @@ class _Dom:
         self.consecutive_blocks = 0
         self.soft_failures = 0
         self.disabled = False
+        self.disabled_until = 0.0
         self.crawl_delay = 0.0
 
 
@@ -199,6 +202,7 @@ class Fetcher:
         self.backoff_start = float(_opt(c, "backoff_start_s", 60))
         self.backoff_cap = float(_opt(c, "backoff_cap_s", 3600))
         self.disable_after = int(_opt(c, "disable_after_blocks", 3))
+        self.disable_cooldown = float(_opt(c, "disable_cooldown_s", 3600))
         self.robots_ttl = float(_opt(c, "robots_ttl_s", 86400))
         self.user_agent = str(_opt(c, "user_agent", DEFAULT_UA))
         self.max_crawl_delay = float(_opt(c, "max_crawl_delay_s", 60))
@@ -218,6 +222,11 @@ class Fetcher:
 
     def blocked(self, domain: str) -> bool:
         d = self._dom(domain)
+        if d.disabled and self.clock() >= d.disabled_until:
+            # re-enable after the cooldown: one retry chance with a fresh block streak (eBay challenges expire)
+            d.disabled = False
+            d.consecutive_blocks = 0
+            self._health(domain, "re_enabled", f"retry allowed after {self.disable_cooldown:.0f}s disable cooldown")
         return d.disabled or self.clock() < max(d.blocked_until, d.soft_until)
 
     def disabled(self, domain: str) -> bool:
@@ -237,14 +246,26 @@ class Fetcher:
         self._health(domain, "blocked", f"{why}; backoff {delay:.0f}s; consecutive={d.consecutive_blocks}")
         if d.consecutive_blocks >= self.disable_after and not d.disabled:
             d.disabled = True
-            self._health(domain, "disabled", f"disabled for session after {d.consecutive_blocks} consecutive blocks")
+            d.disabled_until = self.clock() + self.disable_cooldown
+            self._health(domain, "disabled", f"disabled after {d.consecutive_blocks} consecutive blocks; "
+                                             f"retry in {self.disable_cooldown:.0f}s")
 
-    def _register_soft(self, domain: str, why: str) -> None:
+    def _register_soft(self, domain: str, why: str, *, respect_after: float | None = None) -> None:
         d = self._dom(domain)
         d.soft_failures += 1
         delay = min(self.backoff_start * 2 ** (d.soft_failures - 1), SOFT_CAP_S)
+        if respect_after is not None:
+            delay = min(max(delay, respect_after), SOFT_CAP_S)
         d.soft_until = self.clock() + delay
         self._health(domain, "soft_backoff", f"{why}; backoff {delay:.0f}s; failures={d.soft_failures}")
+
+    @staticmethod
+    def _retry_after(resp) -> float | None:
+        """Seconds value of `Retry-After` when it is a plain delay (HTTP-date is ignored), clamped to the soft cap."""
+        raw = (resp.headers.get("retry-after") or "").strip()
+        if raw.isdigit():
+            return max(0.0, min(float(raw), SOFT_CAP_S))
+        return None
 
     async def pace(self, domain: str) -> bool:
         """For callers that load a page outside `get` (headless screenshots): wait out the domain's pacing
@@ -262,8 +283,16 @@ class Fetcher:
             return True
 
     def report_block(self, domain: str, why: str) -> None:
-        """A block (403/429/challenge) seen outside `get`: same backoff and health bookkeeping."""
+        """A block (403/challenge, or a 429 seen in a screenshot) outside `get`: block backoff and health
+        bookkeeping. Rate limits seen by `get` itself go through the soft path instead."""
         self._register_block(domain, why)
+
+    def report_ok(self, domain: str) -> None:
+        """A good page load outside `get` (a paced screenshot): resets the block and soft-failure counts exactly as
+        a good response in `get` does. A running backoff is not shortened."""
+        d = self._dom(domain)
+        d.consecutive_blocks = 0
+        d.soft_failures = 0
 
     # --- the one place a request is made ------------------------------------
     async def _locked_request(self, domain: str, url: str, headers: dict | None, *, robots: bool = False) -> _Out:
@@ -294,6 +323,10 @@ class Fetcher:
             d.last_request = self.clock()
             text = r.text
             chal = is_challenge(r.status_code, text)
+            if r.status_code == 429 and not chal:
+                # Bare rate limit: back off (honouring Retry-After) but never count it toward session disable.
+                self._register_soft(domain, "status 429 rate limit", respect_after=self._retry_after(r))
+                return _Out("response", r, block=True)
             if r.status_code in (403, 429) or chal:
                 self._register_block(domain, f"status {r.status_code}" + (" challenge page" if chal else ""))
                 return _Out("response", r, block=True)

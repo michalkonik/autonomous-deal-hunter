@@ -22,7 +22,7 @@ adapters:
       kleinanzeigen: [kleinanzeigen.de, classistatic.de]
       ebay: [ebayimg.com]
   vinted: {enabled: false}
-  ebay: {enabled: true, via: api}   # applies to ebay_de and ebay_pl; disabled at run time without keys (bw-secret ebay#client_id / #client_secret)
+  ebay: {enabled: true, via: api}   # applies to all ebay_* markets (DE, PL + GB, FR, IT, ES, IE, AT, CH, BE); disabled at run time without keys (bw-secret ebay#client_id / #client_secret). Foreign markets return only items the seller ships to PL.
   pepper_pl: {enabled: true, via: rss}
   hotukdeals: {enabled: true, via: rss}
   retail: {enabled: true}
@@ -31,6 +31,8 @@ adapters:
   kleinanzeigen: {enabled: true}
   hardverapro: {enabled: true}
   marktplaats: {enabled: true}
+  2ememain: {enabled: true}
+  tori: {enabled: true}
   # Bazos: search is disallowed by robots.txt; category listing pages only, filtered locally.
   bazos_cz: {enabled: true, pages: 2}
   bazos_sk: {enabled: true, pages: 2}
@@ -50,4 +52,4 @@ retail:
     - {shop: xkom, url: "https://www.x-kom.pl/p/1318534-karta-graficzna-nvidia-gigabyte-geforce-rtx-5070-windforce-oc-12gb-gddr7-dlss5.html"}
     - {shop: xkom, url: "https://www.x-kom.pl/p/1321564-karta-graficzna-amd-gigabyte-radeon-rx-9070-xt-gaming-oc-16gb-gddr6.html"}
     - {shop: xkom, url: "https://www.x-kom.pl/p/1309815-karta-graficzna-nvidia-gigabyte-geforce-rtx-5090-windforce-oc-32gb-gddr7-dlss5.html"}
-retention: {photos_days: 90, snapshots_days: 90}
+retention: {photos_days: 90, snapshots_days: 90}   # photo hashes; raw snapshots and saved alert mails (the daily purge)

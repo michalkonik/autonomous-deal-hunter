@@ -36,6 +36,14 @@ time. They are computed as the union of the ledger's observation windows (`dh/im
 | `query` | `rtx 5070 ti` on `all` sources | arm: schema and must-pass, then probation. The bandit's trial budget and the CUSUM judge it, because replay cannot score a query nobody ran (research §3.3) |
 | `cadence` | minutes between searches of one source | arm: as above |
 
+How the scheduler uses them: `prompt.extract` is the worker's extraction prompt; `prompt.triage` is the senior
+model's **finalist triage** prompt (every candidate that reaches tier 1 or 2 is reviewed before the live re-check
+and the push: ok keeps the tier, suspicious caps it at tier 3, scam excludes it; with no answer the confidence is
+capped at medium, so there is no tier-1 push without a triage). A `cadence` item of C minutes for a source, with
+rounds every R minutes (`scheduler.round_interval_s`): when C > R the source's bandit arms run only in a round at
+least C minutes after the last round that searched them; when C < R its per-round cap
+(`max_searches_per_source`) is multiplied by R / C, up to the budget. Sentinel and feed arms are never affected.
+
 Queries and cadences are never *removed* by a delta: the bandit retires weak arms into its cold pool.
 Every prompt must keep its prompt-injection guard (`<listing>` and "untrusted"). Caps: at most 400 items, a prompt
 at most 1500 characters, other values at most 120.
@@ -58,7 +66,7 @@ at most 1500 characters, other values at most 120.
 4. **replay**: the last 21 days of stored listings are judged again with both playbooks, using cached LLM output
    and no network. The gate rejects if the expected net of tier 1-3 falls more than 5%, if known false positives
    rise, or if a deal you bought or sold is lost.
-5. **owner review** (prompt changes only): `cli_pending` shows the proposed text and `cli_apply(id)` applies it.
+5. **owner review** (prompt changes only): `dh playbook --pending` shows the proposed text and `dh playbook --apply ID` applies it.
    The must-pass set runs again with the LIVE model and the new prompt (a triage change also gets live triage
    verdicts on the scam and true-deal cases). Nothing is promoted if any case fails, if any live call was
    unavailable, or if no case actually reached the changed prompt. The live result is kept in the proposal. A
@@ -121,7 +129,7 @@ time by chance (research §3.1).
   shadow tally (wins, losses, unlabelled), probation hours left and recent events.
 - `dh eval` (`improve.cli_eval`): the must-pass and golden scores of the active playbook. It exits 1 if a must-pass
   case fails.
-- The weekly report (`improve.report.weekly_async`) is published to the log repo. It covers the scoreboard of spec
+- The weekly report (`improve.report.weekly_async`) is published to the log repo (`weekly/`) every 168 watched hours; `dh report --weekly` prints it any time. It covers the scoreboard of spec
   §9.7, the week's proposals (the change, its trigger, the predicted effect and the outcome) and the prediction
   ledger (the share of proposals that passed the gates in 30 days). If that share stays below 20%, reflect less
   often or give the advisor role a stronger model.
@@ -130,19 +138,28 @@ time by chance (research §3.1).
 
 ## Overruling it
 
-- **Label disagreements**: `improve.cli_pending()` lists them. Label one with
-  `improve.cli_label(id, "deal" | "not_deal" | "key:<key>")`. You state the truth and code decides which side was
+- **Label disagreements**: `dh playbook --pending` lists them. Label one with
+  `dh playbook --label ID deal|not_deal|key:<key>`. You state the truth and code decides which side was
   right. Your Bought / Skipped / Sold marks label disagreements automatically. A Skipped mark counts as a
   wrong-deal label only when its reason names the wrongness (scam, box, wrong model, broken...; see
   `evals/labels.py`).
-- **Force a rollback**: `improve.cli_rollback(N)` makes version N active again and aborts any change in flight.
-- **Force maintenance on or off**: `improve.cli_maintenance(True | False)`.
-- **Apply a prompt change**: `improve.cli_apply(id)`, after reading it in `cli_pending`.
+- **Force a rollback**: `dh playbook --rollback N` makes version N active again and aborts any change in flight. A
+  rollback does not cancel an `--apply` still queued: the reply warns and names it (it would be re-applied on top
+  of version N at the next round, after its live must-pass).
+- **Force maintenance on or off**: `dh playbook --maintenance on|off`.
+- **Apply a prompt change**: `dh playbook --apply ID`, after reading it in `--pending`. It needs the running agent (the must-pass set is re-checked with the live model); with the agent stopped the command refuses. A
+  queued apply that has not run within `improve.apply_expiry_days` (7) days is dropped with an "expired" result;
+  the proposal keeps waiting for review.
 - `dh status` and every other read never write: the controller is read-only until a round or an owner command
   runs. An applied command is marked in the same commit that saves its effect.
+- **One writer.** Only the process holding the agent lock (`var/run/agent.lock`, a kernel `flock`) ever changes
+  the loop's state: the running agent (`dh start`), a foreground `dh round`, or a CLI command applying the queue
+  when no agent runs. A starting agent waits for such a CLI command to finish (it marks the lock as `cli`), but gives
+  up after 30 s when another agent holds it. Each controller step is one database transaction. The playbook file is rewritten only over
+  the loop's own previous content, never over an edit you saved meanwhile.
 - These owner commands are **queued** (`improve_commands`). The running agent applies them at the start of its
   next round, and again just before saving if one arrives mid-round. When the agent is stopped, the CLI applies
-  them at once. The controller's state is saved with a compare-and-swap, so no command is ever overwritten.
+  them at once (except `--apply`, which refuses). The controller's state is saved with a compare-and-swap, so no command is ever overwritten.
 - **Edit `playbook/items.yaml` by hand** if you like. The next round notices that the file matches no stored
   version and records it as a new baseline version (note "owner edit", or "owner revert to vN" when you put back
   an older version). It aborts any change in flight, logs a health event and carries on, all in one commit. A

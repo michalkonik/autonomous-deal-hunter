@@ -46,6 +46,10 @@ gpu:
   - {id: rtx-5080, vram: [16], default_vram: 16}
   - {id: rtx-5090, vram: [32], default_vram: 32}
   - {id: rtx-5090d, vram: [32], default_vram: 32}
+  # ---- NVIDIA RTX 60 (next generation; VRAM per the pre-launch leaks, widen at launch if a new ship variant appears)
+  - {id: rtx-6070, vram: [12, 16], default_vram: 12}
+  - {id: rtx-6080, vram: [20, 24], default_vram: 20}
+  - {id: rtx-6090, vram: [32], default_vram: 32}
   # ---- AMD RX 6000
   - {id: rx-6400, vram: [4], default_vram: 4}
   - {id: rx-6500-xt, vram: [4, 8], default_vram: 4}

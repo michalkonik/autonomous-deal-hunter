@@ -98,6 +98,43 @@ def test_ebay_parses_fixture():
     assert a.posted_at == datetime(2026, 10, 27, 8, 15, tzinfo=timezone.utc)
 
 
+def test_ebay_variation_listing_priced_at_highest_option(store):
+    """Trap: title advertises the strongest option but the search price is the cheapest one (Koniu's FIFFEX
+    screenshot: 'RTX 5090' at 2399 while the 5090 option costs 6699). The group endpoint must re-price."""
+    async def req(method, url, headers, data, timeout):
+        if "oauth2/token" in url:
+            return 200, json.dumps({"access_token": "tok", "expires_in": 7200})
+        if "get_items_by_item_group" in url:
+            assert "item_group_id=999000111222" in url and headers["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_DE"
+            return 200, fixture_text("ebay", "group_de.json")
+        return 200, fixture_text("ebay", "search_variations_de.json")
+
+    async def nosleep(_): pass
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=KEYS.get, client=ebay.ApiClient(req, min_interval_s=0, sleep=nosleep))
+    ls = run(ad.search(Query(text="gaming pc"), StoreFetcher(store)))
+    v = next(l for l in ls if l.source_id == "v1|999000111222|616564534592")
+    assert v.price == Decimal("6699.00") and v.currency == "EUR"
+    assert "variation listing verified: 3 options, price set to the highest option 6699.00 EUR" in v.description
+    plain = next(l for l in ls if l.source_id == "v1|314159265358|0")
+    assert "variation" not in plain.description and plain.price == Decimal("1549.00")
+
+
+def test_ebay_variation_group_check_failure_keeps_warning(store):
+    async def req(method, url, headers, data, timeout):
+        if "oauth2/token" in url:
+            return 200, json.dumps({"access_token": "tok", "expires_in": 7200})
+        if "get_items_by_item_group" in url:
+            return 400, '{"error": "not a group"}'
+        return 200, fixture_text("ebay", "search_variations_de.json")
+
+    async def nosleep(_): pass
+    ad = ebay.EbayBrowse("EBAY_DE", secret_fn=KEYS.get, client=ebay.ApiClient(req, min_interval_s=0, sleep=nosleep))
+    ls = run(ad.search(Query(text="gaming pc"), StoreFetcher(store)))
+    v = next(l for l in ls if l.source_id == "v1|999000111222|616564534592")
+    assert v.price == Decimal("2399.00")  # untouched
+    assert "price may be for the cheapest option" in v.description  # the extractor/LLM still sees the warning
+
+
 def test_ebay_search_sends_token_marketplace_and_filter(store):
     rec = Recorder()
     ad = ebay.EbayBrowse("EBAY_PL", secret_fn=KEYS.get, client=_client(rec))
@@ -434,8 +471,84 @@ def test_bw_secret_cached_per_process(monkeypatch):
     ("Karta od 3 999 zł do 2 899 zł", Decimal("2899")),
     ("Karta za 2 899 zł (było 3 999 zł)", Decimal("2899")),
     ("Karta (było 3 999 zł) teraz 2 899 zł", Decimal("2899")),
-    ("Monitor 1 299 zł, kod -10% do 100 zł", Decimal("100")),
+    ("Monitor 1 299 zł, kod -10% do 100 zł", Decimal("1299")),  # "do 100 zł" is the coupon's cap, not the price
     ("Karta z 3 999 zł do 2 899 zł", Decimal("2899")),
     ("Karta 2 899 zł", Decimal("2899"))])
 def test_rss_title_price_prefers_deal_price(title, expected):
     assert rss.title_price(title, "PLN")[0] == expected
+
+
+@pytest.mark.parametrize("title,expected", [
+    # the old-price words need a word boundary: "prize"/"Größe ze" endings, "canvas" are not "ze"/"was"
+    ("Grand prize 499 zł RTX 4070", Decimal("499")),
+    ("Canvas 199 zł", Decimal("199")),
+    ("Etui Größe 99 zł", Decimal("99")),
+    ("Karta ze 3 999 zł teraz 2 899 zł", Decimal("2899")),  # a real "ze" old price still loses
+    ("Karta was 3 999 zł now 2 899 zł", Decimal("2899")),
+    # coupon caps and discount amounts are never the price
+    ("Kupon -20% do 100 zł na RTX 4070 Super", None),
+    ("Kod rabatowy 15% do 300 zł na karty graficzne", None),
+    ("RTX 4070 Super 2 499 zł + kupon -10% do 200 zł", Decimal("2499")),
+    ("RTX 4070 za 2 499 zł, rabat 100 zł z kodem", Decimal("2499")),
+    ("Cashback 200 zł na RTX 5070", None),
+    ("15% off up to £50 on graphics cards", None),
+    ("Karta od 3 999 zł do 2 899 zł", Decimal("2899")),  # a plain "do" after a price range is the deal price
+])
+def test_rss_title_price_word_boundaries_and_coupons(title, expected):
+    r = rss.title_price(title, "GBP" if "£" in title else "PLN")
+    assert (r[0] if r else None) == expected, title
+
+
+def test_prefetch_resolves_ebay_keys_in_parallel_once_per_run(monkeypatch):
+    """Profiling: two sequential `bw-secret` calls (~4.8 s each with no item) blocked a round's event loop for
+    ~9.6 s. build_context now prefetches both refs in parallel threads; `enabled` then reads the cache."""
+    import threading
+    import time
+    calls, active, peak = [], [0], [0]
+    lock = threading.Lock()
+
+    def slow(ref):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        time.sleep(0.3)
+        with lock:
+            active[0] -= 1
+        calls.append(ref)
+        return {"ebay#client_id": "cid", "ebay#client_secret": "sec"}[ref]
+    monkeypatch.setattr("dh.notify.bw_secret", slow)
+    t0 = time.monotonic()
+    ebay.prefetch_secrets()
+    assert time.monotonic() - t0 < 0.55 and peak[0] == 2  # both at once
+    assert sorted(calls) == ["ebay#client_id", "ebay#client_secret"]
+    assert ebay.EbayBrowse("EBAY_DE").enabled is True and ebay.EbayBrowse("EBAY_PL").enabled is True
+    ebay.prefetch_secrets()
+    assert len(calls) == 2  # cached: not asked again
+
+
+def test_build_context_prefetches_the_ebay_keys(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from dh import config, runtime
+    seen = []
+    monkeypatch.setattr(ebay, "prefetch_secrets", lambda *a, **k: seen.append(1))
+    repo = Path(__file__).resolve().parents[2]
+    st = Store(tmp_path / "t.db")
+    try:
+        runtime.build_context(config.load(repo), tmp_path, st, fetcher=None, no_llm=True)
+    finally:
+        st.close()
+    assert seen == [1]
+
+
+def test_ebay_ship_to_pl_filter_on_foreign_markets(store):
+    """Every non-PL market filters to items the seller ships to Poland; PL itself does not need it."""
+    from urllib.parse import parse_qs as pq, urlsplit as us
+    rec = Recorder()
+    ad = ebay.EbayBrowse("EBAY_GB", secret_fn=KEYS.get, client=_client(rec))
+    run(ad.search(Query(text="rtx 4090"), StoreFetcher(store)))
+    assert pq(us(rec.calls[-1][1]).query)["filter"] == ["itemLocationCountry:GB,deliveryCountry:PL,buyingOptions:{FIXED_PRICE}"]
+    for cc, cn in (("EBAY_FR", "FR"), ("EBAY_CH", "CH")):
+        flt = pq(us(ebay.EbayBrowse(cc).search_url(Query(text="x"))).query)["filter"][0]
+        assert flt == f"itemLocationCountry:{cn},deliveryCountry:PL,buyingOptions:{{FIXED_PRICE}}"
+    assert "deliveryCountry" not in ebay.EbayBrowse("EBAY_PL").search_url(Query(text="x"))

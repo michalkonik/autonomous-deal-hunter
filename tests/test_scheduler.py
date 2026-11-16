@@ -13,12 +13,13 @@ from dh import config, ledger, scheduler
 from dh.bandit import Bandit
 from dh.models import Listing
 from dh.money import Fx
+from dh.playbook_io import load_items
 from dh.sources.base import Adapter, AdapterError, Query
 from dh.store import Store
 
 REPO = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
-RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90"}
+RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90", "CHF": "4.55"}
 KEY = "gpu:rtx-3060:12"
 
 
@@ -90,13 +91,24 @@ class FakeAdapter(Adapter):
         return ok, (listing.price if price is None and ok else price)
 
 
+TRIAGE_OK = {"verdict": "ok", "p_scam": 0.02, "reasons": []}
+
+
 class FakeLLM:
-    def __init__(self, reply, senior=None):
-        self.reply, self.senior, self.calls = reply, senior, []
+    """`reply` for extraction, `senior` for the senior confirm pass, `triage` for the finalist triage (a schema with a
+    `verdict`). Triage calls are kept apart (`triage_calls`) so extraction-call counts stay as they were."""
+
+    def __init__(self, reply, senior=None, triage=TRIAGE_OK):
+        self.reply, self.senior, self.triage, self.calls, self.triage_calls = reply, senior, triage, [], []
 
     async def chat_json(self, role, system, user, schema, max_tokens=600):
-        self.calls.append((role, user))
         assert "<listing>" in user
+        if "verdict" in (schema.get("properties") or {}):
+            self.triage_calls.append((role, user, system))
+            if isinstance(self.triage, Exception):
+                raise self.triage
+            return dict(self.triage)
+        self.calls.append((role, user))
         return dict(self.senior if role == "senior" and self.senior is not None else self.reply)
 
 
@@ -162,7 +174,8 @@ async def test_round_pipeline_with_fakes(tmp_path):
     assert ad.searches == ["rtx 3060"]
     assert stats.listings_seen == 1 and stats.candidates == 1
     assert len(llm.calls) == 1 and llm.calls[0][0] == "worker"  # rules certainty 0.7 -> LLM; 0.8 < 0.85: no confirm
-    assert stats.llm_calls == 1
+    assert len(llm.triage_calls) == 1 and llm.triage_calls[0][0] == "senior"  # tier 2: the finalist triage
+    assert stats.llm_calls == 2 and stats.triage == {"keep": 1}
     assert stats.deals_by_tier == {2: 1}, stats.deals
     d = st.deals()[0]
     assert d.tier == 2 and d.key == KEY and d.confidence == "medium" and d.effort == "easy"
@@ -445,7 +458,9 @@ async def test_partout_values_pc_bundle(tmp_path, monkeypatch):
     assert llm.calls == []  # the product extractor is not asked about whole PCs
     assert stats.partout == 1
     d = ctx.store.deals()[0]
-    assert d.key == "pc:bundle" and d.effort == "heavy" and d.tier == 3  # 3 parts -> heavy; certainty 0.5 -> low
+    assert d.key == "pc:bundle" and d.tier == 3  # 3 parts -> heavy; certainty 0.5 -> low
+    # allegro_lokalnie ships inside PL: the direct-to-PL bonus eases heavy -> moderate (owner 2026-11-07)
+    assert d.effort == "moderate" and d.ship_pl == 1
     assert sorted(json.loads(d.evidence_json)["components"]) == ["cpu:ryzen-5-5600", "gpu:rtx-3060:12",
                                                                  "ram:ddr4:16:2x8"]
 
@@ -506,9 +521,10 @@ async def test_rules_only_evaluation_is_redone_when_the_llm_is_back(tmp_path):
 
 # ------------------------------------------------------------------------------------------------ review fix round 1
 
-def tier1_ctx(tmp_path, ad, llm=None, **kw):
-    """Comps for a verified tier-1 RTX 3060 at 6400 PLN (see test_tier1_push_and_screenshot_when_not_dry)."""
-    ctx = make_ctx(tmp_path, ad, llm, dry=False, **kw)
+def tier1_ctx(tmp_path, ad, llm="fake", **kw):
+    """Comps for a verified tier-1 RTX 3060 at 6400 PLN (see test_tier1_push_and_screenshot_when_not_dry). The LLM
+    defaults to a fake whose finalist triage says ok: without a triage there is no tier 1 (final review I4)."""
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060) if llm == "fake" else llm, dry=False, **kw)
     for i in range(14):
         ctx.store.add_comp(KEY, "used", "olx", Decimal("9000") + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
     return ctx
@@ -549,7 +565,7 @@ async def test_retier_updates_the_deal_and_pushes_once(tmp_path):
     """Important 1: valued with the LLM off -> tier 3; the LLM confirms the key next round -> the SAME deal row
     becomes tier 1, is pushed once; later rounds never push it again."""
     ad = FakeAdapter([listing("5", "RTX 3060 używana", "6400")])  # rules certainty 0.7
-    ctx = tier1_ctx(tmp_path, ad)
+    ctx = tier1_ctx(tmp_path, ad, llm=None)
     s1 = await scheduler.run_round(ctx)
     d1 = ctx.store.deals()
     assert [d.tier for d in d1] == [3] and ctx.pushes == [], s1.deals
@@ -776,7 +792,7 @@ async def test_tier1_push_is_queued_when_the_round_is_cancelled_after_reservatio
     rows = ctx.store.conn.execute("select payload from pending_pushes").fetchall()
     assert len(rows) == 1
     payload = json.loads(rows[0]["payload"])
-    assert payload["headers"]["Click"].startswith("https://fake.test/oferta/5") and "rtx-3060" in payload["headers"]["Title"]
+    assert payload["headers"]["Click"].startswith("https://fake.test/oferta/5") and "RTX 3060 12GB" in payload["headers"]["Title"]
     assert ctx.store.conn.execute("select count(*) from deal_pushes").fetchone()[0] == 1
 
 
@@ -835,3 +851,616 @@ def test_rules_extract_gets_the_round_root(tmp_path, monkeypatch):
     seed_comps(ctx.store)
     asyncio.run(scheduler.run_round(ctx))
     assert seen and all(r == ctx.root for r in seen)
+
+
+# ------------------------------------------------------------------------------------------------ fix wave A
+
+
+def _with(ctx, **sections):
+    data = ctx.cfg.to_dict()
+    for k, v in sections.items():
+        data[k] = {**data.get(k, {}), **v}
+    ctx.cfg = config.Config(data, REPO)
+    return ctx
+
+
+def test_pickup_origin_comes_from_config(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    l = Listing(**{**listing().__dict__, "pickup_only": True, "lat": 50.0647, "lon": 19.9450})
+    assert scheduler._Round(ctx)._shipping(l, "gpu")[2] == 0.0  # default origin: Krakow
+    _with(ctx, pickup={"origin": {"name": "Warszawa", "lat": 52.2297, "lon": 21.0122}})
+    km = scheduler._Round(ctx)._shipping(l, "gpu")[2]
+    assert 245 < km < 260
+
+
+async def test_retention_keys_drive_the_daily_purge(tmp_path):
+    ad = FakeAdapter([])
+    ctx = make_ctx(tmp_path, ad, None)
+    _with(ctx, sources={"retention": {"photos_days": 30, "snapshots_days": 45}})
+    from dh import photos
+    photos.ensure_schema(ctx.store)
+    for i, days in enumerate((40, 20)):  # 40 d old: purged at 30; 20 d old: kept
+        ctx.store.conn.execute("insert into photo_hashes (listing_id, seller_hash, phash, seen_at) values (?,?,?,?)",
+                               (i, "s", f"{i:04x}", (NOW - timedelta(days=days)).isoformat()))
+    ctx.store.conn.commit()
+    s = await scheduler.run_round(ctx)
+    assert s.maintenance["photo_hashes"] == 1 and ctx.fetcher.purges == [45]
+    assert ctx.store.conn.execute("select count(*) from photo_hashes").fetchone()[0] == 1
+
+
+def test_retention_alias_and_defaults():
+    base = config.load(REPO)
+    assert scheduler.retention_days(base) == (90, 90)
+    d = base.to_dict()
+    d["sources"] = {k: v for k, v in d["sources"].items() if k != "retention"}
+    d["scheduler"] = {**d["scheduler"], "retention_days": 60}  # the old key: an alias when sources.retention is absent
+    assert scheduler.retention_days(config.Config(d, REPO)) == (60, 60)
+
+
+def test_bandit_settings_come_from_scheduler_config(tmp_path):
+    from dh import runtime
+    base = config.load(REPO)
+    assert scheduler.bandit_kwargs(base) == {"gamma": 0.98, "floor": 0.10, "prior": (1.0, 10.0), "new_pulls": 3}
+    d = base.to_dict()
+    d["scheduler"] = {**d["scheduler"], "bandit": {"gamma": 0.9, "floor": 0.2, "prior": [2, 5]}}
+    c = config.Config(d, REPO)
+    ctx = runtime.build_context(c, tmp_path, Store(tmp_path / "b.db"), fetcher=None, no_llm=True)
+    b = ctx.bandit
+    assert (b.gamma, b.floor, b.prior, b.new_pulls) == (0.9, 0.2, (2.0, 5.0), 3)
+
+
+def test_trend_signal_rules():
+    rules = config.load(REPO).rules
+    sc = scheduler.sched_cfg(config.load(REPO))
+    t = scheduler.trend_signal(0.20, "10", "1000", "high", rules, sc, 50)
+    assert t.tier == 4 and not t.star and "trend" in t.reasons[0]
+    assert scheduler.trend_signal(0.149, "10", "1000", "high", rules, sc) is None  # below +15%
+    assert scheduler.trend_signal(None, "10", "1000", "high", rules, sc) is None
+    assert scheduler.trend_signal(0.3, "-1", "1000", "high", rules, sc) is None  # losing money
+    assert scheduler.trend_signal(0.3, "10", "1000", "excluded", rules, sc) is None
+    assert scheduler.trend_signal(0.3, "10", "99999", "high", rules, sc) is None  # over the capital cap
+
+
+async def test_rising_market_makes_a_below_floor_listing_a_tier_4_trend_deal(tmp_path, monkeypatch):
+    ad = FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1380")])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    s0 = await scheduler.run_round(ctx)
+    assert ctx.store.deals() == [], s0.dropped  # below the floor: not logged
+    ctx2 = make_ctx(tmp_path / "b", FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1380")]),
+                    FakeLLM(LLM_3060))
+    seed_comps(ctx2.store)
+    _with(ctx2, scheduler={"trend": {"min_30d": 0.15, "min_cons_net_usd": -100000}})
+    import dataclasses
+    real = scheduler._Round._estimate
+
+    def rising(self, *a, **kw):
+        e = real(self, *a, **kw)
+        return None if e is None else dataclasses.replace(e, trend_30d=0.3)
+    monkeypatch.setattr(scheduler._Round, "_estimate", rising)
+    await scheduler.run_round(ctx2)
+    ds = ctx2.store.deals()
+    assert [d.tier for d in ds] == [4] and any(r.startswith("trend:") for r in ds[0].reasons)
+
+
+class KleinanzeigenFake(FakeAdapter):
+    name, domain = "kleinanzeigen", "ka.test"
+
+
+async def test_mailbox_kleinanzeigen_listing_is_detailed_and_verified_by_the_real_adapter(tmp_path):
+    ka = Listing(**{**listing("m1", "RX 6800 używana", "900").__dict__, "source": "kleinanzeigen",
+                    "url": "https://www.kleinanzeigen.de/s-anzeige/m1"})
+    olx = Listing(**{**listing("m2", "RX 6800 używana", "900").__dict__, "source": "olx",
+                     "url": "https://www.olx.pl/d/oferta/m2"})
+    real = KleinanzeigenFake([], alive=(True, Decimal("900")))
+    ctx = make_ctx(tmp_path, real, None, items=[])
+    mail = FakeMail([ka], ctx.store)
+    ctx.adapters["mailbox"] = mail
+    for i in range(10):
+        ctx.store.add_comp(RX, "used", "olx", Decimal("1400") + i, NOW - timedelta(days=1 + i), "owner_sale", f"r:{i}")
+    real_detail_calls = []
+    orig = real.detail
+
+    async def spy(listing, fetcher):
+        real_detail_calls.append(listing.source)
+        return await orig(listing, fetcher)
+    real.detail = spy
+    await scheduler.run_round(ctx)
+    d = ctx.store.deals()[0]
+    assert real_detail_calls == ["kleinanzeigen"] and real.alive_calls == 1
+    assert d.verified_at is not None  # verified through the real adapter
+    # an OLX alert stays unverifiable: no detail, no alive, never verified
+    ctx2 = make_ctx(tmp_path / "o", real, None, items=[])
+    mail2 = FakeMail([olx], ctx2.store)
+    ctx2.adapters["mailbox"] = mail2
+    for i in range(10):
+        ctx2.store.add_comp(RX, "used", "olx", Decimal("1400") + i, NOW - timedelta(days=1 + i), "owner_sale", f"r:{i}")
+    real_detail_calls.clear()
+    await scheduler.run_round(ctx2)
+    assert real_detail_calls == [] and ctx2.store.deals()[0].verified_at is None
+
+
+# ------------------------------------------------------------------------------------------------ final review I2
+
+
+class _Nbp:
+    """NBP fake whose table for `today` is published only when `published` is set (a different rate)."""
+
+    def __init__(self, today):
+        self.today, self.published = today, False
+        self.old = {"USD": "3.70", "EUR": "4.25"}
+        self.new = {"USD": "3.80", "EUR": "4.40"}
+
+    async def __call__(self, url: str):
+        ccy = url.split("/rates/a/")[1].split("/")[0].upper()
+        day = url.split("/rates/a/")[1].split("/")[1]
+        if day == self.today.isoformat():
+            if not self.published:
+                return 404, "Not Found"
+            return 200, json.dumps({"rates": [{"mid": self.new.get(ccy, RATES[ccy])}]})
+        return 200, json.dumps({"rates": [{"mid": self.old.get(ccy, RATES[ccy])}]})
+
+
+async def test_verify_replays_the_rates_the_deal_was_valued_with(tmp_path):
+    """I2: valued before NBP published today's table (yesterday's rate served, not pinned); after the table appears,
+    `dh verify` must still recompute the same net from the evidence's recorded rates."""
+    from datetime import date
+
+    from dh import cards, verify
+    eur = listing("7", "Gigabyte RTX 3060 Gaming OC używana", "165")
+    eur.currency = "EUR"
+    ad = FakeAdapter([eur])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    nbp2 = _Nbp(date.today())
+    ctx.fx = Fx(ctx.store, http=nbp2)
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    ev = json.loads(d.evidence_json)
+    assert json.loads(d.evidence_json)["net_inputs"]["buy_ccy"] == "EUR"
+    got = {(r["currency"], r["day"]): (r["rate"], r["effective_date"]) for r in ev["fx_rates"]}
+    t = date.today()
+    assert got[("EUR", t.isoformat())] == ("4.25", (t - timedelta(days=1)).isoformat())
+    assert got[("USD", t.isoformat())][0] == "3.70"
+    assert ev["fx_usd"] == {"rate": "3.70", "date": (t - timedelta(days=1)).isoformat()}
+    md, data = cards.from_deal(d)
+    assert "3.70 PLN per USD" in md and data["fx_usd"]["rate"] == "3.70"
+
+    nbp2.published = True  # NBP publishes today's table: live rates move
+    fresh = Fx(ctx.store, http=nbp2)
+    assert await fresh.rate("EUR", t) == Decimal("4.40")
+    res = await verify.verify_deal(ctx.store, d.id, ctx.cfg, fresh, None, {ad.name: ad}, ctx.fetcher)
+    assert res.ok, res.diffs
+    assert res.net_now_cons_pln == d.cons_net_pln
+
+
+def test_round_today_is_the_local_date_like_fx(tmp_path, monkeypatch):
+    """Minor: Fx pins by the LOCAL date (date.today()); the round's `today` must be the same local date, not UTC."""
+    import time as _time
+    monkeypatch.setenv("TZ", "Europe/Warsaw")
+    _time.tzset()
+    try:
+        ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+        ctx.now = lambda: datetime(2026, 10, 29, 23, 30, tzinfo=timezone.utc)  # 00:30 on the 30th in Warsaw
+        from datetime import date
+        assert scheduler._Round(ctx).today == date(2026, 10, 30)
+    finally:
+        monkeypatch.delenv("TZ")
+        _time.tzset()
+
+
+# ------------------------------------------------------------------------------------------------ final review I4
+
+
+async def test_finalist_triage_keep_demote_exclude(tmp_path):
+    """I4b: a tier <= 2 candidate is reviewed by the senior model (prompt.triage, listing in <listing>) BEFORE the live
+    re-check and the push: ok keeps the tier, suspicious caps it at 3, scam is a hard exclude with reason triage."""
+    for verdict, want in (("ok", 1), ("suspicious", 3), ("scam", None)):
+        ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+        llm = FakeLLM(LLM_3060, triage={"verdict": verdict, "p_scam": 0.4, "reasons": ["price far below market"]})
+        ctx = tier1_ctx(tmp_path / verdict, ad, llm)
+        st = await scheduler.run_round(ctx)
+        assert len(llm.triage_calls) == 1
+        role, user, system = llm.triage_calls[0]
+        assert role == "senior" and user.startswith("<listing>") and "RTX 3060 12GB" in user
+        assert system == next(i for i in load_items(REPO) if i["id"] == "prompt.triage")["value"]
+        deals = ctx.store.deals()
+        if want is None:
+            assert deals == [] and st.dropped.get("triage_exclude") == 1 and ctx.pushes == []
+            assert ad.alive_calls == 0  # excluded BEFORE the live re-check
+            continue
+        [d] = deals
+        assert d.tier == want, (verdict, d.tier, d.reasons)
+        assert len(ctx.pushes) == (1 if want == 1 else 0)
+        ev = json.loads(d.evidence_json)
+        assert ev["triage"]["verdict"] == {"ok": "keep", "suspicious": "demote"}[verdict]
+        from dh import cards
+        md, data = cards.from_deal(d)
+        assert "Triage" in md and data["triage"]["verdict"] == ev["triage"]["verdict"]
+        if want == 3:
+            assert any("triage" in r for r in d.reasons) and "price far below market" in md
+
+
+async def test_triage_unavailable_caps_confidence_at_medium(tmp_path):
+    """I4b: no triage (LLM error, no LLM) -> the tier stands but confidence is at most medium: never a tier-1 push."""
+    from dh.llm import LLMError
+    for name, llm in (("error", FakeLLM(LLM_3060, triage=LLMError("down"))), ("malformed", FakeLLM(LLM_3060, triage={"x": 1})),
+                      ("nollm", None)):
+        ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+        ctx = make_ctx(tmp_path / name, ad, llm, dry=False)
+        for i in range(14):
+            ctx.store.add_comp(KEY, "used", "olx", Decimal("9000") + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
+        await scheduler.run_round(ctx)
+        [d] = ctx.store.deals()
+        assert d.tier == 2 and d.confidence == "medium" and ctx.pushes == [], (name, d.tier, d.confidence)
+        assert json.loads(d.evidence_json)["triage"]["verdict"] == "unavailable"
+
+
+async def test_triage_result_is_reused_for_the_same_title_and_price(tmp_path):
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+    llm = FakeLLM(LLM_3060)
+    ctx = tier1_ctx(tmp_path, ad, llm, reeval_hours=0)
+    await scheduler.run_round(ctx)
+    await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 1
+
+
+def _cadence_items(minutes):
+    from dh.improve.playbook import Item, Playbook
+    q = [{"id": "q.rtx3060", "kind": "query", "target": "all", "value": "rtx 3060", "sentinel": False}]
+    if minutes is None:
+        return q
+    pb = Playbook.from_file(REPO)
+    item = Item("cadence.allegro_lokalnie", "cadence", "allegro_lokalnie", minutes)
+    # an owner may already carry a cadence item for this source in playbook/items.yaml: overwrite it instead of
+    # adding a second one ("add: item exists" is a PlaybookError, and the test is about the value, not the op)
+    pb = pb.apply(pb.make_delta("update" if pb.get(item.id) else "add", item))
+    return q + [i for i in pb.as_dicts() if i["kind"] == "cadence"]
+
+
+async def test_promoted_cadence_item_spaces_the_sources_searches(tmp_path):
+    """I4a: a cadence item (minutes between searches of a source) makes the plan skip the source's bandit arms until
+    that many minutes passed since its last searched round."""
+    t0 = datetime.now(timezone.utc)
+    clock = {"t": t0}
+    for minutes, expected in ((None, [1, 1, 1]), (30, [1, 0, 1])):
+        ad = FakeAdapter([])
+        ctx = make_ctx(tmp_path / str(minutes), ad, None, items=_cadence_items(minutes))
+        ctx.now = lambda: clock["t"]
+        ran = []
+        for dt in (0, 10, 31):
+            clock["t"] = t0 + timedelta(minutes=dt)
+            before = len(ad.searches)
+            st = await scheduler.run_round(ctx)
+            ran.append(len(ad.searches) - before)
+        assert ran == expected, (minutes, ran)
+        if minutes:
+            assert st.cadence == {"allegro_lokalnie": {"minutes": 30, "due": True, "cap": 10}}
+
+
+async def test_fast_cadence_raises_the_sources_per_round_cap(tmp_path):
+    """I4a: a cadence shorter than the round interval multiplies the source's per-round search cap."""
+    qs = [{"id": f"q{i}", "kind": "query", "target": "all", "value": f"rtx 30{i:02d}", "sentinel": False} for i in range(30)]
+    for minutes, want in ((None, 10), (5, 20)):  # round_interval_s 600 = 10 min: cadence 5 min -> x2
+        items = qs + ([] if minutes is None else [{"id": "cadence.al", "kind": "cadence", "target": "allegro_lokalnie",
+                                                   "value": minutes}])
+        ad = FakeAdapter([])
+        ctx = make_ctx(tmp_path / str(minutes), ad, None, items=items, budget=40, budget_max=40)
+        await scheduler.run_round(ctx)
+        assert len(ad.searches) == want, (minutes, len(ad.searches))
+
+
+# ------------------------------------------------------------------------------------------------ final review I5
+
+
+def _bulk_market(st, n=2000, gone_share=0.3):
+    """n saleable listings of KEY on olx (PLN) seen over the last 25 days, a share of them disappeared in the last
+    3 days after a 2-day life (so clears_at has probably-sold rows), each with two observations."""
+    import random as _r
+    ledger.migrate(st)
+    rnd = _r.Random(7)
+    now = NOW
+    rows, ex, obs = [], [], []
+    for i in range(n):
+        first = now - timedelta(days=rnd.uniform(3, 25))
+        gone = i < n * gone_share
+        last = now - timedelta(days=rnd.uniform(0, 2.5)) if gone else now - timedelta(minutes=rnd.uniform(1, 600))
+        price = Decimal(1300 + rnd.randint(0, 300))
+        dis = last if gone else None
+        appeared = (dis - timedelta(days=2)) if gone else None
+        rows.append((i + 1, "olx", f"b{i}", f"https://olx.pl/d/{i}", "RTX 3060 12GB", "", str(price), "PLN", "PL",
+                     "Krakow", f"s{i}", first.isoformat(), last.isoformat(), None if dis is None else dis.isoformat(),
+                     None if appeared is None else appeared.isoformat()))
+        ex.append((i + 1, KEY, "gpu", 0.95, "used", "[]", 0, 0, 0, "[]", "rules"))
+        obs.append((i + 1, str(price + 50), first.isoformat()))
+        obs.append((i + 1, str(price), (first + (last - first) / 2).isoformat()))
+    st.conn.executemany(
+        "insert into listings (id, source, source_id, url, title, description, price, currency, country, city, "
+        "seller_hash, first_seen_at, last_seen_at, disappeared_at, appeared_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        rows)
+    st.conn.executemany("insert into extractions (listing_id, key, category, certainty, condition, defects, box_only, "
+                        "for_parts, wanted_ad, bundle_items, method) values (?,?,?,?,?,?,?,?,?,?,?)", ex)
+    st.conn.executemany("insert into observations (listing_id, price, seen_at) values (?,?,?)", obs)
+    st.conn.commit()
+
+
+async def test_estimate_phase_is_fast_with_a_large_ledger(tmp_path):
+    """I5 benchmark: 2,000 listings of one key, 100 candidates. The ledger comps (clears_at, active asks) are
+    computed once per (key, condition) per round and the median asks come from one index per (key, currency); the
+    estimate phase stays within a few seconds (it was O(candidates x disappeared x listings) queries)."""
+    import time as _time
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    _bulk_market(ctx.store)
+    r = scheduler._Round(ctx)
+    await r._warm_rates()
+    lids = [row[0] for row in ctx.store.conn.execute(
+        "select id from listings where disappeared_at is null order by id limit 100")]
+    t0 = _time.monotonic()
+    limit = 5.0
+    ests = []
+    for lid in lids:
+        for ch in r.enabled_channels:
+            ests.append(r._estimate(KEY, "used", ch, lid))
+        assert _time.monotonic() - t0 < limit, f"estimate phase too slow: {len(ests)} estimates in {limit:.0f} s"
+    took = _time.monotonic() - t0
+    print(f"estimate phase: {len(ests)} estimates for {len(lids)} candidates in {took:.2f} s")
+    assert took < limit, took
+    e = next(x for x in ests if x is not None)
+    kinds = {c.kind for c in e.comps}
+    assert {"probably_sold", "active_ask"} <= kinds, kinds
+
+
+async def test_cached_ledger_rows_give_the_same_estimate_and_drop_the_candidate(tmp_path):
+    """I5: the per-round ledger cache must not change an estimate, and a candidate is never its own comparable."""
+    from dh import valuation
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    _bulk_market(ctx.store, n=120)
+    r = scheduler._Round(ctx)
+    lid = ctx.store.conn.execute("select id from listings where disappeared_at is null limit 1").fetchone()[0]
+    for ch in ("olx", "allegro"):
+        fresh = valuation.estimate(ctx.store, KEY, "used", ch, ctx.now(), params=r.params, channels=r.channels,
+                                   exclude_listing_ids=[lid])
+        cached = r._estimate(KEY, "used", ch, lid)
+        assert (fresh is None) == (cached is None)
+        if fresh is not None:
+            assert (fresh.p25_pln, fresh.median_pln, fresh.p75_pln, fresh.n_effective, len(fresh.comps)) == \
+                   (cached.p25_pln, cached.median_pln, cached.p75_pln, cached.n_effective, len(cached.comps))
+            assert f"https://olx.pl/d/{lid - 1}" not in {c.ref for c in cached.comps}
+
+
+def test_median_ask_index_matches_the_reference(tmp_path):
+    """I5: the indexed median ask (one load per key and currency) equals the per-call SQL computation."""
+    st = Store(tmp_path / "t.db")
+    _bulk_market(st, n=300)
+    cache: dict = {}
+    for h in (1, 10, 30, 70, 200, 500):
+        t = NOW - timedelta(hours=h)
+        assert ledger.median_ask(st, KEY, "PLN", t, ledger.ASK_WINDOW, cache=cache) == \
+               ledger._median_ask(st, KEY, "PLN", t, ledger.ASK_WINDOW)
+
+
+# ------------------------------------------------------------------------------------------------ minor: gone
+
+
+async def test_deal_whose_listing_is_gone_gets_status_gone(tmp_path):
+    """A listing that is gone at the live re-check, or confirmed gone after disappearing, turns its deal into
+    status "gone" (card rewritten so the publisher updates it); a deal found alive again is "new" again."""
+    ad = FakeAdapter([listing()])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    assert d.status == "new"
+    ad.alive_result = (False, None)
+    ad.listings = [listing(price="690")]  # a price change: re-evaluated, re-checked live -> gone
+    s = await scheduler.run_round(ctx)
+    assert s.dropped.get("gone") == 1
+    d = ctx.store.get_deal(d.id)
+    assert d.status == "gone"
+    md = next((tmp_path / "cards" / "deals").glob(f"*/*-{d.id}.md"))
+    assert "Status: gone" in md.read_text()
+    ad.alive_result = (True, None)
+    ad.listings = [listing(price="680")]
+    await scheduler.run_round(ctx)
+    assert ctx.store.get_deal(d.id).status == "new"
+
+
+async def test_disappeared_listing_confirmed_dead_marks_its_deal_gone(tmp_path):
+    ad = FakeAdapter([listing()])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    await scheduler.run_round(ctx)
+    [d] = ctx.store.deals()
+    ad.alive_result = (False, None)
+    r = scheduler._Round(ctx)
+    await r._confirm_disappeared(ad, ad.name, [d.listing_ref])
+    assert ctx.store.get_deal(d.id).status == "gone"
+
+
+async def test_triage_cache_is_keyed_by_the_prompt_sha(tmp_path):
+    """A cached triage is reused only under the same prompt.triage; a promoted new prompt re-triages the listing."""
+    q = {"id": "q.rtx3060", "kind": "query", "target": "all", "value": "rtx 3060", "sentinel": False}
+
+    def items(text):
+        return [q, {"id": "prompt.triage", "kind": "prompt", "target": "senior", "value": text, "sentinel": False}]
+
+    ad = FakeAdapter([listing("5", "RTX 3060 12GB używana", "6400")])
+    llm = FakeLLM(LLM_3060)
+    ctx = tier1_ctx(tmp_path, ad, llm, items=items("triage prompt A"), reeval_hours=0)
+    await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 1
+    await scheduler.run_round(ctx)  # same prompt: cached
+    assert len(llm.triage_calls) == 1
+    ctx.items = items("triage prompt B")  # a promoted prompt
+    st = await scheduler.run_round(ctx)
+    assert len(llm.triage_calls) == 2 and llm.triage_calls[1][2] == "triage prompt B"
+    assert st.triage.get("cached", 0) == 0
+
+
+def test_triage_table_without_prompt_sha_is_migrated(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    ctx.store.conn.execute("drop table if exists triage")
+    ctx.store.conn.execute("create table triage (listing_id integer primary key, title_hash text, price text, "
+                           "result text not null, at text not null)")
+    ctx.store.conn.execute("insert into triage values (1, 'h', '10', '{}', 'x')")
+    ctx.store.conn.commit()
+    scheduler._Round(ctx)
+    cols = {r[1] for r in ctx.store.conn.execute("pragma table_info(triage)")}
+    assert "prompt_sha" in cols
+    assert ctx.store.conn.execute("select prompt_sha from triage where listing_id=1").fetchone()[0] is None
+
+
+# ------------------------------------------------------------------ deferred minors: paid booking, bandit clamp
+
+
+class PaidLLM(FakeLLM):
+    """A paid endpoint: every call costs $0.01, reported through ctx.on_paid like llm.Client(on_paid=...) does;
+    `paid_booked` records what the round handed back after booking it."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.ctx, self.booked = None, []
+
+    async def chat_json(self, role, system, user, schema, max_tokens=600):
+        self.ctx.on_paid(role, 0.01)
+        return await super().chat_json(role, system, user, schema, max_tokens)
+
+    def paid_booked(self, usd):
+        self.booked.append(usd)
+
+
+async def test_round_books_paid_spend_once_and_clears_the_clients_unbooked_counter(tmp_path):
+    """Wiring minor: the round writes the paid_api cost row, then hands exactly that amount to llm.paid_booked and
+    zeroes ctx.usage["paid_usd"], so the client's cap check (books + unbooked) never counts it twice."""
+    llm = PaidLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), llm)
+    llm.ctx = ctx
+    seed_comps(ctx.store)
+    s1 = await scheduler.run_round(ctx)
+    n_calls = len(llm.calls) + len(llm.triage_calls)
+    assert n_calls >= 2 and s1.llm_calls == n_calls
+    assert llm.booked == [pytest.approx(0.01 * n_calls)] and ctx.usage["paid_usd"] == 0.0
+    pln_per_usd = float(ctx.cfg.models.paid_api.pln_per_usd)
+    row = ctx.store.conn.execute("select amount_pln from costs where kind='paid_api' and round_id=?",
+                                 (s1.round_id,)).fetchone()
+    assert float(row["amount_pln"]) == pytest.approx(0.01 * n_calls * pln_per_usd, abs=0.01)
+    s2 = await scheduler.run_round(ctx)  # nothing new to evaluate: no paid call, nothing more booked
+    assert len(llm.booked) == 1 and ctx.usage["paid_usd"] == 0.0
+    row2 = ctx.store.conn.execute("select amount_pln from costs where kind='paid_api' and round_id=?",
+                                  (s2.round_id,)).fetchone()
+    assert float(row2["amount_pln"]) == 0.0
+
+
+async def test_a_negative_net_trend_deal_updates_its_arm_with_zero_value(tmp_path, monkeypatch):
+    """Behavioural test of the bandit clamp (was source inspection): a tier-4 trend deal with a negative expected
+    net makes value_units negative; the round must still finish and the arm gets one pull with reward 0."""
+    import dataclasses
+
+    from dh.bandit import value_units
+    ad = FakeAdapter([listing("1", "Gigabyte RTX 3060 Gaming OC używana", "1395")])
+    ctx = make_ctx(tmp_path, ad, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    _with(ctx, scheduler={"trend": {"min_30d": 0.15, "min_cons_net_usd": -100000}})
+    real = scheduler._Round._estimate
+
+    def rising(self, *a, **kw):
+        e = real(self, *a, **kw)
+        return None if e is None else dataclasses.replace(e, trend_30d=0.3)
+    monkeypatch.setattr(scheduler._Round, "_estimate", rising)
+    st = await scheduler.run_round(ctx)
+    ds = ctx.store.deals()
+    assert [d.tier for d in ds] == [4] and ds[0].exp_net_usd < 0, [(d.tier, d.exp_net_usd) for d in ds]
+    assert value_units([(4, float(ds[0].exp_net_usd))]) < 0  # the raw value would be refused by Bandit.update
+    arm = ledger.arm_id("allegro_lokalnie", "rtx 3060")
+    row = ctx.store.conn.execute("select pulls, reward from arm_stats where arm=?", (arm,)).fetchone()
+    assert row["pulls"] == 1 and row["reward"] == 0.0
+    assert st.round_id is not None and ctx.store.conn.execute(
+        "select notes from rounds where id=?", (st.round_id,)).fetchone()["notes"]  # bookkeeping completed
+
+
+async def test_without_the_llm_a_laptop_naming_a_gpu_is_never_valued_as_the_card(tmp_path):
+    """Live round 29 Oct: "MSI ... Core Ultra 9 275HX ... RTX 5090" (a laptop) became a T3 deal on the rules key.
+    A weak rules key (a system/lot, or certainty < 0.7) waits for the LLM instead of being valued on its own."""
+    lap = listing("9", "Ryzen 7 7800X3D 2TB RTX 3060 12GB", "900")  # rules: gpu:rtx-3060:12, a system, 0.5
+    ctx = make_ctx(tmp_path, FakeAdapter([lap]), None)  # the LLM is off
+    seed_comps(ctx.store)  # 900 PLN against ~1400 PLN cards: a "deal" if valued as a bare card
+    st = await scheduler.run_round(ctx)
+    assert ctx.store.deals() == [] and st.dropped.get("weak_match_waits_for_llm") == 1, st.dropped
+    note = ctx.store.conn.execute("select note from evaluations").fetchone()["note"]
+    assert note == "llm_pending"  # evaluated again as soon as the LLM is back
+
+
+async def test_without_the_llm_a_plain_card_is_still_valued(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), None)
+    seed_comps(ctx.store)
+    st = await scheduler.run_round(ctx)
+    assert st.candidates == 1 and "weak_match_waits_for_llm" not in st.dropped
+
+
+# ------------------------------------------------------------------ validation: a foreign model loaded mid-round
+
+
+async def test_a_model_loaded_mid_round_stops_the_rounds_llm_calls(tmp_path):
+    """Validation 30 Oct: another workload loaded its model after the round-start guard had passed. Every later LLM
+    call would make llama-swap load the role model back and evict theirs; the round's calls stop instead, the
+    listings wait (llm_pending), and one health event says why."""
+    checks = []
+
+    async def running():
+        checks.append(1)
+        return [] if len(checks) == 1 else ["gemma-4-26b-a4b"]  # clean at the round-start guard, then not
+    llm = FakeLLM(LLM_3060)
+    ctx = make_ctx(tmp_path, FakeAdapter([listing("1"), listing("2", price="720")]), llm)
+    ctx.llm_check = running
+    seed_comps(ctx.store)
+    st = await scheduler.run_round(ctx)
+    assert llm.calls == [] and llm.triage_calls == [] and st.llm_calls == 0
+    assert st.llm_mode == "foreign_model" and st.foreign_models == ["gemma-4-26b-a4b"]
+    notes = {r["note"] for r in ctx.store.conn.execute("select note from evaluations")}
+    assert notes == {"llm_pending"}  # valued on the rules for now (certainty 0.7), re-evaluated with the LLM later
+    assert ctx.store.conn.execute("select count(*) from health where kind='foreign_model'").fetchone()[0] == 1
+
+
+async def test_counting_llm_checks_before_every_call_and_shares_the_check_in_flight():
+    """Review: a 15 s cache let a call through up to 15 s after another workload loaded its model, and concurrent
+    callers did not share a check. Every call now awaits a check that is in flight or starts a new one."""
+    from dh.llm import LLMUnavailable
+    checks, foreign, gate = [], [[]], asyncio.Event()
+
+    async def running():
+        checks.append(1)
+        await gate.wait()  # slow /running: the concurrent calls must all wait for this one check
+        return foreign[0]
+
+    class Model:
+        def __init__(self):
+            self.n = 0
+
+        async def chat_json(self, *a, **kw):
+            self.n += 1
+            return {"ok": True}
+    seen = []
+    c = scheduler._CountingLLM(Model(), scheduler.RoundStats(), running, seen.append)
+    calls = [asyncio.create_task(c.chat_json("worker", "s", "u", {})) for _ in range(4)]
+    await asyncio.sleep(0)
+    gate.set()
+    assert [await t for t in calls] == [{"ok": True}] * 4 and len(checks) == 1  # one shared check
+    foreign[0] = ["qwen3.8-flash-next-uncensored"]  # loaded right after: the very next call sees it (no cache)
+    with pytest.raises(LLMUnavailable, match="outside the roles"):
+        await c.chat_json("worker", "s", "u", {})
+    assert len(checks) == 2 and c._inner.n == 4 and seen == [["qwen3.8-flash-next-uncensored"]]
+    foreign[0] = []
+    assert await c.chat_json("worker", "s", "u", {}) == {"ok": True} and len(checks) == 3
+
+
+async def test_warm_rates_cover_every_adapter_currency(tmp_path):
+    """Price bounds and PLN valuation silently skip a currency whose rate was never warmed
+    (the live log showed "no PLN rate for CHF" once eBay CH went live): keep the warm list complete."""
+    from dh.sources import registry
+    from dh.sources import registry
+    ctx = make_ctx(tmp_path, FakeAdapter([]), None)
+    r = scheduler._Round(ctx)
+    await r._warm_rates()
+    need = {a.currency for a in registry(None, REPO).values() if getattr(a, "currency", None)}
+    missing = {c for c in need if c != "PLN" and c not in r.to_pln_rates}
+    assert not missing, f"round-start rate warm-up misses {sorted(missing)}"

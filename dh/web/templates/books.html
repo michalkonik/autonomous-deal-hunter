@@ -13,7 +13,7 @@
 {% if sold_rows %}<div class="tbl"><table><tr><th>Deal</th><th class="n">Sold PLN</th><th class="n">Realised net PLN</th><th class="n">Realised net USD</th><th class="n">Forecast cons. PLN</th></tr>
 {% for r in sold_rows %}<tr><td><a href="/deal/{{r.id}}">{{r.key or "deal"}}</a></td><td class="n">{{r.sold}}</td>
 {% if r.error %}<td colspan="2" class="bad">n/a: {{r.error}}</td>{% else %}<td class="n">{{r.net_pln}}</td><td class="n">{{r.net_usd}}</td>{% endif %}<td class="n">{{r.cons}}</td></tr>{% endfor %}</table></div>
-<p class="mut">Realised net replays the stored net inputs with the exit price set to the sold price; USD at the NBP rate of the mark date.</p>
+<p class="mut">Realised net replays the stored net inputs with the exit price set to the sold price, the buy price set to your Bought price when you entered one, the FX rates the deal was valued with, and no risk haircut or returns reserve (the sale is done); USD at the NBP rate of the mark date.</p>
 {% else %}<p class="mut">No sold deals yet.</p>{% endif %}
 <h2>Cost by kind</h2>
 {% if kinds %}<div class="tbl"><table><tr><th>Kind</th><th class="n">Entries</th><th class="n">PLN</th><th class="n">Units</th></tr>

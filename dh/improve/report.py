@@ -10,13 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from evals.labels import is_false_positive, is_true_positive
 
-from .. import cards, economics
+from .. import books
 from .. import config as dhconfig
 from ..scheduler import MemoFx
 from . import gates, monitor
@@ -41,8 +40,8 @@ def _window(store, now: datetime) -> tuple[str, str, float]:
 
 
 async def _realised(store, deal_ids: set[int], cfg) -> tuple[Decimal, int]:
-    """Realised conservative net of the window's SOLD deals: the stored net inputs with the sold price as the exit,
-    through the same economics.net the books page uses (stored FX only). Returns (PLN, deals that could be priced)."""
+    """Realised net of the window's SOLD deals through `books.realised_net`, as on the books page (the deal's recorded
+    FX, then stored FX only; the Bought price when marked; no haircut, no returns reserve). Returns (PLN, deals priced)."""
     total, n = Decimal(0), 0
     mfx = MemoFx(StoreFx(store, max_back_days=30))
     for m in store.conn.execute("select deal_id, price_pln from marks where id in (select max(id) from marks "
@@ -51,9 +50,7 @@ async def _realised(store, deal_ids: set[int], cfg) -> tuple[Decimal, int]:
             continue
         deal = store.get_deal(m["deal_id"])
         try:
-            inp = cards.inputs_from_json(json.loads(deal.evidence_json or "{}")["net_inputs"])
-            price = Decimal(m["price_pln"])
-            res = await economics.net(replace(inp, exit_price_cons_pln=price, exit_price_exp_pln=price), cfg, mfx, None)
+            res = await books.realised_net(store, deal, Decimal(m["price_pln"]), cfg, mfx, None)
             total += res.cons_net_pln
             n += 1
         except Exception:  # noqa: BLE001 - missing evidence, FX or a duty lookup: not priced here

@@ -16,6 +16,7 @@ every round, and never acts. Only disagreements matter, and only once a verified
 from __future__ import annotations
 
 import json
+import weakref
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -44,11 +45,18 @@ class Disagreement:
     winner: str | None = None  # challenger | champion | tie
 
 
+_MIGRATED: "weakref.WeakSet" = weakref.WeakSet()
+
+
 def migrate(store) -> None:
+    """Once per store object (a step's transaction is never committed by a schema check)."""
+    if store in _MIGRATED:
+        return
     have = {r["name"] for r in store.conn.execute("pragma table_info(shadow_results)")}
     for col in COLUMNS:
         if col.split()[0] not in have:
             store.ensure_table(f"alter table shadow_results add column {col}")
+    _MIGRATED.add(store)
 
 
 def kind_of(a: Outcome, b: Outcome) -> str | None:
@@ -65,7 +73,7 @@ def kind_of(a: Outcome, b: Outcome) -> str | None:
 
 async def score_round(champion: Playbook, challenger: Playbook, round_candidates: list[int], *, store,
                       proposal_id: int, round_id: int | None = None, cfg=None,
-                      now: datetime | None = None) -> list[Disagreement]:
+                      now: datetime | None = None, commit: bool = True) -> list[Disagreement]:
     """Score the round's candidates (listing ids) with both playbooks; store and return the disagreements.
     Judgment changes only (alias, scam keyword): both sides use the same current cached LLM output. A prompt change
     never reaches shadow (owner review only, gates.evaluate -> 'owner_review')."""
@@ -95,7 +103,8 @@ async def score_round(champion: Playbook, challenger: Playbook, round_candidates
         out.append(Disagreement(cur.lastrowid, proposal_id, round_id, lid, k, a, b))
     store.conn.execute("insert into shadow_results (proposal_id, metric, value, round_id) values (?,?,?,?)",
                        (proposal_id, "round", float(scored), round_id))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
     return out
 
 
@@ -115,7 +124,7 @@ def winner_of(champion: Outcome, challenger: Outcome, truth: str) -> str:
     return "challenger" if b and not a else "champion" if a and not b else "tie"
 
 
-def label(store, disagreement_id: int, truth: str, source: str = "owner") -> str:
+def label(store, disagreement_id: int, truth: str, source: str = "owner", commit: bool = True) -> str:
     """Record a verified truth ('deal' | 'not_deal' | 'key:<key or none>') for one disagreement; returns the winner."""
     migrate(store)
     r = store.conn.execute("select champion, challenger from shadow_results where id=? and metric='disagreement'",
@@ -125,7 +134,8 @@ def label(store, disagreement_id: int, truth: str, source: str = "owner") -> str
     w = winner_of(Outcome.from_dict(json.loads(r["champion"])), Outcome.from_dict(json.loads(r["challenger"])), truth)
     store.conn.execute("update shadow_results set truth=?, label_source=?, labelled_at=?, winner=? where id=?",
                        (truth, source, datetime.now(timezone.utc).isoformat(), w, disagreement_id))
-    store.conn.commit()
+    if commit:
+        store.conn.commit()
     return w
 
 
@@ -142,7 +152,7 @@ def pending(store, proposal_id: int | None = None) -> list[Disagreement]:
             for r in store.conn.execute(sql + " order by id", args)]
 
 
-def auto_label(store, proposal_id: int, now: datetime | None = None) -> int:
+def auto_label(store, proposal_id: int, now: datetime | None = None, commit: bool = True) -> int:
     """Label pending disagreements from verified outcomes (module doc). Returns how many were labelled."""
     now = now or datetime.now(timezone.utc)
     n = 0
@@ -164,7 +174,7 @@ def auto_label(store, proposal_id: int, now: datetime | None = None) -> int:
                 if span >= timedelta(days=UNSOLD_DAYS) and len(prices) <= 1:
                     truth, source = "not_deal", "ledger_unsold"
         if truth is not None:
-            label(store, d.id, truth, source)
+            label(store, d.id, truth, source, commit=commit)
             n += 1
     return n
 

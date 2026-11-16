@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 STUBS = ["replay"]  # later milestone
-COMMANDS = ["start", "stop", "status", "deals", "show", "verify", "replay", "eval", "playbook", "books", "round",
-            "report"]
+COMMANDS = ["start", "stop", "status", "page", "deals", "show", "verify", "replay", "eval", "playbook", "books",
+            "round", "report", "recheck"]
 
 
 def _stub(args: argparse.Namespace) -> int:
@@ -57,6 +57,21 @@ def cmd_stop(args) -> int:
     return runtime.stop(cfg, root)
 
 
+def cmd_page(args) -> int:
+    """The standalone page server (`<unit>-web`): browse the deals with the hunter stopped."""
+    from . import runtime
+    root, cfg = _ctx()
+    if args.action == "start":
+        return runtime.start_page(cfg, root)
+    if args.action == "stop":
+        return runtime.stop_page()
+    running = runtime.web_is_active()
+    web = cfg.get("web")
+    port = (web.to_dict() if web is not None else {}).get("port", 8711)
+    print(f"page server: {'RUNNING' if running else 'stopped'} (unit {runtime.web_unit_name()}, port {port})")
+    return 0
+
+
 def cmd_status(args) -> int:
     from . import runtime
     root, cfg = _ctx()
@@ -68,6 +83,10 @@ def cmd_status(args) -> int:
     up = f", up {s['uptime_s'] // 60} min" if s.get("uptime_s") else ""
     print(f"deal-hunter: {'RUNNING' if s['running'] else 'stopped'} (unit {s['unit']}, state {s['state']}"
           f"{', pid ' + str(s['pid']) if s.get('pid') else ''}{up})")
+    if s.get("paused"):
+        p = s["paused"]
+        print(f"  PAUSED: {p.get('reason', 'paused')} ({', '.join(p.get('paths') or [])}): undo the change to resume, "
+              "or `dh stop` and `dh start` to accept it")
     if s.get("processes"):
         print("  processes: " + "; ".join(s["processes"]))
     print(f"  rounds: {s.get('rounds_total', 0)} total, {s.get('rounds_since_start', 0)} since start; "
@@ -148,7 +167,8 @@ async def _round(args) -> int:
     from .fetch import Fetcher
     root, cfg = _ctx()
     if runtime.is_active():
-        print("refused: the deal-hunter service is running (dh status); stop it before a foreground round")
+        print(f"refused: the agent's unit {runtime.unit_name()} is running (dh status); stop it before a foreground "
+              "round (a second checkout sets its own unit name: DH_UNIT_NAME or runtime.unit_name)")
         return 1
     reasons, before, warnings = runtime.preflight(cfg, need_llm=not args.no_llm)
     for w in warnings:
@@ -160,6 +180,10 @@ async def _round(args) -> int:
         return 1
     if runtime.round_running(root) is not None:
         print("refused: another foreground `dh round` is running")
+        return 1
+    agent_lock = runtime.AgentLock(root)
+    if not agent_lock.acquire():  # single writer of the agent's state (serve, `dh round`, queued owner commands)
+        print(f"refused: another agent process holds {agent_lock.path}")
         return 1
     pid_file = runtime.round_pid_path(root)
     pid_file.parent.mkdir(parents=True, exist_ok=True)
@@ -214,6 +238,7 @@ async def _round(args) -> int:
         store.close()
         with contextlib.suppress(OSError):
             pid_file.unlink()
+        agent_lock.release()
     return rc
 
 
@@ -293,13 +318,14 @@ async def _verify(args) -> int:
         if store.get_deal(args.id) is None:
             print(f"no deal {args.id}", file=sys.stderr)
             return 1
-        res = await verify.verify_deal(store, args.id, cfg, Fx(store), Customs(store), registry(cfg, root), fetcher)
-        verify.record_verification(store, args.id, res.ok)
+        res = await verify.verify_and_record(store, args.id, cfg, Fx(store), Customs(store), registry(cfg, root),
+                                             fetcher, cards_root=_cards_root(cfg, root))
     finally:
         await fetcher.aclose()
         store.close()
     out = {"deal_id": args.id, "ok": res.ok, "alive": res.alive, "price_now": res.price_now,
-           "net_now_cons_pln": res.net_now_cons_pln, "net_stored_cons_pln": res.net_stored_cons_pln, "diffs": res.diffs}
+           "net_now_cons_pln": res.net_now_cons_pln, "net_stored_cons_pln": res.net_stored_cons_pln, "diffs": res.diffs,
+           "gone": res.gone}
     if args.json:
         _dump(out)
     else:
@@ -307,7 +333,19 @@ async def _verify(args) -> int:
               f"net now {res.net_now_cons_pln} PLN vs stored {res.net_stored_cons_pln} PLN")
         for d in res.diffs:
             print(f"  - {d}")
+        if res.gone:
+            print("  deal marked gone (the card and the log repo show it)")
     return 0 if res.ok else 1
+
+
+def _cards_root(cfg, root):
+    """Where cards.write puts `deals/<day>/...` (the parent of publish.cards_dir), as build_context does."""
+    from pathlib import Path
+    try:
+        cd = Path(str(cfg.publish.cards_dir))
+    except AttributeError:
+        cd = Path("var/cards/deals")
+    return (cd if cd.is_absolute() else Path(root) / cd).parent
 
 
 def cmd_verify(args) -> int:
@@ -431,6 +469,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status", help="running?, rounds, last round, deals today, health, ntfy topic, log repo")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_status)
+    sp = sub.add_parser("page", help="the standalone page server: browse deals while the hunter is stopped")
+    sp.add_argument("action", nargs="?", default="status", choices=["start", "stop", "status"])
+    sp.set_defaults(func=cmd_page)
     sp = sub.add_parser("round", help="run rounds in the foreground (testing)")
     sp.add_argument("--once", action="store_true", help="one round, then exit")
     sp.add_argument("--dry", action="store_true", help="no ntfy push, no pending-push retries")
@@ -438,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_round)
     sp = sub.add_parser("deals", help="list deals (star, tier, net)")
-    sp.add_argument("--tier", type=int, choices=[1, 2, 3, 4])
+    sp.add_argument("--tier", type=int, choices=[1, 2, 3, 4, 5])
     sp.add_argument("--limit", type=int, default=100)
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_deals)
@@ -470,6 +511,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--weekly", action="store_true", required=True, help="the weekly report (Markdown)")
     sp.add_argument("--publish", action="store_true", help="also write it into the log repo's weekly/ (committed by the next sync)")
     sp.set_defaults(func=cmd_report)
+    from . import recheck
+
+    sp = sub.add_parser("recheck", help="owner, one-off after a matcher fix: rules extractions the current matcher "
+                                        "no longer accepts stop being comparables (dry unless --apply; agent stopped)")
+    sp.add_argument("--apply", action="store_true", help="write the changes (default: only report them)")
+    sp.set_defaults(func=recheck.cli)
     for name in STUBS:
         sp = sub.add_parser(name, help=f"{name} (later milestone)")
         sp.set_defaults(func=_stub)

@@ -394,6 +394,7 @@ def test_owner_commands_are_queued_while_the_unit_runs(inited, monkeypatch, caps
 
 def test_owner_commands_apply_at_once_when_the_unit_is_stopped(inited, monkeypatch, capsys):
     monkeypatch.setattr(runtime, "is_active", lambda run=None: False)
+    monkeypatch.setattr(runtime, "serve_processes", lambda run=None: [])  # pgrep works: a real agent on the host counts
     assert cli.main(["playbook", "--maintenance", "on"]) == 0
     out = capsys.readouterr().out
     assert "queued" not in out and json.loads(out)["ok"] is True

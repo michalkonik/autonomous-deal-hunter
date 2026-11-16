@@ -26,7 +26,9 @@ LOCAL_FROZEN_PATHS = ["config/local/rules.yaml", "config/local/economics.yaml"]
 
 
 class FrozenChanged(RuntimeError):
-    pass
+    def __init__(self, msg: str = "", paths: list[str] | tuple[str, ...] = ()):
+        super().__init__(msg)
+        self.paths = list(paths)
 
 
 class PolicyViolation(ValueError):
@@ -92,14 +94,15 @@ def _read_yaml(p: Path) -> dict:
     return yaml.safe_load(p.read_text()) or {}
 
 
-def load(root: Path) -> Config:
+def load(root: Path, *, local: bool = True) -> Config:
+    """config/*.yaml deep-merged with config/local/*.yaml (`local=False`: the shipped defaults only)."""
     root = Path(root)
     data: dict[str, Any] = {}
     for f in sorted((root / "config").glob("*.yaml")):
         data[f.stem] = _read_yaml(f)
-    local = root / "config" / "local"
-    if local.is_dir():
-        for f in sorted(local.glob("*.yaml")):
+    local_dir = root / "config" / "local"
+    if local and local_dir.is_dir():
+        for f in sorted(local_dir.glob("*.yaml")):
             data[f.stem] = deep_merge(data.get(f.stem, {}), _read_yaml(f))
     check_policy(data)
     return Config(data, root)
@@ -127,8 +130,13 @@ def frozen_digest(root: Path) -> dict[str, str]:
     return out
 
 
-def assert_frozen_unchanged(cfg: Config, digest: dict[str, str]) -> None:
+def frozen_changes(cfg: Config, digest: dict[str, str]) -> list[str]:
+    """Frozen files whose SHA-256 differs from `digest` (added, removed or edited)."""
     now = cfg.frozen_digest()
-    changed = sorted(k for k in set(now) | set(digest) if now.get(k) != digest.get(k))
+    return sorted(k for k in set(now) | set(digest) if now.get(k) != digest.get(k))
+
+
+def assert_frozen_unchanged(cfg: Config, digest: dict[str, str]) -> None:
+    changed = frozen_changes(cfg, digest)
     if changed:
-        raise FrozenChanged(f"frozen files changed: {', '.join(changed)}")
+        raise FrozenChanged(f"frozen files changed: {', '.join(changed)}", changed)

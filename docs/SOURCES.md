@@ -23,8 +23,11 @@ The registry is in `dh/sources/__init__.py` (`ADAPTER_NAMES`, `DROPPED`); the sw
 | Kleinanzeigen.de (DE) | `kleinanzeigen` | Plain HTML at low rate | Enabled |
 | HardverApro (HU) | `hardverapro` | Plain HTML, page 1 only | Enabled |
 | Marktplaats (NL) | `marktplaats` | HTML search page (embedded page data) | Enabled |
+| 2ememain.be (BE) | `2ememain` | HTML search page (embedded page data; same platform as Marktplaats) | Enabled |
+| Tori.fi (FI) | `tori` | JSON search endpoint allowed by robots.txt (Adevinta BAP API) | Enabled |
 | Bazos CZ, SK | `bazos_cz`, `bazos_sk` | Allowed category pages, filtered locally | Enabled |
 | eBay DE and PL | `ebay_de`, `ebay_pl` | Official Browse API | **Disabled until keys exist** |
+| eBay EU/EU-adjacent (GB, FR, IT, ES, IE, AT, CH, BE) | `ebay_gb`, `ebay_fr`, `ebay_it`, `ebay_es`, `ebay_ie`, `ebay_at`, `ebay_ch`, `ebay_be` | Official Browse API, filtered to sellers shipping to PL | **Disabled until keys exist** |
 | eBay sold prices | (Marketplace Insights) | Official API, limited release | **Disabled until the scope is granted** |
 | Pepper.pl, hotukdeals | `pepper_pl`, `hotukdeals` | RSS "hot" feeds | Enabled (feed sources) |
 | Retail price watch | `retail` | JSON-LD on shop pages: morele.net, x-kom.pl | Enabled (feed source) |
@@ -62,7 +65,10 @@ The HTML search page `/q/<query>/` is allowed and embeds the listings in `__NEXT
 `pages` pages (20 ads each) of the matching category (for example `pc.bazos.cz/graficka/`) and filters locally.
 The Bazos dataset can also seed price history (`python -m dh.seed bazos`).
 
-**eBay (DE, PL).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`.
+**eBay (DE, PL, GB, FR, IT, ES, IE, AT, CH, BE).** The official Browse API with your keys: `bw-secret ebay#client_id` and `ebay#client_secret`
+(read once per run: restart the agent after adding them). Foreign markets add `deliveryCountry:PL` to the search
+filter, so only items the seller ships to Poland are returned. (eBay's PT, FI, SE, NO, DK markets are not supported
+by the Browse API — those countries need their local marketplaces instead.)
 eBay web pages are never fetched. eBay's terms ban AI shopping agents and scrapers since February 2026, so the API
 is the only route. The API client is a documented exception to the web fetcher (it needs a POST token call and does
 not serve robots.txt): it still sends the honest User-Agent, paces calls, backs off 60 s doubling to 1 h on 429 or
@@ -100,7 +106,7 @@ ban risk falls on the owner's account.
 
 Both block polite polling (Allegro.pl uses DataDome; OLX uses CloudFront). The only legitimate route is the
 platforms' own saved-search alert e-mails. The mailbox adapter reads those mails. It never fetches an Allegro, OLX
-or eBay page, so these listings are **never re-checked live** and cannot reach tier 1. They can reach tier 2.
+or eBay page, so Allegro and OLX listings are **never re-checked live** and cannot reach tier 1. They can reach tier 2.
 The human acting on a deal opens the link and checks it by hand.
 
 ## Alert mailbox set-up
@@ -113,7 +119,8 @@ This is **gated on you**: until you do it, Allegro.pl, OLX.pl and the other aler
    ```json
    {"host": "imap.example.com", "port": 993, "user": "alerts@example.com", "password": "...", "folder": "INBOX"}
    ```
-   Check it with `bw-secret dh-mail#imap`. `folder` is optional (default `INBOX`).
+   Check it with `bw-secret dh-mail#imap`. `folder` is optional (default `INBOX`). The login is read once per run:
+   if the agent is running, `dh stop` and `dh start` after storing it.
 3. **Sign up** on Allegro, OLX, Kleinanzeigen and (optionally) eBay with that address.
 4. **Save narrow searches** on each platform and turn on e-mail alerts for them, at the most frequent setting the
    platform offers. Good searches mirror the playbook queries: one per product, for example "rtx 4090", with a
@@ -142,4 +149,4 @@ How mail is handled:
   (`tests/fixtures/mailbox/README.md`). They have not yet met a real alert. Expect to adjust them after your first
   real mails: if `alert_parse_empty` appears, send a sample to a developer.
 - Kleinanzeigen mails are enriched through the polite fetcher when its robots rules allow it. Allegro, OLX and eBay
-  mails never are. Every mailbox listing, Kleinanzeigen included, is unverifiable and tops out at tier 2.
+  mails never are. Allegro and OLX mailbox listings are unverifiable and top out at tier 2. A Kleinanzeigen mail listing is routed to the real `kleinanzeigen` adapter for its detail page and its live re-check (when that adapter is enabled), and an eBay one to the eBay API adapter when keys exist; verified, they can reach tier 1.

@@ -36,7 +36,7 @@ watched time, and only when a sweep succeeded and returned results. A crash or a
 ## 4. Put the money rules in a frozen, tested engine
 
 *See `dh/economics.py`, `docs/ECONOMICS.md`, `dh/tiering.py`.* The profit formula is pure functions with ten
-hand-worked examples. Floors and tiers read thresholds from a config the agent cannot write, and the rounds stop
+hand-worked examples. Floors and tiers read thresholds from a config the agent cannot write, and the rounds pause
 if a frozen file changes. **Lesson:** the scorer and the rules of the game must be outside the agent's reach.
 Systems that could reach their own scorer gamed it (research report section 3.7).
 

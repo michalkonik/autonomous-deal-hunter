@@ -27,6 +27,10 @@ class LLMUnavailable(LLMError):
     """The server is unreachable; raised immediately while the circuit breaker is open."""
 
 
+class PaidCapReached(LLMUnavailable):
+    """A paid-endpoint role was asked for while paid use is off (cap 0) or the month's cap is spent."""
+
+
 def wrap_untrusted(text: str) -> str:
     """Strip any listing tags from untrusted text, truncate to 4000 chars and wrap it in ONE <listing> block."""
     t = text or ""
@@ -102,8 +106,18 @@ class Client:
 
     def __init__(self, cfg, on_usage: Callable[[str, int, int, float], None] | None = None,
                  transport: httpx.AsyncBaseTransport | None = None, retries: int = 2,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 paid_spend: Callable[[], float] | None = None,
+                 on_paid: Callable[[str, float], None] | None = None):
         models = cfg.models
+        pa = models.get("paid_api", {}) or {}
+        pa = pa.to_dict() if hasattr(pa, "to_dict") else pa
+        # paid roles: only with paid_api.enabled; each maps a role to a model on paid_api.base_url. The monthly cap
+        # (USD, default 0 = no paid call is ever made) is checked before EVERY paid call against the books'
+        # month-to-date paid spend (`paid_spend`) plus the not-yet-booked spend of this client (`paid_booked` clears what the books took).
+        self.paid = dict(pa) if pa.get("enabled") else {}
+        self.paid_roles = dict(self.paid.get("roles") or {})
+        self._paid_spend, self._on_paid, self._paid_session = paid_spend, on_paid, 0.0
         self.base_url = str(models.base_url).rstrip("/")
         self.roles = dict(models.roles.to_dict() if hasattr(models.roles, "to_dict") else models.roles)
         to = models.get("timeouts", {}) or {}
@@ -131,10 +145,37 @@ class Client:
             self._open_until = self._clock() + self.breaker_cooldown
         return LLMUnavailable(f"transport error: {type(err).__name__}: {err}")
 
+    def paid_gate(self, role: str) -> None:
+        """Raise PaidCapReached unless a paid call for `role` is within the monthly cap (USD)."""
+        cap = float(self.paid.get("monthly_cap_usd", 0) or 0)
+        if cap <= 0:
+            raise PaidCapReached(f"role {role!r} uses the paid API but models.paid_api.monthly_cap_usd is 0")
+        spent = (float(self._paid_spend()) if self._paid_spend else 0.0) + self._paid_session
+        if spent >= cap:
+            raise PaidCapReached(f"paid API cap reached: ${spent:.2f} of ${cap:.2f} this month")
+
+    def paid_booked(self, usd: float) -> None:
+        """The books recorded `usd` of this client's paid spend (a round's cost row): it is part of the month-to-date
+        total now, so it leaves the unbooked session counter (never counted twice)."""
+        self._paid_session = max(0.0, self._paid_session - float(usd))
+
+    def _paid_headers(self) -> dict:
+        ref = self.paid.get("api_key_secret")
+        if not ref:
+            return {}
+        from .notify import bw_secret
+        key = bw_secret(str(ref))
+        return {"Authorization": f"Bearer {key}"} if key else {}
+
     async def _post(self, role: str, body: dict) -> tuple[str, str | None]:
         t0 = time.monotonic()
+        paid = role in self.paid_roles
+        url, headers = self.base_url, {}
+        if paid:
+            self.paid_gate(role)
+            url, headers = str(self.paid["base_url"]).rstrip("/"), self._paid_headers()
         try:
-            r = await self._http.post(f"{self.base_url}/chat/completions", json=body)
+            r = await self._http.post(f"{url}/chat/completions", json=body, headers=headers)
         except httpx.TransportError as e:  # connect/read timeouts, connection refused, ...
             raise self._transport_failed(e) from None
         self._fails = 0
@@ -147,6 +188,15 @@ class Client:
             content, finish = choice["message"]["content"] or "", choice.get("finish_reason")
         except (ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
             raise ValueError(f"malformed completion: {e}") from None
+        if paid:
+            usd = (int(usage.get("prompt_tokens", 0)) * float(self.paid.get("usd_per_mtok_in", 0))
+                   + int(usage.get("completion_tokens", 0)) * float(self.paid.get("usd_per_mtok_out", 0))) / 1e6
+            self._paid_session += usd
+            if self._on_paid:
+                try:
+                    self._on_paid(role, usd)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_paid callback failed")
         if self.on_usage:
             try:
                 self.on_usage(role, int(usage.get("prompt_tokens", 0)), int(usage.get("completion_tokens", 0)),
@@ -156,11 +206,11 @@ class Client:
         return content, finish
 
     async def chat_json(self, role: str, system: str, user: str, schema: dict, max_tokens: int = 600) -> dict:
-        if role not in self.roles:
+        if role not in self.roles and role not in self.paid_roles:
             raise LLMError(f"unknown role {role!r}")
         if self._clock() < self._open_until:
             raise LLMUnavailable("circuit breaker open: LLM server failed repeatedly")
-        model = self.roles[role]
+        model = self.paid_roles[role] if role in self.paid_roles else self.roles[role]
         last = ""
         strict = True  # per call: a 400/422 only drops response_format for this call
         length_retried = False

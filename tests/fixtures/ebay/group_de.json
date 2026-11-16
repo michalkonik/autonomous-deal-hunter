@@ -1,0 +1,28 @@
+{
+ "items": [
+  {
+   "itemId": "v1|999000111222|1",
+   "title": "RTX 3050 build",
+   "price": {
+    "value": "999.00",
+    "currency": "EUR"
+   }
+  },
+  {
+   "itemId": "v1|999000111222|2",
+   "title": "RTX 5070 build",
+   "price": {
+    "value": "3299.00",
+    "currency": "EUR"
+   }
+  },
+  {
+   "itemId": "v1|999000111222|3",
+   "title": "RTX 5090 build",
+   "price": {
+    "value": "6699.00",
+    "currency": "EUR"
+   }
+  }
+ ]
+}

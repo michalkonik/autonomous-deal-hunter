@@ -1,0 +1,4 @@
+# Process identity of this checkout (dh/runtime.py). Owner-tunable; not part of the frozen layer.
+# A second checkout on the same host (a development clone) sets its own unit name in config/local/runtime.yaml
+# (or DH_UNIT_NAME), so its `dh round`, `dh start`, `dh stop` and `dh status` never act on the owner's unit.
+unit_name: deal-hunter

@@ -221,17 +221,19 @@ def test_owner_rollback_during_a_long_round_is_applied_before_saving(env):
     assert make(env).s["champion"] == ctl.s["champion"]  # the state saved by the round includes the rollback
 
 
-def test_state_save_is_compare_and_swap_and_merges(env):
+def test_state_conflict_is_an_assertion_not_a_merge(env):
+    """Single writer (fix round 3): a CAS conflict aborts the step; nothing is merged (see test_improve_review3)."""
+    from dh.improve.controller import StepAborted
     store, root, clock = env
     a = started(env)
     b = make(env)
     b.s["consecutive_rejections"] = 2
     b._commit()
-    a.s["maintenance"] = True  # a loaded before b saved: a different field
-    a._commit()
+    a.s["maintenance"] = True
+    with pytest.raises(StepAborted):
+        a._commit()
     fresh = make(env)
-    assert fresh.s["consecutive_rejections"] == 2 and fresh.s["maintenance"] is True  # neither change is lost
-    assert any(e["event"] == "state_conflict" for e in fresh.s["events"])
+    assert fresh.s["consecutive_rejections"] == 2 and fresh.s["maintenance"] is False
 
 
 # ------------------------------------------------------------------ health rollback during probation
@@ -268,6 +270,26 @@ def test_health_rise_on_the_sentinel_sources_is_not_the_playbook(env):
     store, root, clock = env
     ctl = _cadence_probation(env, "kleinanzeigen")  # a sentinel source is unhealthy too: the sites changed
     assert ctl.phase == "probation" and not [e for e in ctl.s["events"] if e["event"] == "rolled_back"]
+
+
+def test_health_rise_keys_are_matched_by_domain_too(env):
+    """A sentinel source that reports under its HOST must be as invisible to probation as one named by adapter.
+    (2026-11-01, live: proposal 1 changed only sprzedajemy and was rolled back by `allegrolokalnie.pl|blocked`,
+    because "allegro_lokalnie" is not a substring of "allegrolokalnie.pl".)"""
+    ctl = _cadence_probation(env, "allegrolokalnie.pl")  # the same unhealthy control source, host spelling
+    assert ctl.phase == "probation" and not [e for e in ctl.s["events"] if e["event"] == "rolled_back"]
+
+
+def test_source_matches_maps_adapter_names_to_their_domains(env):
+    ctl = make(env)
+    ids = ctl._source_identities()
+    assert "allegrolokalnie.pl" in ids["allegro_lokalnie"] and "www.kleinanzeigen.de" in ids["kleinanzeigen"]
+    control = {"allegro_lokalnie", "hardverapro", "kleinanzeigen"}
+    assert Controller._source_matches("allegrolokalnie.pl|blocked", control, ids)
+    assert Controller._source_matches("www.kleinanzeigen.de|robots_disallow", control, ids)
+    assert not Controller._source_matches("images.marktplaats.com|robots_error", control, ids)
+    assert not Controller._source_matches("sprzedajemy.pl|blocked", control, ids)
+    assert not Controller._source_matches("imap|poll_failed", control, ids)
 
 
 # ------------------------------------------------------------------ cooldowns, triggers, health per state, MDE

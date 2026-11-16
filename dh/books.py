@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+from datetime import datetime, timezone
 from decimal import Decimal
 from statistics import mean
 
@@ -116,6 +117,15 @@ def energy_pln(seconds: float, gpu_watts_samples: list[float], tariff_pln_kwh: f
     return q2(Decimal(str(kwh)) * Decimal(str(tariff_pln_kwh)))
 
 
+def paid_month_usd(store, now: datetime | None = None) -> float:
+    """Paid-API spend (USD, the `units` of the paid_api cost rows) of the calendar month so far (UTC)."""
+    now = now or datetime.now(timezone.utc)
+    start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    r = store.conn.execute("select coalesce(sum(c.units),0) from costs c join rounds r on r.id=c.round_id "
+                           "where c.kind='paid_api' and r.started_at >= ?", (start,)).fetchone()
+    return float(r[0])
+
+
 def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[float], llm: dict,
                  fetches: int) -> dict:
     """Write this round's cost rows. `llm` = {calls, prompt_tokens, completion_tokens, seconds}."""
@@ -123,12 +133,17 @@ def record_round(store, round_id: int, cfg, *, seconds: float, gpu_watts: list[f
     kwh = energy_kwh(seconds, gpu_watts, b)
     e_pln = energy_pln(seconds, gpu_watts, tariff(cfg), b)
     tokens = int(llm.get("prompt_tokens", 0)) + int(llm.get("completion_tokens", 0))
-    paid = Decimal("0.00")  # paid APIs are off (models.paid_api.enabled: false); nothing else spends money yet
+    paid_usd = float(llm.get("paid_usd", 0.0))  # 0 unless a paid role ran (models.paid_api, capped per month)
+    try:
+        pln_usd = Decimal(str(cfg.models.paid_api.get("pln_per_usd", 4.0)))
+    except AttributeError:
+        pln_usd = Decimal("4.0")
+    paid = q2(Decimal(str(paid_usd)) * pln_usd)
     # amount kept to 6 dp (a short round costs fractions of a grosz: q2 per row would sum to 0); summaries round
     store.add_cost(round_id, "energy", Decimal(str(round(kwh * tariff(cfg), 6))), round(kwh, 6))
     store.add_cost(round_id, "llm", Decimal("0.00"), tokens)
     store.add_cost(round_id, "fetch", Decimal("0.00"), int(fetches))
-    store.add_cost(round_id, "paid_api", paid, 0)
+    store.add_cost(round_id, "paid_api", paid, round(paid_usd, 6))
     return {"energy_pln": e_pln, "kwh": kwh, "gpu_w_mean": mean(gpu_watts) if gpu_watts else None,
             "llm_tokens": tokens, "llm_calls": int(llm.get("calls", 0)), "fetches": int(fetches), "paid_api_pln": paid}
 
@@ -154,3 +169,42 @@ def summary(store, since: str | None = None, cfg=None) -> dict:
     total = sum((v["pln"] for v in by.values()), Decimal(0))
     return {"rounds": rounds, "total_pln": str(q2(total)),
             "by_kind": {k: {"pln": str(q2(v["pln"])), "units": v["units"], "rows": v["rows"]} for k, v in by.items()}}
+
+
+# ---------------------------------------------------------------- realised net of a sold deal
+
+
+def _completed_sale_cfg(cfg):
+    """The config for a COMPLETED sale: no returns reserve (the sale happened; a later return is a new event)."""
+    from .config import Config
+    data = cfg.to_dict()
+    return Config({**data, "economics": {**data["economics"], "returns_reserve": 0}}, getattr(cfg, "_root", None))
+
+
+def bought_price_pln(store, deal_id: int) -> Decimal | None:
+    """The price of the owner's latest Bought mark (PLN), None when there is none with a price."""
+    r = store.conn.execute("select price_pln from marks where deal_id=? and status='bought' and price_pln is not null "
+                           "order by id desc limit 1", (deal_id,)).fetchone()
+    return Decimal(r["price_pln"]) if r else None
+
+
+async def realised_net(store, deal, sold_pln: Decimal, cfg, fx, customs=None):
+    """economics.NetResult of a SOLD deal (the books page and the weekly report):
+    - the stored net inputs, exit = the sold price;
+    - buy = the owner's Bought mark price when there is one (PLN: buy currency PLN, no second FX conversion), else the
+      listing price in its own currency;
+    - FX replayed at the rates the deal was valued with (evidence `fx_rates`; the live `fx` only for anything else);
+    - no risk haircut (p_scam 0) and no returns reserve: the sale is completed."""
+    from dataclasses import replace
+
+    from . import economics
+    from .cards import inputs_from_json
+    from .money import FixedFx
+    ev = json.loads(deal.evidence_json or "{}")
+    inp = inputs_from_json(ev["net_inputs"])
+    price = Decimal(sold_pln)
+    inp = replace(inp, exit_price_cons_pln=price, exit_price_exp_pln=price, p_scam=0.0)
+    paid = bought_price_pln(store, deal.id)
+    if paid is not None:
+        inp = replace(inp, buy_price=paid, buy_ccy="PLN")
+    return await economics.net(inp, _completed_sale_cfg(cfg), FixedFx.from_evidence(ev, fallback=fx), customs)

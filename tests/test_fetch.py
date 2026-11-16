@@ -78,7 +78,44 @@ async def test_backoff_after_429(tmp_path):
     assert f.blocked("a.test")
     ft.t += 2
     assert not f.blocked("a.test")
-    assert [k for _, k, _ in st.health].count("blocked") == 2
+    assert [k for _, k, _ in st.health].count("soft_backoff") == 2
+    assert [k for _, k, _ in st.health].count("blocked") == 0
+    assert not f.disabled("a.test")
+
+
+async def test_repeated_429_never_disables_and_honours_retry_after(tmp_path):
+    calls = []
+
+    def h(req):
+        calls.append(req.url.path)
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(429, text="slow down", headers={"Retry-After": "300"})
+    f, ft, st = make(tmp_path, h)
+    for _ in range(5):
+        r = await f.get("https://a.test/x", kind="html")
+        assert r.blocked
+        assert f.blocked("a.test")
+        ft.t += 902
+    assert not f.disabled("a.test")
+    # Retry-After 300 s beats the plain 60 s start on the first failure
+    assert "backoff 300s" in st.health[0][2]
+    assert [k for _, k, _ in st.health].count("soft_backoff") == 5
+    # soft cap: the doubling never exceeds 15 min
+    assert "backoff 900s" in st.health[-1][2]
+
+
+async def test_429_challenge_page_still_counts_as_block(tmp_path):
+    def h(req):
+        if req.url.path == "/robots.txt":
+            return httpx.Response(404)
+        return httpx.Response(429, text="<title>captcha-delivery</title>")
+    f, ft, st = make(tmp_path, h)
+    for _ in range(3):
+        await f.get("https://a.test/x", kind="html")
+        ft.t += 4000
+    assert f.disabled("a.test")
+    assert [k for _, k, _ in st.health].count("blocked") == 3
 
 
 async def test_disable_after_3_blocks(tmp_path):
@@ -90,12 +127,15 @@ async def test_disable_after_3_blocks(tmp_path):
     f, ft, st = make(tmp_path, h)
     for _ in range(3):
         await f.get("https://a.test/x", kind="html")
-        ft.t += 4000
+        ft.t += 1000  # stay inside the disable cooldown: after the 3rd block the domain must be blocked
     assert f.disabled("a.test") and f.blocked("a.test")
     n = len(calls)
     r = await f.get("https://a.test/x", kind="html")
     assert r.blocked and len(calls) == n
     assert any(k == "disabled" for _, k, _ in st.health)
+    ft.t += 3601  # the disable cooldown expired (2026-11-07): the domain gets one retry with a fresh streak
+    assert not f.blocked("a.test") and not f.disabled("a.test")
+    assert any(k == "re_enabled" for _, k, _ in st.health)
 
 
 async def test_robots_disallow_respected(tmp_path):
@@ -391,3 +431,19 @@ async def test_get_bytes_binary_body_obeys_robots_and_skips_snapshot(tmp_path):
     assert d.disallowed and d.content == b""
     big = await f.get_bytes("https://img.example/p/2.jpg", max_bytes=3)
     assert big.content == b""
+
+
+async def test_report_ok_resets_consecutive_blocks_like_a_good_get(tmp_path):
+    """Deferred minor: a successful paced load (screenshot) never reset `consecutive_blocks`, so two old blocks and
+    one new one, hours apart with good loads between, disabled the domain for the session."""
+    f, ft, st = make(tmp_path, ok_handler([]))
+    f.report_block("a.test", "429")
+    f.report_block("a.test", "429")
+    ft.t += 10_000  # the backoff is over
+    assert await f.pace("a.test") is True
+    f.report_ok("a.test")  # the page loaded fine
+    f.report_block("a.test", "429 much later")
+    assert not f.disabled("a.test")  # counted as the first block again, not the third
+    f.report_block("a.test", "429")
+    f.report_block("a.test", "429")
+    assert f.disabled("a.test")  # three in a row still disable it

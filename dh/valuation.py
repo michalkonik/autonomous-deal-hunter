@@ -21,14 +21,17 @@ limited to `lookback_days`. The quantiles are capped at the new-retail ceiling: 
 last `recent_days` (or `retail_new_pln`) × 0.95.
 
 FX: `estimate` is sync and reads the `fx` cache (filled by money.Fx; `warm_fx` fills it ahead). A rate up to
-`fx_max_back_days` older than the comp date is accepted with the note "fx_stale" whenever the NBP effective date is
-not the comp date; a comp with no rate is skipped ("fx_missing:CCY").
+`fx_max_back_days` older than the comp date is accepted. The notes cover the comps that make the quantiles (the last
+`recent_days`) only: "fx_stale" when one of them was converted at an NBP rate more than `fx_stale_days` older than
+its date (a weekend or holiday gap is normal NBP behaviour, not staleness), "fx_missing:CCY" when one had no rate
+(it is skipped). Older comps (trend only) never add a note.
 
 Quantiles use midpoint interpolation: each value sits at the middle of its weight on the cumulative-weight axis.
 With equal weights this reproduces the ordinary median.
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
@@ -62,6 +65,7 @@ class Params:
     lookback_days: int
     active_ask_max_age_days: int
     fx_max_back_days: int
+    fx_stale_days: int
 
     @classmethod
     def from_config(cls, cfg: dhconfig.Config) -> "Params":
@@ -79,6 +83,7 @@ class Params:
             lookback_days=int(d["lookback_days"]),
             active_ask_max_age_days=int(d["active_ask_max_age_days"]),
             fx_max_back_days=int(d["fx_max_back_days"]),
+            fx_stale_days=int(d["fx_stale_days"]),
         )
 
 
@@ -151,26 +156,34 @@ class ExitEstimate:
 
 def weighted_quantile(values: list[Decimal], weights: list[float], q: float) -> Decimal:
     """Weighted quantile, midpoint interpolation (each value at the centre of its weight). q in [0, 1]."""
+    return weighted_quantiles(values, weights, (q,))[0]
+
+
+def weighted_quantiles(values: list[Decimal], weights: list[float], qs: Iterable[float]) -> list[Decimal]:
+    """`weighted_quantile` for several q at once: one sort and one cumulative pass (I5)."""
     if not values or len(values) != len(weights):
         raise ValueError("weighted_quantile needs equally long, non-empty values and weights")
     pairs = sorted((Decimal(v), Decimal(str(w))) for v, w in zip(values, weights))
     if any(w <= 0 for _, w in pairs):
         raise ValueError("weights must be positive")
     total = sum(w for _, w in pairs)
-    qd = Decimal(str(q))
     pos, cum = [], Decimal(0)
     for _, w in pairs:
         pos.append((cum + w / 2) / total)
         cum += w
-    if qd <= pos[0]:
-        return pairs[0][0]
-    if qd >= pos[-1]:
-        return pairs[-1][0]
-    for i in range(len(pairs) - 1):
-        if pos[i] <= qd <= pos[i + 1]:
-            lo, hi = pairs[i][0], pairs[i + 1][0]
-            return lo + (hi - lo) * (qd - pos[i]) / (pos[i + 1] - pos[i])
-    raise AssertionError("unreachable")
+    out = []
+    for q in qs:
+        qd = Decimal(str(q))
+        if qd <= pos[0]:
+            out.append(pairs[0][0])
+            continue
+        if qd >= pos[-1]:
+            out.append(pairs[-1][0])
+            continue
+        i = bisect.bisect_right(pos, qd) - 1  # pos[i] <= qd < pos[i + 1]
+        lo, hi = pairs[i][0], pairs[i + 1][0]
+        out.append(lo + (hi - lo) * (qd - pos[i]) / (pos[i + 1] - pos[i]))
+    return out
 
 
 # ------------------------------------------------------------------ FX (cached rates only; sync)
@@ -191,14 +204,17 @@ def cached_rate(store: Store, ccy: str, day: date, max_back_days: int) -> tuple[
 
 
 async def warm_fx(store: Store, fx, key: str, condition: str | None, day: date | datetime, *,
-                  params: Params | None = None, channels: Channels | None = None) -> int:
+                  params: Params | None = None, channels: Channels | None = None,
+                  rows: list[CompRow] | None = None) -> int:
     """Fetch (via money.Fx, which caches) every rate an `estimate` with the same arguments will need.
 
-    Pass the same `params`/`channels` as to `estimate`. Returns the number of (currency, date) pairs fetched.
+    Pass the same `params`/`channels` as to `estimate` (and the same precomputed `rows`, if any). Returns the number
+    of (currency, date) pairs fetched.
     """
     p = params or default_params()
     now = _now(day)
-    rows = _ledger_rows(store, key, condition, now, p, channels or default_channels(), include_listing_asks=True)
+    if rows is None:
+        rows = _ledger_rows(store, key, condition, now, p, channels or default_channels(), include_listing_asks=True)
     need = {(r.currency.upper(), r.at.date()) for r in rows if r.price_pln is None and r.currency.upper() != "PLN"}
     for ccy, d in sorted(need):
         await fx.rate_with_date(ccy, d)
@@ -243,10 +259,21 @@ def _now(day: date | datetime) -> datetime:
     return datetime.combine(day, time(23, 59, 59), tzinfo=timezone.utc)
 
 
+def ledger_rows(store: Store, key: str, condition: str | None, day: date | datetime, *, params: Params | None = None,
+                channels: Channels | None = None, include_listing_asks: bool = True,
+                ask_cache: dict | None = None) -> list[CompRow]:
+    """The clears-at ledger's comparables for `key`/`condition` as of `day` (probably sold + live asks), for ALL
+    listings: compute them once per (key, condition) per round and pass them to every `estimate` of that round
+    (`ledger_rows=`); each estimate drops its own candidate (`exclude_listing_ids`) afterwards."""
+    return _ledger_rows(store, key, condition, _now(day), params or default_params(), channels or default_channels(),
+                        include_listing_asks, ask_cache)
+
+
 def _ledger_rows(store: Store, key: str, condition: str | None, now: datetime, p: Params, channels: Channels,
-                 include_listing_asks: bool) -> list[CompRow]:
+                 include_listing_asks: bool, ask_cache: dict | None = None) -> list[CompRow]:
     since = now - timedelta(days=p.lookback_days)
-    rows = [r for r in ledger.clears_at(store, key, condition, since, channel_of=channels.channel_of) if r.at <= now]
+    rows = [r for r in ledger.clears_at(store, key, condition, since, channel_of=channels.channel_of,
+                                        ask_cache=ask_cache) if r.at <= now]
     if include_listing_asks:
         rows += ledger.active_asks(store, key, condition, now, channel_of=channels.channel_of,
                                    max_age=timedelta(days=p.active_ask_max_age_days))
@@ -277,7 +304,7 @@ def _tiers(target: str | None, channel: str, p: Params, market_of) -> list[tuple
 class _Conv:
     row: CompRow
     pln: Decimal | None
-    stale: bool
+    gap_days: int  # comp date - NBP effective date of the rate used (0 for PLN or a same-day rate)
 
 
 def _wmedian(rows: list[tuple[Decimal, float]]) -> Decimal:
@@ -287,11 +314,12 @@ def _wmedian(rows: list[tuple[Decimal, float]]) -> Decimal:
 def estimate(store: Store, key: str, condition: str | None, channel: str, day: date | datetime, *,
              params: Params | None = None, channels: Channels | None = None,
              exclude_listing_ids: Iterable[int] = (), retail_new_pln: Decimal | None = None,
-             include_listing_asks: bool = True) -> ExitEstimate | None:
+             include_listing_asks: bool = True, ledger_rows: list[CompRow] | None = None) -> ExitEstimate | None:
     """Exit-price distribution for `key` in `condition` (None = any) on exit `channel`, as of `day`.
 
     `day` is a date (valued as of its end, UTC) or an aware datetime. None when no channel tier has a comparable
-    from the last `recent_days`.
+    from the last `recent_days`. `ledger_rows`: the ledger comparables precomputed by `ledger_rows()` for the same
+    key, condition and day (the round's cache); None computes them here.
     """
     p = params or default_params()
     ch = channels or default_channels()
@@ -316,7 +344,8 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         rows.append(CompRow(key=key, condition=r["condition"], channel=r["channel"], kind=r["kind"], price=price,
                             currency="PLN", at=at, weight=p.weights[r["kind"]], ref=r["ref"] or f"comp:{r['id']}",
                             price_pln=price))
-    rows += _ledger_rows(store, key, condition, now, p, ch, include_listing_asks)
+    rows += (_ledger_rows(store, key, condition, now, p, ch, include_listing_asks) if ledger_rows is None
+             else [r for r in ledger_rows if r.at <= now and (include_listing_asks or r.kind != "active_ask")])
     excluded = set(exclude_listing_ids)
     seen: set[tuple[str, str]] = set()
     conv: list[_Conv] = []
@@ -324,15 +353,15 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         if (r.listing_id is not None and r.listing_id in excluded) or (r.kind, r.ref) in seen:
             continue
         seen.add((r.kind, r.ref))
-        pln, stale = r.price_pln, False
+        pln, gap = r.price_pln, 0
         if pln is None:
             got = cached_rate(store, r.currency, r.at.date(), p.fx_max_back_days)
             if got is not None:
                 rate, eff = got
-                pln, stale = q2(r.price * rate), eff != r.at.date()
+                pln, gap = q2(r.price * rate), (r.at.date() - eff).days
         if pln is not None and r.kind == "active_ask":
             pln = q2(pln * p.ask_to_sale_ratio)
-        conv.append(_Conv(r, pln, stale))
+        conv.append(_Conv(r, pln, gap))
 
     # channel tier: the first with a converted comp from the last recent_days
     chosen = None
@@ -345,17 +374,18 @@ def estimate(store: Store, key: str, condition: str | None, channel: str, day: d
         return None
     note, factor, pool = chosen
     notes: list[str] = [note] if note else []
-    missing = sorted({c.row.currency.upper() for c in pool if c.pln is None})
+    recent_pool = [c for c in pool if c.row.at >= recent_from]  # the comps the quantiles use: the FX notes' scope
+    missing = sorted({c.row.currency.upper() for c in recent_pool if c.pln is None})
     notes += [f"fx_missing:{m}" for m in missing]
     used = [(c.row, c.pln, round(p.weights.get(c.row.kind, c.row.weight) * factor, 4))
             for c in pool if c.pln is not None]
-    if any(c.stale for c in pool if c.pln is not None):
+    if any(c.gap_days > p.fx_stale_days for c in recent_pool if c.pln is not None):
         notes.append("fx_stale")
 
     recent = [u for u in used if u[0].at >= recent_from]
     vals = [pln for _, pln, _ in recent]
     ws = [w for _, _, w in recent]
-    p25, p50, p75 = (q2(weighted_quantile(vals, ws, q)) for q in (0.25, 0.5, 0.75))
+    p25, p50, p75 = (q2(x) for x in weighted_quantiles(vals, ws, (0.25, 0.5, 0.75)))
 
     if retail_new_pln is not None:
         retail.append(Decimal(retail_new_pln))

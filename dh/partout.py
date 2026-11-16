@@ -143,8 +143,11 @@ def _leg_pln(kind: str) -> Decimal:
 async def value(listing: Listing, extraction: Extraction | None, store: Store, day: date | datetime,
                 client: Client | None = None, *, params: valuation.Params | None = None,
                 channels: valuation.Channels | None = None, exit_channel: str | None = None,
-                comps: list[Component] | None = None) -> valuation.ExitEstimate | None:
-    """Part-out exit estimate for a PC listing, or None when it is not a PC or no part could be valued."""
+                comps: list[Component] | None = None,
+                condition: str | None = None) -> valuation.ExitEstimate | None:
+    """Part-out exit estimate for a PC listing, or None when it is not a PC or no part could be valued.
+    `condition` ('new'/'used') benchmarks every part on the SAME condition as the PC itself (owner directive
+    2026-11-07: used offers are only ever compared to used clears, never to new)."""
     if extraction is not None and extraction.category not in (None, "pc"):
         return None
     cfg = _params()
@@ -152,7 +155,7 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
     parts = comps if comps is not None else await components(listing, extraction, client, int(cfg["max_components"]))
     valued, unvalued = [], []
     for c in parts:
-        est = valuation.estimate(store, c.key, None, channel, day, params=params, channels=channels,
+        est = valuation.estimate(store, c.key, condition, channel, day, params=params, channels=channels,
                                  exclude_listing_ids=())
         (valued if est is not None else unvalued).append((c, est))
     if not valued:
@@ -170,7 +173,7 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
     notes += [f"part:{c.key}" for c, _ in valued] + [f"unvalued:{c.key}" for c, _ in unvalued]
     notes += sorted({n for _, e in valued for n in e.notes})
     return valuation.ExitEstimate(
-        channel=channel, key=(extraction.key if extraction and extraction.key else "pc:bundle"), condition=None,
+        channel=channel, key=(extraction.key if extraction and extraction.key else "pc:bundle"), condition=condition,
         p25_pln=p25, median_pln=med, p75_pln=p75,
         n_effective=min(e.n_effective for _, e in valued), n_sold=min(e.n_sold for _, e in valued),
         newest_days=max(e.newest_days for _, e in valued), days_to_sell=max(dts) if dts else None, trend_30d=None,

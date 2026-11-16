@@ -5,15 +5,18 @@
 <label>Category<select name="category"><option value="">all</option>{% for o in opts.category %}<option{% if f.get("category")==o %} selected{% endif %}>{{o}}</option>{% endfor %}</select></label>
 <label>Country<select name="country"><option value="">all</option>{% for o in opts.country %}<option{% if f.get("country")==o %} selected{% endif %}>{{o}}</option>{% endfor %}</select></label>
 <label>Source<select name="source"><option value="">all</option>{% for o in opts.source %}<option{% if f.get("source")==o %} selected{% endif %}>{{o}}</option>{% endfor %}</select></label>
-<label>Since<input type="date" name="since" value="{{f.get('since','')}}"></label>
+<label>Since<select name="since"><option value="">all time</option>{% for s in since_opts %}<option value="{{s}}"{% if f.get("since")==s %} selected{% endif %}>{{s}}</option>{% endfor %}</select></label>
+<label>False positive<select name="fp"><option value="">all</option><option value="yes"{% if f.get("fp")=="yes" %} selected{% endif %}>yes</option><option value="no"{% if f.get("fp")=="no" %} selected{% endif %}>no</option></select></label>
 <button>Filter</button><a href="/">reset</a></form>
 {% if not rows %}<p class="mut">No deals match (or no data yet).</p>{% else %}
-<div class="tbl"><table><tr><th></th><th>Tier</th><th>Deal</th><th>Src</th><th>Ctry</th><th class="n">Cons. net USD</th><th class="n">Exp. net USD</th><th>Conf.</th><th>Mark</th></tr>
+<div class="tbl"><table><tr><th></th><th><a href="{{shd.tier}}">Tier{{arrows.tier or ""}}</a></th><th><a href="{{shd.deal}}">Deal{{arrows.deal or ""}}</a></th><th><a href="{{shd.src}}">Src{{arrows.src or ""}}</a></th><th><a href="{{shd.ctry}}">Ctry{{arrows.ctry or ""}}</a></th><th><a href="{{shd.date}}">Date{{arrows.date or ""}}</a></th><th>Time</th><th class="n"><a href="{{shd.cons}}">Cons. net USD{{arrows.cons or ""}}</a></th><th class="n"><a href="{{shd.exp}}">Exp. net USD{{arrows.exp or ""}}</a></th><th><a href="{{shd.conf}}">Conf.{{arrows.conf or ""}}</a></th><th><a href="{{shd.ship}}">Ship→PL{{arrows.ship or ""}}</a></th><th>Mark</th><th>Offer</th></tr>
 {% for r in rows %}<tr>
 <td class="star">{% if r.d.star %}&#9733;{% endif %}</td><td>{{r.d.tier}}</td>
-<td><a href="/deal/{{r.d.id}}">{{r.d.key or "deal"}}</a><div class="mut">{{r.l["title"] if r.l else ""}}</div></td>
+<td><a href="/deal/{{r.d.id}}">{{r.d.key or "deal"}}</a>{% if r.d.status == "gone" %} <span class="bad">gone</span>{% endif %}<div class="mut">{{r.l["title"] if r.l else ""}}</div></td>
 <td>{{r.l["source"] if r.l else ""}}</td><td>{{(r.l["country"] if r.l else "") or ""}}</td>
-<td class="n">{{r.cons_usd}}</td><td class="n">{{r.exp_usd}}</td><td>{{r.d.confidence}}</td><td>{{r.mark or ""}}</td></tr>{% endfor %}
+<td>{{r.date}}</td><td>{{r.time}}</td>
+<td class="n">{{r.cons_usd}}</td><td class="n">{{r.exp_usd}}</td><td>{{r.d.confidence}}</td><td>{{r.ship}}</td><td>{{r.mark or ""}}{% if r.fp %} <span class="tag bad">false positive</span>{% endif %}</td>
+<td>{% if r.url.startswith(("http://","https://")) %}<a href="{{r.url}}" rel="noopener noreferrer">offer url</a>{% endif %}</td></tr>{% endfor %}
 </table></div>
 <p class="mut">{{total}} deals &middot; page {{page_no}} of {{pages}}
 {% if page_no > 1 %}<a href="/?page={{page_no-1}}{{qs}}">prev</a>{% endif %}

@@ -53,12 +53,14 @@ from statistics import median
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlsplit
 
-from . import books, cards, dedupe, economics, extract, ledger, notify, partout, photos, risk as riskmod, tiering, valuation, verify
+from . import books, cards, dedupe, economics, extract, ledger, notify, partout, photos, risk as riskmod, shipping, tiering, valuation, valuegate, verify
+from . import triage as triagemod
+from .llm import LLMUnavailable
 from .bandit import Bandit, value_units
 from .config import Config, assert_frozen_unchanged
 from .match import rules_extract
 from .models import Deal, Extraction, Listing
-from .money import q2
+from .money import RecordingFx, q2
 from .playbook_io import load_items
 from .sources.base import KIND_PATTERNS, AdapterError, Query
 
@@ -67,15 +69,18 @@ log = logging.getLogger(__name__)
 DEFAULTS = {
     "round_interval_s": 600, "budget": 60, "budget_max": 120, "budget_boost": 1.5, "max_searches_per_source": 12,
     "max_llm_items": 200, "alive_confirm_per_source": 5, "reeval_hours": 24, "round_timeout_s": 1500,
-    "ebay_comp_keys": 10, "ebay_insights_keys": 10, "maintenance_hours": 24, "retention_days": 90,
+    "ebay_comp_keys": 10, "ebay_insights_keys": 10, "maintenance_hours": 24,
     "price_range": [0.15, 3.0], "min_prices_for_range": 3, "min_estimate_comps": 3,
     "feed_sources": ["pepper_pl", "hotukdeals", "retail"], "requeue_hours": 48, "requeue_max": 500,
     "timeout_grace_s": 60,
+    "bandit": {"gamma": 0.98, "floor": 0.10, "prior": [1.0, 10.0], "new_pulls": 3},
+    "trend": {"min_30d": 0.15, "min_cons_net_usd": 0},
 }
 SWEEP_TIMEOUT_S = 300  # default of sources.sweep_timeout_s
 CATEGORY_FOR_ECONOMICS = {"gpu": "gpu", "gpu-mobile": "gpu", "ram": "ram", "ram-sodimm": "ram", "ssd": "ssd", "pc": "pc"}
 PC_KEY = "pc:bundle"
-KRAKOW = (50.0647, 19.9450)
+DEFAULT_ORIGIN = (50.0647, 19.9450)  # Krakow: only used when config/pickup.yaml has no `origin`
+DEFAULT_RETENTION_DAYS = 90
 _HW = re.compile("|".join(rx for kind, rx in KIND_PATTERNS if kind in ("gpu", "ram", "disk")), re.I)
 _SYSTEM_WORDS = re.compile(r"komputer|zestaw|(?<![a-z])pc(?![a-z])|laptop|notebook|desktop|rechner|počítač|pocitac|"
                            r"számítógép|szamitogep|macbook|konsol|playstation|xbox", re.I)
@@ -84,6 +89,11 @@ EVAL_SQL = """create table if not exists evaluations (
 MARK_COMPS_SQL = "create table if not exists mark_comps (mark_id integer primary key)"
 MAINT_SQL = "create table if not exists maintenance (task text primary key, at text not null)"
 PUSHES_SQL = "create table if not exists deal_pushes (deal_id integer primary key, at text not null)"
+TRIAGE_SQL = """create table if not exists triage (
+  listing_id integer primary key, title_hash text, price text, result text not null, at text not null,
+  prompt_sha text)"""
+CADENCE_SQL = "create table if not exists cadence_runs (source text primary key, at text not null)"
+CADENCE_SLACK_S = 30  # rounds are paced start to start: a source due "every 30 min" may run at 29.5
 DEAL_INDEX_SQL = "create unique index if not exists idx_deals_listing on deals(listing_ref)"
 REQUEUE_NOTES = ("deferred", "llm_pending")
 
@@ -112,6 +122,50 @@ def is_mail_source(ad) -> bool:
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def pickup_origin(cfg) -> tuple[float, float]:
+    """Where personal pickups start: config/pickup.yaml `origin: {lat, lon}`."""
+    try:
+        o = cfg.pickup.origin
+        return float(o.lat), float(o.lon)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return DEFAULT_ORIGIN
+
+
+def retention_days(cfg) -> tuple[int, int]:
+    """(photo-hash days, raw snapshot / saved-mail days): config/sources.yaml `retention`. The old
+    `scheduler.retention_days` is kept as an alias for BOTH when `sources.retention` does not set them."""
+    s = cfg.get("scheduler") if cfg is not None else None
+    alias = (s.to_dict() if s is not None else {}).get("retention_days")
+    src = cfg.get("sources") if cfg is not None else None
+    r = ((src.to_dict() if src is not None else {}).get("retention")) or {}
+    base = int(alias) if alias is not None else DEFAULT_RETENTION_DAYS
+    return int(r.get("photos_days", base)), int(r.get("snapshots_days", base))
+
+
+def bandit_kwargs(cfg) -> dict:
+    """Bandit(store, **kwargs) from config/scheduler.yaml `bandit:` (gamma, floor, prior, new_pulls)."""
+    b = {**DEFAULTS["bandit"], **(sched_cfg(cfg).get("bandit") or {})}
+    return {"gamma": float(b["gamma"]), "floor": float(b["floor"]), "prior": (float(b["prior"][0]), float(b["prior"][1])),
+            "new_pulls": int(b["new_pulls"])}
+
+
+def trend_signal(trend: float | None, cons_usd: Any, capital_usd: Any, conf: str, rules: Any, sc: dict,
+                 floor_usd: Any = 0) -> tiering.TierResult | None:
+    """Tier 4 with reason "trend": a rising market makes holding attractive even below the floor. Needs the key's
+    30-day trend >= scheduler.trend.min_30d (+0.15), a conservative net >= scheduler.trend.min_cons_net_usd (0),
+    a listing that is not hard-excluded, and capital within the cap. tiering.assign (frozen) is untouched."""
+    t = {**DEFAULTS["trend"], **(sc.get("trend") or {})}
+    if trend is None or conf == "excluded" or trend < float(t["min_30d"]):
+        return None
+    if Decimal(str(cons_usd)) < Decimal(str(t["min_cons_net_usd"])):
+        return None
+    if Decimal(str(capital_usd)) > Decimal(str(rules.capital_cap_usd)):
+        return None
+    return tiering.TierResult(4, False, Decimal(str(floor_usd)),
+                              [f"trend: the key's 30-day trend is {trend:+.0%} (>= {float(t['min_30d']):+.0%}) and the "
+                               f"conservative net {Decimal(str(cons_usd)):.0f} USD is not negative"])
 
 
 def sched_cfg(cfg) -> dict:
@@ -275,6 +329,8 @@ class RoundStats:
     llm_mode: str = "on"
     foreign_models: list = field(default_factory=list)
     sweep_timeouts: list = field(default_factory=list)
+    cadence: dict = field(default_factory=dict)  # source -> {minutes, due, cap} for sources with a cadence item
+    triage: dict = field(default_factory=dict)  # keep / demote / exclude / unavailable / cached counts
     mail_listings: int = 0
     mail_committed: int = 0
     partout: int = 0
@@ -329,14 +385,56 @@ class RoundContext:
         self.usage["completion_tokens"] += int(completion_tokens)
         self.usage["seconds"] += float(seconds)
 
+    def on_paid(self, role: str, usd: float) -> None:
+        """llm.Client(on_paid=ctx.on_paid): paid-API spend of this round (USD) for the books."""
+        self.usage["paid_usd"] = float(self.usage.get("paid_usd", 0.0)) + float(usd)
+
 
 class _CountingLLM:
-    def __init__(self, inner, stats: RoundStats):
+    """Every LLM call of a round goes through here: counted, and never sent while llama-swap runs a model outside
+    the configured roles. The round-start guard (`_Round._llm_guard`) is not enough: another workload can load its
+    model in the middle of a round (validation, 30 Oct: one did, swapped the role model out and four calls hung
+    for 60 s); the next call would make llama-swap load the role model back and evict theirs. So EVERY call checks
+    llama-swap `/running` first, with no cache: concurrent calls share the one check in flight (a shared future),
+    a call arriving after it finished starts a new one. A refused call raises LLMUnavailable (the listing waits as
+    llm_pending) and is not counted. (A model loaded between the check and llama-swap receiving the call cannot be
+    seen by any client; the window is the round trip to localhost.)"""
+
+    def __init__(self, inner, stats: RoundStats, check: Callable[[], Awaitable[list[str]]] | None = None,
+                 on_foreign: Callable[[list[str]], None] | None = None):
         self._inner, self._stats = inner, stats
+        self._check, self._on_foreign = check, on_foreign
+        self._inflight: asyncio.Future | None = None
+        self._foreign: list[str] = []
+
+    async def _run_check(self) -> list[str]:
+        try:
+            found = list(await self._check())
+        except Exception as e:  # noqa: BLE001 - cannot tell: be safe, no LLM call
+            found = [f"check failed: {type(e).__name__}"]
+        if found and not self._foreign and self._on_foreign is not None:
+            self._on_foreign(found)
+        self._foreign = found
+        return found
+
+    async def _foreign_now(self) -> list[str]:
+        if self._check is None:
+            return []
+        fut = self._inflight
+        if fut is None or fut.done():
+            fut = asyncio.ensure_future(self._run_check())
+            self._inflight = fut
+        return await asyncio.shield(fut)  # one caller's cancellation never cancels the others' shared check
 
     async def chat_json(self, *a, **kw):
+        foreign = await self._foreign_now()
+        if foreign:
+            raise LLMUnavailable("llama-swap runs a model outside the roles: " + ", ".join(foreign))
         self._stats.llm_calls += 1
         return await self._inner.chat_json(*a, **kw)
+
+    def __getattr__(self, name):  # anything else (paid_booked, aclose, ...) is the wrapped client's
+        return getattr(self._inner, name)
 
 
 @dataclass
@@ -356,6 +454,9 @@ class Appraisal:
     confidence: str
     why: list[str]
     tier: tiering.TierResult
+    fxr: Any = None  # money.RecordingFx: every rate this appraisal used (stored in the evidence for replay)
+    triage: dict | None = None  # the finalist triage result (dh.triage), recorded on the card
+    ship_pl: int | None = None  # direct-to-Poland shipping: 1/0/None (dh/shipping.py)
 
 
 # ------------------------------------------------------------------------------------------------ the round
@@ -369,7 +470,8 @@ class _Round:
         self.stats = RoundStats()
         self.rf = RoundFetcher(ctx.fetcher)
         self.fx = MemoFx(ctx.fx)
-        self.llm = _CountingLLM(ctx.llm, self.stats) if ctx.llm is not None else None
+        self.llm = (_CountingLLM(ctx.llm, self.stats, ctx.llm_check, self._foreign_midround)
+                    if ctx.llm is not None else None)
         workers = ctx.cfg.get("models")
         par = 4
         try:
@@ -380,13 +482,18 @@ class _Round:
         self.parallel = max(1, par)
         self.waiting = 0
         self.llm_budget = int(self.sc["max_llm_items"])
-        self.today = ctx.now().date()
+        # the LOCAL date, as money.Fx pins rates by date.today(): a UTC date would disagree around midnight
+        self.today = ctx.now().astimezone().date()
         self.to_pln_rates: dict[str, Decimal] = {}
         self.to_pln = make_to_pln(self.to_pln_rates)
         self.enabled_channels = list(ctx.cfg.economics.exit_channels.enabled)
         self.channels = valuation.Channels.from_config(ctx.cfg)
         self.params = valuation.Params.from_config(ctx.cfg)
+        self.gate = valuegate.GateParams.from_valuation(ctx.cfg["valuation"])  # dh/valuegate.py screen
+        self.gate_cache: dict[tuple, valuegate.MarketData] = {}  # raw market picture per (key, condition), once per round
         self.est_cache: dict[tuple, Any] = {}
+        self.ledger_cache: dict[tuple, list] = {}  # (key, condition) -> ledger comparables, once per round (I5)
+        self.ask_cache: dict = {}  # median-ask index per (key, currency) for clears_at
         self.warmed: set[tuple] = set()
         self.median_cache: dict[str, Decimal | None] = {}
         self.arm_value: dict[str, list[tuple[int | None, float]]] = defaultdict(list)
@@ -405,18 +512,25 @@ class _Round:
         self.shipping = economics.load_shipping()
         self.repo_web_url = str((ctx.cfg.get("publish").to_dict() if ctx.cfg.get("publish") is not None else {})
                                 .get("repo_web_url") or "").rstrip("/")
+        self.origin = pickup_origin(ctx.cfg)
         self.store.ensure_table(EVAL_SQL)
         self.store.ensure_table(MARK_COMPS_SQL)
         self.store.ensure_table(MAINT_SQL)
         self.store.ensure_table(PUSHES_SQL)
+        self.store.ensure_table(TRIAGE_SQL)
+        if "prompt_sha" not in {r[1] for r in self.store.conn.execute("pragma table_info(triage)")}:
+            self.store.conn.execute("alter table triage add column prompt_sha text")  # tables from before the key
+            self.store.conn.commit()
+        self.store.ensure_table(CADENCE_SQL)
         ensure_deal_index(self.store)
+        self._items_cache: list[dict] | None = None
 
     # ------------------------------------------------------------ helpers
     def _stopped(self) -> bool:
         return self.ctx.stop is not None and self.ctx.stop.is_set()
 
     async def _warm_rates(self) -> None:
-        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD"):
+        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF"):
             try:
                 self.to_pln_rates[ccy] = await self.fx.rate(ccy, self.today)
                 await self.fx.rate(ccy, self.today - timedelta(days=1))  # pins a dated row valuation can read
@@ -482,8 +596,44 @@ class _Round:
                           bundle_items=json.loads(r["bundle_items"] or "[]"), method="llm")
 
     # ------------------------------------------------------------ arms
+    def _items(self) -> list[dict]:
+        if self._items_cache is None:
+            self._items_cache = self.ctx.items if self.ctx.items is not None else load_items(self.root)
+        return self._items_cache
+
+    def _cadence(self, usable_sources: set[str], cap: int, budget: int) -> tuple[set[str], dict[str, int]]:
+        """Playbook `cadence` items (target = one source, value = minutes between searches of it). With the round
+        interval R minutes and the cadence C, the multiplier m = C / R:
+        - m > 1: the source's bandit arms run only in a round at least C minutes after the last round that searched
+          them (the source is skipped in between);
+        - m < 1: its per-round cap is max_searches_per_source / m (rounded up, at most the budget).
+        Sentinel and feed arms are never affected (the control group and one feed sweep per round).
+        Returns (sources skipped this round, per-source caps)."""
+        cad: dict[str, int] = {}
+        for it in self._items():
+            if it.get("kind") == "cadence" and str(it.get("target") or "") in usable_sources:
+                try:
+                    cad[str(it["target"])] = int(it["value"])
+                except (TypeError, ValueError):
+                    continue
+        round_min = max(1e-9, float(self.sc["round_interval_s"]) / 60)
+        now = self.ctx.now()
+        skip, caps = set(), {}
+        for src, minutes in sorted(cad.items()):
+            m = minutes / round_min
+            due = True
+            if m > 1:
+                r = self.store.conn.execute("select at from cadence_runs where source=?", (src,)).fetchone()
+                if r is not None:
+                    due = (now - datetime.fromisoformat(r["at"])).total_seconds() >= minutes * 60 - CADENCE_SLACK_S
+            caps[src] = min(budget, math.ceil(cap / m)) if m < 1 else cap
+            if not due:
+                skip.add(src)
+            self.stats.cadence[src] = {"minutes": minutes, "due": due, "cap": caps[src]}
+        return skip, caps
+
     def _plan(self) -> list[Arm]:
-        items = self.ctx.items if self.ctx.items is not None else load_items(self.root)
+        items = self._items()
         arms = build_arms(items, self.ctx.adapters, list(self.sc["feed_sources"]))
         usable = []
         for a in arms:
@@ -501,6 +651,8 @@ class _Round:
         self.stats.budget = budget
         per_src: Counter = Counter(a.source for a in fixed)
         cap = int(self.sc["max_searches_per_source"])
+        skip, caps = self._cadence({a.source for a in usable}, cap, budget)
+        free = [a for a in free if a.source not in skip]
         chosen = list(fixed)
         by_id = {a.id: a for a in free}
         # Multiple-play Thompson (I5 ruling): each arm runs at most once per round, so the round takes the k = budget
@@ -512,11 +664,16 @@ class _Round:
             if taken >= budget:
                 break
             a = by_id[aid]
-            if per_src[a.source] >= cap:
+            if per_src[a.source] >= caps.get(a.source, cap):
                 continue
             per_src[a.source] += 1
             chosen.append(a)
             taken += 1
+        for src in caps:
+            if any(a.source == src for a in chosen if not (a.sentinel or a.feed)):
+                self.store.conn.execute("insert or replace into cadence_runs (source, at) values (?,?)",
+                                        (src, self.ctx.now().isoformat()))
+        self.store.conn.commit()
         self.stats.arms = len(chosen)
         self.stats.sentinel_arms = sum(a.sentinel for a in chosen)
         self.stats.feed_arms = sum(a.feed for a in chosen)
@@ -635,27 +792,27 @@ class _Round:
             self.stats.requeued += len(self.inflight) - before
 
     def _maintenance(self) -> None:
-        """Daily: photo hashes, raw snapshots and saved alert mails older than the retention (90 days) are deleted."""
+        """Daily: photo hashes, raw snapshots and saved alert mails older than the retention (sources.retention, 90 days) are deleted."""
         now = self.ctx.now()
         r = self.store.conn.execute("select at from maintenance where task='daily'").fetchone()
         if r is not None and now - datetime.fromisoformat(r["at"]) < timedelta(hours=float(self.sc["maintenance_hours"])):
             return
-        days = int(self.sc["retention_days"])
+        photo_days, snap_days = retention_days(self.cfg)
         out = {}
         try:
-            out["photo_hashes"] = photos.purge(self.store, now)
+            out["photo_hashes"] = photos.purge(self.store, now, days=photo_days)
         except Exception as e:  # noqa: BLE001
             self.stats.errors.append(f"photos.purge: {e}"[:200])
         for n, ad in self.ctx.adapters.items():
             if is_mail_source(ad) and hasattr(ad, "purge"):
                 try:
-                    out[f"{n}_eml"] = ad.purge(older_than_days=days)
+                    out[f"{n}_eml"] = ad.purge(older_than_days=snap_days)
                 except Exception as e:  # noqa: BLE001
                     self.stats.errors.append(f"{n}.purge: {e}"[:200])
         purge = getattr(self.ctx.fetcher, "purge_snapshots", None)
         if purge is not None:
             try:
-                out["snapshot_files"] = purge(days)
+                out["snapshot_files"] = purge(snap_days)
             except Exception as e:  # noqa: BLE001
                 self.stats.errors.append(f"purge_snapshots: {e}"[:200])
         self.store.conn.execute("insert or replace into maintenance (task, at) values ('daily', ?)", (now.isoformat(),))
@@ -674,8 +831,14 @@ class _Round:
                 ok, price = await ad.alive(l, self.ctx.fetcher)
             except AdapterError:
                 continue  # not confirmed either way: the ledger keeps its inference
+            except asyncio.CancelledError:
+                raise
             except Exception as e:  # noqa: BLE001
                 self.store.add_health(source, "alive_error", f"{type(e).__name__}: {e}"[:300])
+                continue
+            if ok is False:  # the platform says it is gone: its deal is too
+                verify.mark_listing_gone(self.store, lid, "listing disappeared and was confirmed gone",
+                                         self.ctx.cards_root)
                 continue
             if ok and price is not None and price > 0:
                 # seen alive: a sighting without an arm clears disappeared_at and records no sweep
@@ -736,6 +899,11 @@ class _Round:
         if not ex.key or ex.box_only or ex.wanted_ad or ex.for_parts:
             self._mark_eval(lid, l, note="llm_pending" if pending else "no_key_after_llm")
             return self.stats.drop("no_key")
+        if pending and ex.key != PC_KEY and (ex.bundle_items or ex.certainty < ledger.COMP_MIN_CERTAINTY):
+            # LLM off or unreachable and the rules only guess (a laptop or PC naming a GPU, a lot): never valued as
+            # the bare product; it waits for the LLM (live round 29 Oct: an RTX 5090 laptop became a T3 "card")
+            self._mark_eval(lid, l, note="llm_pending")
+            return self.stats.drop("weak_match_waits_for_llm")
         if ex.key != rules.key and ex.key != PC_KEY and not self._in_range(ex.key, price_pln):
             self._mark_eval(lid, l, note="price_range")
             return self.stats.drop("price_range")
@@ -747,11 +915,20 @@ class _Round:
         self._mark_eval(lid, self.revalued.pop(lid, l), tier=tier, note="llm_pending" if pending else "")
 
     # ------------------------------------------------------------ valuation / economics / risk / tier
+    def _ledger_rows(self, key: str, cond: str | None) -> list:
+        """The clears-at ledger comparables of (key, condition), computed once per round for every candidate."""
+        k = (key, cond)
+        if k not in self.ledger_cache:
+            self.ledger_cache[k] = valuation.ledger_rows(self.store, key, cond, self.ctx.now(), params=self.params,
+                                                         channels=self.channels, ask_cache=self.ask_cache)
+        return self.ledger_cache[k]
+
     def _estimate(self, key: str, cond: str | None, ch: str, lid: int):
         k = (key, cond, ch, lid)
-        if k not in self.est_cache:
+        if k not in self.est_cache:  # the candidate's own listing is dropped from the shared rows here
             self.est_cache[k] = valuation.estimate(self.store, key, cond, ch, self.ctx.now(), params=self.params,
-                                                   channels=self.channels, exclude_listing_ids=[lid])
+                                                   channels=self.channels, exclude_listing_ids=[lid],
+                                                   ledger_rows=self._ledger_rows(key, cond))
         return self.est_cache[k]
 
     def _shipping(self, l: Listing, category: str) -> tuple[Decimal, Decimal, float | None] | None:
@@ -762,7 +939,7 @@ class _Round:
         if l.pickup_only or l.ships is False:
             if l.lat is None or l.lon is None:
                 return None
-            return Decimal("0"), outbound, round(haversine_km(KRAKOW, (l.lat, l.lon)), 1)
+            return Decimal("0"), outbound, round(haversine_km(self.origin, (l.lat, l.lon)), 1)
         inb = self.shipping.get("inbound_pln") or {}
         key = "PL" if origin == "PL" else ("EU" if origin in economics.EU else "non_EU")
         return Decimal(str(inb.get(key, 0))), outbound, None
@@ -803,7 +980,7 @@ class _Round:
             if must_wait:
                 self.waiting -= 1
 
-    async def _partout(self, l: Listing, lid: int, ex: Extraction):
+    async def _partout(self, l: Listing, lid: int, ex: Extraction, condition: str | None = None):
         """Part-out exit estimate of a whole PC (cached per listing for the round). Uses the worker LLM for the parts
         the rules miss, within the round's LLM item budget and worker slots."""
         if lid in self.partout_cache:
@@ -816,9 +993,10 @@ class _Round:
         if client is not None:
             async with self._llm_slot():
                 est = await partout.value(l, ex, self.store, self.ctx.now(), client, params=self.params,
-                                          channels=self.channels)
+                                          channels=self.channels, condition=condition)
         else:
-            est = await partout.value(l, ex, self.store, self.ctx.now(), None, params=self.params, channels=self.channels)
+            est = await partout.value(l, ex, self.store, self.ctx.now(), None, params=self.params,
+                                      channels=self.channels, condition=condition)
         self.partout_cache[lid] = est
         if est is not None:
             self.stats.partout += 1
@@ -829,7 +1007,7 @@ class _Round:
         cfg = self.cfg
         cond = ex.condition if ex.condition in ("new", "like_new") else "used"
         if ex.key == PC_KEY:
-            est = await self._partout(l, lid, ex)
+            est = await self._partout(l, lid, ex, cond)
             ests = {est.channel: est} if est is not None else {}
             if est is not None:  # effort sees the parts (>= 3 valued parts -> heavy)
                 ex = dataclasses.replace(ex, bundle_items=partout.parts_of(est))
@@ -840,7 +1018,7 @@ class _Round:
                 self.warmed.add(wkey)
                 try:
                     await valuation.warm_fx(self.store, self.fx, ex.key, cond, self.ctx.now(), params=self.params,
-                                            channels=self.channels)
+                                            channels=self.channels, rows=self._ledger_rows(ex.key, cond))
                 except Exception as e:  # noqa: BLE001 - comps without a rate are skipped by estimate
                     self.stats.errors.append(f"warm_fx {ex.key}: {e}"[:200])
             need = int(self.sc["min_estimate_comps"])  # one stray ask is not a market price
@@ -869,11 +1047,12 @@ class _Round:
                 outbound_ship_pln=outbound, pickup_km=km, items=1, day=self.today, category=category,
                 p_scam=round(float(p_scam), 4))
 
+        fxr = RecordingFx(self.fx)  # what this appraisal is valued with is what verify and the books replay
         results, inps = {}, {}
         for ch, e in ests.items():
             inp = inputs(ch, e, rk.p_scam)
             try:
-                results[ch] = await economics.net(inp, cfg, self.fx, self.ctx.customs)
+                results[ch] = await economics.net(inp, cfg, fxr, self.ctx.customs)
                 inps[ch] = inp
             except Exception as err:  # noqa: BLE001 - FX/duty lookup failure: this channel cannot be priced
                 self.stats.errors.append(f"net {ex.key} {ch}: {type(err).__name__}: {err}"[:200])
@@ -890,39 +1069,66 @@ class _Round:
         inp = inps[ch]
         if round(rk2.p_scam, 4) != inp.p_scam:
             inp = inputs(ch, est, rk2.p_scam)
-            net = await economics.net(inp, cfg, self.fx, self.ctx.customs)
+            net = await economics.net(inp, cfg, fxr, self.ctx.customs)
         if "pickup_out_of_range" in net.flags:
             self.stats.drop("pickup_out_of_range")
             return None
-        cons_usd = await self.fx.pln_to_usd(net.cons_net_pln, self.today)
-        exp_usd = await self.fx.pln_to_usd(net.exp_net_pln, self.today)
-        cap_usd = net.capital_usd if net.capital_usd is not None else await self.fx.pln_to_usd(net.capital_pln, self.today)
+        cons_usd = await fxr.pln_to_usd(net.cons_net_pln, self.today)
+        exp_usd = await fxr.pln_to_usd(net.exp_net_pln, self.today)
+        cap_usd = net.capital_usd if net.capital_usd is not None else await fxr.pln_to_usd(net.capital_pln, self.today)
         effort = tiering.effort_class(l, ch, net.flags, est, extraction=ex)
+        ship = shipping.ship_pl(l)
+        if ship == 1 and effort == "heavy":
+            effort = "moderate"  # direct-to-PL shipping removes the forwarding leg (owner bonus 2026-11-07)
         conf, why = tiering.confidence(ex, est, rk2, verified_age_s, cap_usd, cfg.rules)
-        tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules)
-        return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr)
+        tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules, ship_pl=ship == 1)
+        if ship == 1:
+            tr.reasons.append("ships directly to Poland: 5% floor bonus, no forwarding needed")
+        if tr.tier is None:  # below the floor and not within 20%: a rising market can still make it a tier-4 watch
+            tr = trend_signal(est.trend_30d, cons_usd, cap_usd, conf, cfg.rules, self.sc, tr.floor_usd) or tr
+        return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr, fxr,
+                         ship_pl=ship)
 
     def _deal(self, a: Appraisal, evidence: str = "{}") -> Deal:
         return Deal(id=None, listing_ref=a.lid, key=a.ex.key, tier=a.tier.tier, star=a.tier.star, effort=a.effort,
                     confidence=a.confidence, cons_net_pln=a.net.cons_net_pln, exp_net_pln=a.net.exp_net_pln,
                     cons_net_usd=a.cons_usd, exp_net_usd=a.exp_usd, capital_usd=a.capital_usd,
                     breakdown_json=cards.breakdown_json(a.net), evidence_json=evidence,
-                    reasons=list(a.tier.reasons) + [f"confidence: {w}" for w in a.why], created_at=self.ctx.now())
+                    reasons=list(a.tier.reasons) + [f"confidence: {w}" for w in a.why], created_at=self.ctx.now(),
+                    ship_pl=a.ship_pl)
+
+    def _verifier(self, l: Listing, ad):
+        """The adapter that may detail-fetch / verify `l`: its own adapter, or, for a listing that arrived through the
+        alert mailbox, the platform's REAL adapter when that one may be read politely (Kleinanzeigen) or through an
+        API (eBay with keys). OLX and Allegro mail listings have none: the e-mail is all we may read (unverifiable,
+        capped at medium confidence)."""
+        if not is_mail_source(ad):
+            return ad
+        real = self.ctx.adapters.get(l.source)
+        if real is None or is_mail_source(real) or getattr(real, "enabled", True) is False:
+            return None
+        if l.source == "kleinanzeigen" or l.source.startswith("ebay"):
+            return real
+        return None
 
     async def _deal_path(self, l: Listing, lid: int, ex: Extraction, arm: Arm, price_pln, ad) -> int | None:
+        vad = self._verifier(l, ad)
         a = await self._appraise(l, lid, ex, price_pln)
         if a is None or a.tier.tier is None:
             if a is not None:
                 self.stats.drop("below_floor")
+            return None
+        a = self._value_gate(a)
+        if a is None:
             return None
         if self._cross_duplicate(a, await self._price_pln(l) or Decimal(0)):
             self.stats.duplicates += 1  # the same item on another listing / platform: no detail fetch, no deal
             return a.tier.tier
         verified = False
         if a.tier.tier <= 3:
-            if not is_mail_source(ad):  # mailbox (Allegro/OLX) listings: the e-mail is all we may read
+            if vad is not None:  # mailbox Allegro/OLX listings have none: the e-mail is all we may read
                 try:
-                    l = await ad.detail(l, self.ctx.fetcher)
+                    l = await vad.detail(l, self.ctx.fetcher)
                     self.arm_fetches[arm.id] += 1
                     self.store.upsert_listing(l)
                 except AdapterError as e:
@@ -945,14 +1151,23 @@ class _Round:
             a = await self._appraise(l, lid, ex, price_pln, stock_photo=stock)
             if a is None or a.tier.tier is None:
                 return None
+            if a.tier.tier <= 2:  # finalist: the senior review comes BEFORE the live re-check and any push
+                tri = await self._triage(l, lid, a)
+                if tri.verdict == "exclude":
+                    self.stats.drop("triage_exclude")  # a hard exclude, reason "triage"
+                    return None
+                a = self._apply_triage(a, tri)
             if a.tier.tier <= 2:
                 try:
-                    alive, now_price = await ad.alive(l, self.ctx.fetcher)
+                    if vad is None:
+                        raise AdapterError("not verifiable: alert e-mail only")
+                    alive, now_price = await vad.alive(l, self.ctx.fetcher)
                     self.arm_fetches[arm.id] += 1
                 except AdapterError:
                     alive, now_price = None, None  # unverifiable: keep the deal, unverified
                 if alive is False:
                     self.stats.drop("gone")
+                    verify.mark_listing_gone(self.store, lid, "listing gone at the live re-check", self.ctx.cards_root)
                     return None
                 if alive and now_price is not None and now_price > 0:
                     changed = now_price != l.price
@@ -964,13 +1179,89 @@ class _Round:
                         price_pln = await self._price_pln(l)
                     verified = True  # alive, and the price just read is the one the deal is valued at
                     a2 = await self._appraise(l, lid, ex, price_pln, verified_age_s=0.0, stock_photo=stock)
+                    if a2 is not None and a2.tier.tier is not None:
+                        a2 = self._apply_triage(a2, tri)
+                        a2 = self._value_gate(a2)  # a changed price is a changed market picture: the screen runs again
                     if a2 is None or a2.tier.tier is None:
                         if changed:
                             self.stats.drop("price_changed_below_floor")
+                            verify.mark_listing_gone(self.store, lid, f"failed re-verification: price now {now_price} "
+                                                     f"{l.currency}, no longer a deal", self.ctx.cards_root)
                             return None
                     else:
                         a = a2
         return await self._save(a, arm, verified)
+
+    # ------------------------------------------------------------ value gate (dh/valuegate.py)
+    def _value_gate(self, a: Appraisal) -> Appraisal | None:
+        """Evidence-and-edge screen between pricing and saving: keeps the tier, forces it to the tier-5 watchlist
+        (stored and shown, never pushed, never re-fetched), or drops the listing outright. Skipped for part-out
+        PCs - their value is the sum of their parts, not one key's comparables."""
+        if not self.gate.enabled or a.ex.key is None or a.ex.key == PC_KEY:
+            return a
+        cond = a.ex.condition if a.ex.condition in ("new", "like_new") else "used"
+        ck = (a.ex.key, cond)
+        if ck not in self.gate_cache:
+            self.gate_cache[ck] = valuegate.collect(self.store, a.ex.key, cond, self.ctx.now(), self.gate)
+        v = valuegate.verdict(a.inp.buy_price, self.gate_cache[ck], self.gate)
+        if v.action == "drop":
+            self.stats.drop(f"value_gate_{v.code}")
+            return None
+        if v.action == "watch":
+            a.tier.tier = 5
+            a.tier.reasons.append(v.note)
+            a.why.append(v.note)
+        return a
+
+    # ------------------------------------------------------------ finalist triage (dh/triage.py)
+    async def _triage(self, l: Listing, lid: int, a: Appraisal) -> triagemod.Triage:
+        """The senior review of a tier <= 2 candidate, reused while the listing's title and price are unchanged
+        (an `unavailable` result is never reused)."""
+        th, price = self._title_hash(l), str(l.price)
+        prompt = self._prompt(triagemod.PROMPT_ID)
+        psha = extract.prompt_sha(prompt or "")  # the playbook's prompt identity: a promoted prompt re-triages
+        r = self.store.conn.execute("select title_hash, price, result, prompt_sha from triage where listing_id=?",
+                                    (lid,)).fetchone()
+        if r is not None and r["title_hash"] == th and r["price"] == price and r["prompt_sha"] == psha:
+            self.stats.triage["cached"] = self.stats.triage.get("cached", 0) + 1
+            return triagemod.Triage.from_dict(json.loads(r["result"]))
+        med = getattr(a.est, "median_pln", None)
+        tri = await triagemod.review(self.llm, prompt, l, market_median_pln=med)
+        self.stats.triage[tri.verdict] = self.stats.triage.get(tri.verdict, 0) + 1
+        if tri.verdict != "unavailable":
+            self.store.conn.execute(
+                "insert or replace into triage (listing_id, title_hash, price, result, at, prompt_sha) values (?,?,?,?,?,?)",
+                (lid, th, price, json.dumps(tri.to_dict()), self.ctx.now().isoformat(), psha))
+            self.store.conn.commit()
+        return tri
+
+    def _prompt(self, item_id: str) -> str | None:
+        """A prompt item of the round's playbook; a round given only arm items falls back to the active playbook."""
+        for items in (self._items(), None):
+            if items is None:
+                try:
+                    items = load_items(self.root)
+                except (OSError, ValueError):
+                    return None
+            hit = next((str(i.get("value") or "") for i in items if i.get("id") == item_id), None)
+            if hit:
+                return hit
+        return None
+
+    def _apply_triage(self, a: Appraisal, tri: triagemod.Triage | None) -> Appraisal:
+        """demote -> at most tier 3; unavailable -> confidence at most medium (never tier 1 without a triage)."""
+        if tri is None:
+            return a
+        a = dataclasses.replace(a, triage=tri.to_dict())
+        if tri.verdict == "unavailable" and a.confidence == "high":
+            why = [*a.why, "no finalist triage (" + "; ".join(tri.reasons)[:120] + "): capped at medium"]
+            tr = tiering.assign(a.cons_usd, a.exp_usd, a.effort, "medium", a.capital_usd, self.cfg.rules)
+            a = dataclasses.replace(a, confidence="medium", why=why, tier=tr if tr.tier is not None else a.tier)
+        if tri.verdict == "demote" and a.tier.tier is not None and a.tier.tier < 3:
+            reasons = "; ".join(tri.reasons) or "no reason given"
+            a = dataclasses.replace(a, tier=tiering.TierResult(
+                3, a.tier.star, a.tier.floor_usd, [*a.tier.reasons, f"triage: demoted to tier 3 ({reasons})"]))
+        return a
 
     def _evidence_probe(self, a: Appraisal, buy_pln: Decimal) -> str:
         ev = {"buy_pln": str(q2(buy_pln))}
@@ -992,10 +1283,10 @@ class _Round:
         self.store.conn.execute(
             """update deals set key=?, tier=?, star=?, effort=?, confidence=?, cons_net_pln=?, exp_net_pln=?,
                cons_net_usd=?, exp_net_usd=?, capital_usd=?, breakdown_json=?, evidence_json=?, reasons=?,
-               verified_at=null where id=?""",
+               ship_pl=?, verified_at=null, status=case when status='gone' then 'new' else status end where id=?""",
             (d.key, d.tier, int(d.star), d.effort, d.confidence, str(d.cons_net_pln), str(d.exp_net_pln),
              str(d.cons_net_usd), str(d.exp_net_usd), str(d.capital_usd), d.breakdown_json, d.evidence_json,
-             json.dumps(d.reasons), deal_id))
+             json.dumps(d.reasons), d.ship_pl, deal_id))
         self.store.conn.commit()
 
     def _pushed(self, deal_id: int) -> bool:
@@ -1006,8 +1297,10 @@ class _Round:
         final duplicate re-check, the insert/update, the card and the push reservation happen under it with no await,
         so two concurrent evaluations can never produce two deals or two pushes."""
         l, tier = a.listing, a.tier.tier
-        rate, rdate = await self.fx.rate_with_date(l.currency, self.today)
-        buy_pln = await self._price_pln(l) or Decimal(0)
+        fxr = a.fxr if a.fxr is not None else RecordingFx(self.fx)
+        rate, rdate = await fxr.rate_with_date(l.currency, self.today)
+        usd_rate, usd_date = await fxr.rate_with_date("USD", self.today)
+        buy_pln = await fxr.to_pln(l.price, l.currency, self.today)
         shots: dict = {}
         old = self._existing_deal_id(a.lid)
         if tier == 1 and not (old is not None and self._pushed(old)):
@@ -1015,9 +1308,11 @@ class _Round:
             if await self.ctx.screenshot(l.url, p, self.ctx.fetcher):
                 shots["discovery"] = str(p)
         ev = cards.build_evidence(a.inp, l, a.est, a.risk, fx_rate=rate, fx_date=rdate, buy_pln=buy_pln,
-                                  screenshots=shots)
+                                  screenshots=shots, fx_rates=fxr.as_json(), fx_usd=(usd_rate, usd_date))
         if a.ex.key == PC_KEY:  # dedupe tells two PCs of one seller apart by their parts
             ev = json.dumps({**json.loads(ev), "components": partout.parts_of(a.est)})
+        if a.triage is not None:
+            ev = json.dumps({**json.loads(ev), "triage": a.triage})
         push = False
         async with self.save_lock:
             deal = self._deal(a, ev)
@@ -1107,6 +1402,13 @@ class _Round:
         else:
             nxt = cur
         self.ctx.budget = nxt
+
+    def _foreign_midround(self, foreign: list[str]) -> None:
+        """Another workload loaded a model during this round: the rest of the round's LLM work waits (llm_pending)."""
+        self.stats.llm_mode = "foreign_model"
+        self.stats.foreign_models = list(foreign)
+        self.store.add_health("scheduler", "foreign_model",
+                              "mid-round: LLM calls stopped; llama-swap runs " + ", ".join(foreign))
 
     # ------------------------------------------------------------ main
     async def _llm_guard(self) -> None:
@@ -1229,9 +1531,13 @@ class _Round:
         cost = books.record_round(self.store, rid, self.cfg, seconds=st.seconds, gpu_watts=watts,
                                   llm={**ctx.usage, "calls": st.llm_calls}, fetches=st.fetches)
         st.energy_pln = str(cost["energy_pln"])
+        booked = float(ctx.usage.get("paid_usd", 0.0))  # now in the books' month-to-date: no longer "unbooked"
+        ctx.usage["paid_usd"] = 0.0
+        if booked and ctx.llm is not None and hasattr(ctx.llm, "paid_booked"):
+            ctx.llm.paid_booked(booked)
         executed = {a.id for a in arms if a.id in self.arm_fetches}
         for aid in executed:
-            ctx.bandit.update(aid, value_units(self.arm_value.get(aid, [])), int(self.arm_fetches[aid]))
+            ctx.bandit.update(aid, max(0.0, value_units(self.arm_value.get(aid, []))), int(self.arm_fetches[aid]))
         ctx.bandit.discount()
         self._adapt_budget()
         self.store.conn.execute("update rounds set notes=? where id=?", (json.dumps(st.to_dict(), default=str), rid))

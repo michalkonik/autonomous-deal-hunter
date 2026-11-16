@@ -16,6 +16,7 @@ Two rules before you turn anything:
 | `floors.easy` / `moderate` / `heavy` (50 / 120 / 250 USD) | fewer deals, each with more margin for error | more, thinner deals; tier 3 and 4 fill up |
 | `tiers.t1_min_cons_net_usd` (300) | fewer pushes | more pushes. A push should be worth acting on at once, so go down carefully |
 | `tiers.t4_floor_margin` (0.20) | more near-miss tier-4 rows (they also feed the bandit at 0.2 weight) | fewer |
+| `trend.min_30d` (0.15) and `trend.min_cons_net_usd` (0) in `scheduler.yaml` | fewer tier-4 "trend" watches | more. A listing below its floor and not within 20% of it still becomes a tier-4 row when its key's 30-day trend is at least +15% and its conservative net is not negative: a rising market makes holding attractive. It is never pushed and `tiering.assign` is untouched |
 | `star_usd` (500) | fewer starred deals | more stars. Stars sort first everywhere |
 | `capital_cap_usd` (30000) | larger deals appear | deals needing more capital vanish |
 
@@ -36,7 +37,7 @@ Confidence decides tier 1 (high), tier 2 (medium) or tier 3 (low).
 
 Effective sold comparables count owner sales and eBay sold at weight 1.0 and "probably sold" at 0.5. **Active
 asks never count.** So tier 1 is unreachable until the ledger has matured or eBay Marketplace Insights is granted.
-Listings that come through the alert mailbox cannot be re-checked and so never reach tier 1.
+Listings that come through the alert mailbox from OLX or Allegro cannot be re-checked and so never reach tier 1. A mailbox listing from Kleinanzeigen, or from eBay when its keys exist, is detailed and verified by that platform's real adapter and can.
 
 ## Exit valuation (`config/valuation.yaml`)
 
@@ -50,9 +51,10 @@ Listings that come through the alert mailbox cannot be re-checked and so never r
 
 ## Bandit: gamma, floor and prior
 
-The bandit decides which source x query arms get a search each round. Its parameters are **constants in code, not
-config keys**: `Bandit(store, gamma=0.98, floor=0.10, prior=(1.0, 10.0), new_pulls=3)` in `dh/bandit.py`, created
-with defaults in `dh/runtime.py: build_context`. To change one, change those defaults and restart.
+The bandit decides which source x query arms get a search each round. Its parameters are config keys in the
+`bandit:` block of `config/scheduler.yaml` (`gamma`, `floor`, `prior`, `new_pulls`), read by
+`dh/runtime.py: build_context` through `scheduler.bandit_kwargs`. Override them in `config/local/scheduler.yaml` and
+restart; an unset key keeps the default below.
 
 | Parameter | Default | Effect |
 |---|---|---|
@@ -86,7 +88,7 @@ Value of an arm per round = (sum of expected net USD of tier 1-3 deals + 0.2 x t
 | `models.min_free_ram_gb` (12) | The start guard. Lower it at your own risk: RAM, not VRAM, is the rig's binding limit (a second model next to a large one caused a kernel panic on 2026-10-28) |
 
 The design target is under 5% of new listings reaching the LLM. Check `LLM items` against `listings` in the round
-summary line. Paid APIs are off and have no code path.
+summary line. Paid APIs are off (`models.paid_api`, cap `monthly_cap_usd: 0`): no paid call is ever made unless you set a cap, a base URL and the roles that use it.
 
 ## Source rate limits (`config/sources.yaml`)
 
@@ -116,6 +118,7 @@ Scam probability is `1 / (1 + exp(-(bias + sum of weight x feature)))` over 0/1 
 | `origin_cn_hk` | 2.0 | ships from CN or HK, high-end RTX card |
 | `no_photos_flagship` | 2.0 | no photos on a 4090 or 5090 class card |
 | `scam_kw` | 0.8 | per scam-keyword hit, capped at `scam_kw_max_hits` (2) |
+| `contact_in_text` | 1.2 | a phone number or e-mail in the text, or one the adapter redacted: 3.6% alone; with a too-cheap price and a new account above 50% |
 
 By design, a deep discount alone from an established seller stays under 5% (it can still be tier 1), but a deep
 discount plus a weak-seller signal rises above 30%. Lower a weight to accept more risk; raise it to be stricter.
@@ -125,12 +128,14 @@ Calibrate against your Skipped marks and reasons.
 
 **`dh books`** (also the web page `/books`):
 - `today` and `all_time`: rounds and cost by kind. `energy` is PLN and kWh; `llm` is tokens; `fetch` is requests;
-  `paid_api` is always 0 PLN.
+  `paid_api` is 0 PLN unless you enabled a paid role (USD in `units`, capped per month).
 - `watched hours`: the time the agent was actually running. This is the clock for everything the ledger learns.
 - `deals by tier` and `forecast conservative net`: the sum of the conservative net of all deals found (an
   expectation, not income).
 - The web page also computes **realised** profit from your Sold marks, re-running the net with the price you
-  actually got. Compare realised with forecast to calibrate `ask_to_sale_ratio`. The agent pays for itself when
+  actually got. It uses the price of your Bought mark as the buy price when you entered one (in PLN, so no second
+  FX conversion), the FX rates the deal was valued with, and no risk haircut or returns reserve, since the sale is
+  completed. Compare realised with forecast to calibrate `ask_to_sale_ratio`. The agent pays for itself when
   realised profit exceeds the cost lines.
 
 **`dh status`:** rounds total and since start, the last round (listings, candidates, LLM calls, deals by tier),
@@ -152,7 +157,7 @@ Health kinds you will meet: `blocked`, `disabled`, `soft_backoff`, `robots_error
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | No tier-1 pushes for days | Cold start: fewer than 12 effective sold comps per key | Keep running (watched hours); get eBay Marketplace Insights; mark your own sales; do not lower `min_comps` just to see pushes |
-| Many tier-2 and tier-3 deals, few tier 1 | Mailbox listings cannot be re-checked; or comps thin | Read the "confidence" reasons on a card; they list every unmet condition |
+| Many tier-2 and tier-3 deals, few tier 1 | OLX and Allegro mailbox listings cannot be re-checked; or comps thin | Read the "confidence" reasons on a card; they list every unmet condition |
 | A deal is sold or wrong when you click | Listing changed after the re-check, or a mismatch | Mark it Skipped with a reason that names the problem ("scam", "wrong model", "sold"); check `dh verify <id>` |
 | Round summary shows 0 listings for a source | Layout change (a parser broke), or a block | `dh probe --source <name> --query "rtx 4090"`; look in `/health`. A zero-result sweep is never used as evidence that listings vanished |
 | `blocked` or `disabled` in status | The site refused plain polite requests | Wait for the backoff; restart to clear a disable. If it repeats, raise `fetch.min_interval_s` or set the source to `enabled: false` with a `reason`. Do not circumvent |
@@ -160,7 +165,7 @@ Health kinds you will meet: `blocked`, `disabled`, `soft_backoff`, `robots_error
 | `llm_deferred` is high | More uncertain titles than `max_llm_items` | Raise `max_llm_items`, or improve the rules matcher so fewer titles need the LLM |
 | Rounds say "rules-only" or `foreign_model` | Another model is loaded in llama-swap | Unload it, or map roles to loaded models (see [CONFIGURATION.md](CONFIGURATION.md#modelsyaml)) |
 | `dh start` refuses on RAM | Another workload holds the memory | Stop it; do not lower the guard casually |
-| Rounds stopped, `frozen_changed` | A frozen file was edited while running | `dh stop`, `dh start` |
+| Rounds paused, `frozen_changed` | A frozen file was edited while running | Undo it, or `dh stop`, `dh start` |
 | Same deal pushed twice | Should not happen: one push per deal is enforced | Check `deal_pushes`; report it as a bug |
 | Costs exceed value | Rounds too frequent, or nothing clears the floors | Increase `round_interval_s`, shrink `budget`, or fix the cause upstream (coverage, valuation) |
 | Too many false tier-1 | Scam score too lax, or comps wrong | Raise the scam weights or lower `confidence.p_scam_max`; mark Skipped with reasons; check the comps on the card |

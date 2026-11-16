@@ -17,6 +17,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import weakref
 import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -114,6 +115,20 @@ class StoreFx:
 # ------------------------------------------------------------------------------------------------ judge
 
 
+class _NoCommitStore:
+    """The store as the judge sees it: everything passes through, except that the scheduler's schema checks
+    (`ensure_table`) run WITHOUT committing, so judging never commits a controller step's open transaction."""
+
+    def __init__(self, store):
+        object.__setattr__(self, "_inner", store)
+
+    def ensure_table(self, sql: str) -> None:
+        self._inner.conn.execute(sql)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class _JudgeRound(scheduler._Round):
     """The scheduler's round object, used only for its appraisal path. `estimate_fn(key, condition, channel)`
     replaces the store valuation (the eval sets carry their own market); None keeps the store valuation."""
@@ -139,7 +154,7 @@ class Judge:
         self.store = store
         now = now or datetime.now(timezone.utc)
         ctx = scheduler.RoundContext(
-            cfg=self.cfg, root=self.root, store=store, fetcher=None, adapters={}, llm=None,
+            cfg=self.cfg, root=self.root, store=_NoCommitStore(store), fetcher=None, adapters={}, llm=None,
             fx=fx if fx is not None else StoreFx(store), customs=customs, bandit=None, rng=random.Random(0),
             cards_root=self.root / "cards", shots_root=self.root / "shots", dry=True, now=lambda: now,
             items=playbook.as_dicts())
@@ -246,20 +261,30 @@ EPOCHS_SQL = """create table if not exists improve_prompt_epochs (
   id integer primary key, sha text not null, started_at text not null)"""
 
 
-def record_prompt_epoch(store, sha: str | None, at: datetime) -> None:
+_EPOCHS_READY: "weakref.WeakSet" = weakref.WeakSet()
+
+
+def migrate(store) -> None:
+    if store not in _EPOCHS_READY:
+        store.ensure_table(EPOCHS_SQL)
+        _EPOCHS_READY.add(store)
+
+
+def record_prompt_epoch(store, sha: str | None, at: datetime, commit: bool = True) -> None:
     """Remember from when on an extraction prompt was active (one row per change)."""
     if sha is None:
         return
-    store.ensure_table(EPOCHS_SQL)
+    migrate(store)
     last = store.conn.execute("select sha from improve_prompt_epochs order by id desc limit 1").fetchone()
     if last is None or last["sha"] != sha:
         store.conn.execute("insert into improve_prompt_epochs (sha, started_at) values (?,?)", (sha, _iso(at)))
-        store.conn.commit()
+        if commit:
+            store.conn.commit()
 
 
 def prompt_sha_at(store, at: str | None) -> str | None:
     """The extraction prompt active at `at` (ISO); before the first recorded epoch: the first epoch's prompt."""
-    store.ensure_table(EPOCHS_SQL)
+    migrate(store)
     if at is not None:
         r = store.conn.execute("select sha from improve_prompt_epochs where started_at <= ? order by id desc limit 1",
                                (at,)).fetchone()

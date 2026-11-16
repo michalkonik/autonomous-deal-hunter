@@ -53,7 +53,8 @@ def test_must_pass_scores_economics_with_the_real_pipeline():
     assert res["mp-deal-4090-verified"].outcome.tier == 1
     assert res["mp-deal-4090-unverified"].outcome.tier == 2
     assert res["mp-box-pl"].outcome.reason == "bait"
-    assert res["mp-scam-phone"].outcome.reason == "hard_exclude"
+    # I3 ruling: a phone number is a scam-score feature now; with a too-cheap price it is never tier 1
+    assert "contact_in_text" in res["mp-scam-phone"].outcome.flags and res["mp-scam-phone"].outcome.tier != 1
     assert "scam_kw.box_sell" in res["mp-box-desc-payfirst"].outcome.flags
 
 

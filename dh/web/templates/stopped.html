@@ -1,0 +1,8 @@
+{% extends "base.html" %}{% block title %}Page server stopped{% endblock %}{% block body %}
+<h1>Page server stopped</h1>
+<p>The background page server stopped itself (the "stop the page" button). <b>The hunter was not touched</b> —
+its badge above still shows the truth until this page closes.</p>
+<p>To browse again: <code>dh page start</code> (page only, hunter stays as it is) or <code>dh start</code>
+(starts the hunter, which starts the page too).</p>
+<p class="mut">This is the last page the server serves — after it loads, the tab's next reload will not connect.</p>
+{% endblock %}

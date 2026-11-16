@@ -28,9 +28,9 @@ PUBLIC_KEYS = frozenset({
     "deal_id", "key", "tier", "star", "effort", "confidence", "status",
     "buy_price", "buy_currency", "buy_pln", "exit_p25_pln", "exit_median_pln",
     "cons_net_pln", "exp_net_pln", "cons_net_usd", "exp_net_usd", "capital_usd", "days_to_sell",
-    "breakdown", "fx",
+    "breakdown", "fx", "fx_usd",
     "listing", "comps", "retail_ceiling_pln", "trend_30d", "screenshots",
-    "risk", "reasons", "checklist", "outcome", "created_at", "verified_at",
+    "risk", "reasons", "checklist", "outcome", "created_at", "verified_at", "triage", "gone_reason",
 })
 PUBLIC_COMP_KEYS = frozenset({"url", "price", "date", "kind"})
 PUBLIC_LISTING_KEYS = frozenset({"url", "title", "price", "currency", "country", "city"})
@@ -97,11 +97,16 @@ def _comp_dict(c) -> dict:
 
 
 def build_evidence(inp: NetInputs, listing, estimate, risk, *, fx_rate: Decimal, fx_date: date,
-                   buy_pln: Decimal, screenshots: dict | None = None) -> str:
-    """Value for `Deal.evidence_json`: everything the card shows plus the exact net inputs `dh verify` replays."""
+                   buy_pln: Decimal, screenshots: dict | None = None, fx_rates: list[dict] | None = None,
+                   fx_usd: tuple[Decimal, date] | None = None) -> str:
+    """Value for `Deal.evidence_json`: everything the card shows plus the exact net inputs `dh verify` replays.
+    `fx_rates` = every (currency, day) -> (rate, NBP effective date) the valuation used (money.RecordingFx), replayed
+    by `dh verify` and the books; `fx_usd` = the USD rate and its NBP date the USD figures use."""
     ev = {
         "net_inputs": inputs_to_json(inp),
         "fx": {"currency": inp.buy_ccy.upper(), "rate": str(fx_rate), "date": fx_date.isoformat()},
+        "fx_rates": list(fx_rates or []),
+        "fx_usd": None if fx_usd is None else {"rate": str(fx_usd[0]), "date": fx_usd[1].isoformat()},
         "buy_pln": _q2(buy_pln),
         "listing": _listing_dict(listing),
         "estimate": _estimate_dict(estimate),
@@ -141,19 +146,28 @@ def card_data(deal, ev: dict, breakdown: dict, root: Path | None = None) -> dict
         "cons_net_usd": _q2(deal.cons_net_usd), "exp_net_usd": _q2(deal.exp_net_usd),
         "capital_usd": _q2(deal.capital_usd), "days_to_sell": est.get("days_to_sell"),
         "breakdown": {"cons": breakdown.get("cons", []), "exp": breakdown.get("exp", [])},
-        "fx": ev.get("fx"),
+        "fx": ev.get("fx"), "fx_usd": ev.get("fx_usd"),
         "listing": {k: v for k, v in lst.items() if k in PUBLIC_LISTING_KEYS},
         "comps": [{k: v for k, v in c.items() if k in PUBLIC_COMP_KEYS} for c in est.get("comps", [])],
         "retail_ceiling_pln": est.get("ceiling_pln"), "trend_30d": est.get("trend_30d"),
         "screenshots": {k: _rel(v, root) for k, v in
                         (ev.get("screenshots") or {"discovery": None, "verification": None}).items()},
         "risk": {"p_scam": risk.get("p_scam"), "flags": list(risk.get("flags", []))},
+        "triage": _triage_dict(ev.get("triage")),
         "reasons": list(deal.reasons), "checklist": list(ev.get("checklist", [])),
         "outcome": dict(DEFAULT_OUTCOME),
         "created_at": _iso(deal.created_at), "verified_at": _iso(deal.verified_at),
     }
+    gone = ev.get("gone") if isinstance(ev.get("gone"), dict) else None
+    out["gone_reason"] = str(gone.get("reason") or "") if deal.status == "gone" and gone else None
     assert set(out) <= PUBLIC_KEYS, set(out) - PUBLIC_KEYS
     return out
+
+
+def _triage_dict(t) -> dict | None:
+    if not isinstance(t, dict):
+        return None
+    return {"verdict": t.get("verdict"), "reasons": [str(r) for r in t.get("reasons") or []]}
 
 
 def render(deal, listing, estimate, net, risk, root: Path | None = None) -> tuple[str, dict]:
@@ -162,6 +176,8 @@ def render(deal, listing, estimate, net, risk, root: Path | None = None) -> tupl
     prev = _load(deal.evidence_json)
     ev = {
         "net_inputs": prev.get("net_inputs"), "fx": prev.get("fx"), "buy_pln": prev.get("buy_pln"),
+        "fx_rates": prev.get("fx_rates") or [], "fx_usd": prev.get("fx_usd"), "triage": prev.get("triage"),
+        "gone": prev.get("gone"),
         "listing": _listing_dict(listing), "estimate": _estimate_dict(estimate),
         "screenshots": prev.get("screenshots") or {"discovery": None, "verification": None},
         "risk": {"p_scam": float(risk.p_scam), "flags": list(risk.flags)}, "checklist": list(risk.checklist),
@@ -205,8 +221,26 @@ def _rel(path, root: Path | None) -> str | None:
     return p.as_posix()
 
 
+_URL_UNSAFE = {" ": "%20", "(": "%28", ")": "%29", "<": "%3C", ">": "%3E", "[": "%5B", "]": "%5D", "`": "%60"}
+
+
 def _link(label: str, url: str | None) -> str:
-    return f"[{label}]({url})" if url and str(url).startswith(("http://", "https://")) else _esc(url or label)
+    """A Markdown link. `label` is already escaped by the caller (never escaped again here); the URL's characters
+    that would end or break the link target are percent-encoded. Without a web URL: the escaped URL text, or the
+    label alone."""
+    if url and str(url).startswith(("http://", "https://")):
+        target = "".join(_URL_UNSAFE.get(ch, ch) for ch in str(url).strip())
+        return f"[{label}]({target})"
+    return _esc(url) if url else label
+
+
+def _ask_ratio() -> str:
+    """valuation.ask_to_sale_ratio (config/valuation.yaml), for the comparables legend of a card."""
+    try:
+        from .valuation import default_params
+        return str(default_params().ask_to_sale_ratio)
+    except Exception:  # noqa: BLE001 - a card is never lost over its legend
+        return "0.92"
 
 
 def _table(rows: list[dict]) -> list[str]:
@@ -219,13 +253,16 @@ def _table(rows: list[dict]) -> list[str]:
 def _markdown(d: dict) -> str:
     fm = {"deal_id": d["deal_id"], "key": d["key"], "tier": d["tier"], "star": d["star"],
           "confidence": d["confidence"], "effort": d["effort"], "cons_net_usd": d["cons_net_usd"],
-          "created_at": d["created_at"], "outcome": dict(DEFAULT_OUTCOME)}
+          "status": d.get("status") or "new", "created_at": d["created_at"], "outcome": dict(DEFAULT_OUTCOME)}
     head = yaml.safe_dump(fm, sort_keys=False, allow_unicode=True).rstrip()
     star = " ★" if d["star"] else ""
     lst = d["listing"]
     fx = d.get("fx") or {}
     shots = d["screenshots"] or {}
-    L = [f"---\n{head}\n---", f"# T{d['tier']}{star} {_esc(d['key'] or 'deal')}", "",
+    gone = d.get("status") == "gone"
+    L = [f"---\n{head}\n---", f"# T{d['tier']}{star} {_esc(d['key'] or 'deal')}" + (" (GONE)" if gone else ""), "",
+         *([f"**Status: gone**: {_esc(d.get('gone_reason') or 'the listing is gone or failed re-verification')}", ""]
+           if gone else []),
          "## Headline", "",
          f"- Buy: {d['buy_price']} {d['buy_currency']} ({d['buy_pln']} PLN)",
          f"- Exit P25: {d['exit_p25_pln']} PLN, median: {d['exit_median_pln']} PLN",
@@ -237,17 +274,26 @@ def _markdown(d: dict) -> str:
          "## Net calculation", "", "### Conservative (exit at P25)", ""]
     L += _table(d["breakdown"]["cons"]) + ["", "### Expected (exit at median)", ""]
     L += _table(d["breakdown"]["exp"]) + [""]
-    L += [f"FX: {fx.get('rate')} PLN per {fx.get('currency')} (NBP mid, {fx.get('date')})", "",
+    usd = d.get("fx_usd") or {}
+    L += [f"FX: {fx.get('rate')} PLN per {fx.get('currency')} (NBP mid, {fx.get('date')})"
+          + (f"; USD figures at {usd.get('rate')} PLN per USD (NBP mid, {usd.get('date')})" if usd else ""), "",
           "## Evidence", "",
           f"- Listing: {_link(_esc(lst.get('title') or 'listing'), lst.get('url'))}",
           f"- Screenshot at discovery: {_esc(shots.get('discovery') or 'none')}",
           f"- Screenshot at verification: {_esc(shots.get('verification') or 'none')}",
           f"- Retail ceiling: {d['retail_ceiling_pln']} PLN; 30-day trend: {d['trend_30d']}", "",
           "### Comparables", ""]
+    if any(c.get("kind") == "active_ask" for c in d["comps"]):
+        L += [f"Prices in PLN. An active ask is shown at x{_ask_ratio()} of its asking price (the price it is expected "
+              "to sell at), so it is lower than on the linked page.", ""]
     L += [f"- {c['kind']} {c['price']} PLN on {(c['date'] or '')[:10]}: {_link('link', c['url'])}"
           for c in d["comps"]] or ["- none"]
-    L += ["", "## Risk", "", f"- p_scam: {d['risk']['p_scam']}",
-          f"- Flags: {_esc(', '.join(d['risk']['flags'])) or 'none'}", "", "## Why this tier", ""]
+    tri = d.get("triage")
+    tri_line = ("not run (tier 3 or below)" if tri is None else
+                f"{_esc(tri['verdict'])}" + (f": {_esc('; '.join(tri['reasons']))}" if tri["reasons"] else ""))
+    L += ["", "## Risk", "", f"- p_scam: {float(d['risk']['p_scam']):.3f}",
+          f"- Flags: {_esc(', '.join(d['risk']['flags'])) or 'none'}",
+          f"- Triage (senior model, finalists only): {tri_line}", "", "## Why this tier", ""]
     L += [f"- {_esc(r)}" for r in d["reasons"]] or ["- n/a"]
     L += ["", "## How to buy safely", ""] + [f"- [ ] {_esc(c)}" for c in d["checklist"]]
     L += ["", "## Outcome", "",

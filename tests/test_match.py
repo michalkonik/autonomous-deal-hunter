@@ -65,6 +65,10 @@ GPU = [
     ("RTX 3060", "gpu:rtx-3060:12"),
     ("ASUS TUF RTX4090 OC 24GB", "gpu:rtx-4090:24"),
     ("Grafikkarte NVIDIA GeForce RTX 5090 32GB Founders Edition", "gpu:rtx-5090:32"),
+   ("NVIDIA GeForce RTX 6090 Founders Edition 32GB", "gpu:rtx-6090:32"),
+   ("MSI GeForce RTX 6080 Gaming Trio 20GB", "gpu:rtx-6080:20"),
+   ("ASUS TUF GeForce RTX 6070 OC 16GB", "gpu:rtx-6070:16"),
+   ("Zotac RTX 6080 Solo", "gpu:rtx-6080:20"),
     ("ASUS Dual RTX 4060 Ti 16GB", "gpu:rtx-4060-ti:16"),
     ("Zotac RTX 4060 Ti 8 GB", "gpu:rtx-4060-ti:8"),
     ("Sapphire Nitro+ Radeon RX 7900 XT 20GB", "gpu:rx-7900-xt:20"),
@@ -350,6 +354,7 @@ def test_taxonomy_integrity():
     ("rtx-3060", [8, 12]), ("rtx-4060-ti", [8, 16]), ("rtx-4070-ti-super", [16]), ("rtx-5090", [32]),
     ("rx-7900-xtx", [24]), ("rx-7900-xt", [20]), ("rx-9070-xt", [16]), ("arc-b580", [12]),
     ("rtx-3080", [10, 12]), ("rtx-4090", [24]), ("rtx-5060-ti", [8, 16]), ("a100", [40, 80]),
+    ("rtx-6070", [12, 16]), ("rtx-6080", [20, 24]), ("rtx-6090", [32]),
 ])
 def test_known_vram(model, vram):
     e = {x["id"]: x for x in taxonomy.gpu_entries("gpu")}[model]
@@ -794,3 +799,110 @@ def test_brand_context_still_works_for_cards(title, key):
 def test_stripped_die_words_followed_by_issue_nouns_are_not_for_parts(title):
     r = ex(title)
     assert r.for_parts is False and "stripped_die" not in r.defects, title
+
+
+# ------------------------------------------------------------------ deferred minors: crack vocabulary, "without core"
+
+CRACKED = ["cracked PCB", "PCB cracked", "pęknięta płytka", "pęknięty PCB", "pęknięcie laminatu", "PCB gebrochen",
+           "Platine gebrochen", "abgebrochener Stecker", "prasklá deska", "prasklina na PCB", "törött PCB",
+           "repedt nyák"]
+
+
+@pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RX 7900 XTX 24GB"])
+@pytest.mark.parametrize("w", CRACKED)
+def test_cracked_board_is_a_defect(w, chip):
+    r = ex(f"{chip} {w}")
+    assert r.for_parts is True and "damaged" in r.defects, (w, r.defects)
+
+
+@pytest.mark.parametrize("title", [
+    "RTX 4090 not cracked", "RTX 4090 no cracks", "RTX 4090 bez pęknięć", "RTX 4090 nie pęknięta",
+    "RTX 4090 nicht gebrochen", "RTX 4090 není prasklá", "RTX 4090 nem törött", "RTX 4090 Crackdown edition box no"])
+def test_negated_or_unrelated_crack_words_are_not_defects(title):
+    r = ex(title)
+    assert "damaged" not in r.defects and r.for_parts is False, (title, r.defects)
+
+
+@pytest.mark.parametrize("w", ["without core", "without die", "without the GPU die", "without GPU chip", "without chip"])
+def test_without_core_is_a_stripped_board(w):
+    r = ex(f"RTX 3080 10GB {w}")
+    assert r.for_parts is True and "stripped_die" in r.defects, (w, r.defects)
+
+
+@pytest.mark.parametrize("title", ["RTX 3080 10GB without core issues", "RTX 3080 without box", "RTX 3080 without die problems"])
+def test_without_followed_by_an_issue_noun_or_box_is_not_stripped(title):
+    r = ex(title)
+    assert "stripped_die" not in r.defects, (title, r.defects)
+
+
+# ------------------------------------------------------------------ deferred minors: SSD/RAM accessory window, heatsink
+
+@pytest.mark.parametrize("title", [
+    "SSD NVMe 1TB radiator", "NVMe M.2 2TB heatsink", "M.2 NVMe SSD 2TB Heatsink EK", "Heatsink do SSD M.2 NVMe",
+    "SSD M.2 2280 1TB chłodzenie", "DDR5 32GB radiator", "DDR4 16GB heatsink", "RTX 4090 heatsink",
+    "Samsung 990 Pro 2TB NVMe heatsink"])
+def test_accessory_after_the_capacity_is_still_the_item_sold(title):
+    assert ex(title).key is None, title
+
+
+@pytest.mark.parametrize("title,key", [
+    ("WD Black SN850X 2TB NVMe with heatsink", "ssd:nvme:2tb"),
+    ("Samsung 990 Pro NVMe 2TB z radiatorem", "ssd:nvme:2tb"),
+    ("Samsung 990 Pro NVMe 2TB + heatsink", "ssd:nvme:2tb"),
+    ("Kingston NV2 1TB NVMe M.2 2280", "ssd:nvme:1tb"),
+    ("Crucial P3 Plus 2TB NVMe PCIe 4.0, radiator w zestawie", "ssd:nvme:2tb"),
+    ("Kingston Fury Beast DDR5 32GB (2x16GB) 6000 CL36 with heatsink", None),  # key checked below: not None
+])
+def test_inclusion_markers_keep_the_storage_key(title, key):
+    r = ex(title)
+    assert r.key is not None, title
+    if key:
+        assert r.key == key, (title, r.key)
+
+
+def test_cooler_master_edition_still_keeps_the_gpu_key():
+    assert ex("RTX 3090 Cooler Master edition").key == "gpu:rtx-3090:24"
+    assert ex("RTX 3090 cooler").key is None  # an accessory right after the chip is the item sold
+
+
+# ------------------------------------------------------------------ live round 29 Oct: laptops/PCs and water blocks
+
+
+@pytest.mark.parametrize("title", [
+    "Msi - Inch Core™ Ultra 9 275hx 32 Gb 2 Tb Geforce Rtx™ 5090",   # a laptop on marktplaats (windows-laptops)
+    "MSI - inch GB 1 TB GeForce RTX 5080",
+    "OKAZJA Predator 16 Intel i7 GeForce RTX 4060 1TB",
+    "Paradigit Gaming Ultimate AMD R7 9800X3D RTX 5080",
+    "Ryzen 7 7800X3D RTX 4070 Ti Super zestaw",
+    "Lenovo 16\" RTX 4070 32GB",
+    "Gigabyte G6X 9800X3D RTX 4060",
+    "Asus 15,6 cali RTX 4060",
+    "Core Ultra 7 265K + RTX 5070 Ti",
+    "i9-13980HX RTX 4090",
+])
+def test_laptops_and_pcs_naming_a_gpu_are_never_a_certain_card(title):
+    r = ex(title)
+    assert r.key is None or r.key.startswith("gpu-mobile:") or (r.certainty <= 0.5 and r.bundle_items), (
+        title, r.key, r.certainty, r.bundle_items)
+
+
+@pytest.mark.parametrize("title,key", [
+    ("EVGA RTX 3090 FTW3 Ultra 24GB", "gpu:rtx-3090:24"),
+    ("ASUS ROG Strix RTX 4080 Z790 test", "gpu:rtx-4080:16"),
+    ("MSI RTX 4070 Ti Super Ventus 3X 16GB", "gpu:rtx-4070-ti-super:16"),
+    ("Gigabyte RTX 5070 Ti Gaming OC 16GB", "gpu:rtx-5070-ti:16"),
+    ("Sapphire Nitro+ RX 7900 XTX 24GB", "gpu:rx-7900-xtx:24"),
+    ("RTX 3080 10GB 2 lata gwarancji", "gpu:rtx-3080:10"),
+    ("RTX 4090 Founders Edition 24GB 1000W ready", "gpu:rtx-4090:24"),
+])
+def test_real_cards_keep_a_certain_key(title, key):
+    r = ex(title)
+    assert r.key == key and r.certainty >= 0.7 and not r.bundle_items, (title, r.key, r.certainty, r.bundle_items)
+
+
+@pytest.mark.parametrize("title", [
+    "Blok wodny Alphacool Rtx 4070TI Asus rog Strix", "Blok wodny EK RTX 3080", "RTX 4090 blok wodny Bykski",
+    "Wasserblock RTX 4090", "Kühlblock RTX 3090 Alphacool", "Vízhűtő blokk RTX 3080", "Vodní blok RTX 3080",
+    "Waterkoeling blok RTX 3080", "RTX 3080 Waterblok EK"])
+def test_water_blocks_in_every_language_are_not_cards(title):
+    assert ex(title).key is None, title
