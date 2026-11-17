@@ -13,7 +13,18 @@ from decimal import Decimal
 
 STUBS = ["replay"]  # later milestone
 COMMANDS = ["start", "stop", "status", "page", "deals", "show", "verify", "replay", "eval", "playbook", "books",
-            "round", "report", "recheck"]
+            "round", "report", "recheck", "xai-login"]
+
+
+def cmd_xai_login(args: argparse.Namespace) -> int:
+    from .llm import LLMError
+    from .xai_oauth import login
+    try:
+        login()
+    except LLMError as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def _stub(args: argparse.Namespace) -> int:
@@ -48,6 +59,8 @@ def _dump(obj) -> None:
 def cmd_start(args) -> int:
     from . import runtime
     root, cfg = _ctx()
+    if getattr(args, "page_only", False):
+        return runtime.start_page(cfg, root)
     return runtime.start(cfg, root)
 
 
@@ -101,6 +114,10 @@ def cmd_status(args) -> int:
     print(f"  health (24 h): blocked {h.get('blocked') or '-'}; disabled {h.get('disabled') or '-'}")
     ls = s.get("llama_swap") or {}
     print(f"  llama-swap: running {ls.get('running')}; roles {ls.get('roles')}")
+    provs = s.get("providers") or []
+    if provs:
+        print("  providers: " + "; ".join(
+            f"{p['name']} cap ${p['cap_usd']:g} {p['roles']}" for p in provs))
     print(f"  ntfy topic: {s.get('ntfy_topic')}")
     lr = s.get("log_repo") or {}
     print(f"  log repo: {lr.get('log_dir')} clone={lr.get('clone')} last={lr.get('last_commit')} remote={lr.get('remote')}")
@@ -259,6 +276,15 @@ def _deal_row(store, d) -> dict:
             "verified_at": d.verified_at.isoformat() if d.verified_at else None, "listing": lst}
 
 
+def _deal_rank(d, listing) -> tuple:
+    """Same order as the deals page: star, tier, easy access to Poland, then conservative net."""
+    from .shipping import easy_poland
+    source = listing["source"] if listing is not None else None
+    country = listing["country"] if listing is not None else None
+    easy = easy_poland(source, country, d.ship_pl)
+    return (not d.star, d.tier, not easy, -Decimal(d.cons_net_usd), d.id or 0)
+
+
 def cmd_deals(args) -> int:
     root, _ = _ctx()
     store = _store(root)
@@ -266,7 +292,8 @@ def cmd_deals(args) -> int:
         return 1
     try:
         ds = store.deals({"tier": args.tier} if args.tier else None)
-        ds.sort(key=lambda d: (not d.star, d.tier, -Decimal(d.cons_net_usd)))
+        refs = {r["id"]: r for r in store.conn.execute("select id, source, country from listings")}
+        ds.sort(key=lambda d: _deal_rank(d, refs.get(d.listing_ref)))
         rows = [_deal_row(store, d) for d in ds[: args.limit]]
     finally:
         store.close()
@@ -463,6 +490,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dh", description="Deal Hunter")
     sub = p.add_subparsers(dest="command", metavar="command")
     sp = sub.add_parser("start", help="start the agent (systemd user unit; refuses on low RAM or a foreign model)")
+    sp.add_argument("--page-only", action="store_true",
+                    help="start only the web page; do not start the hunter")
     sp.set_defaults(func=cmd_start)
     sp = sub.add_parser("stop", help="stop everything, close observation windows, release the models it loaded")
     sp.set_defaults(func=cmd_stop)
@@ -522,6 +551,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(func=_stub)
     from . import probe
 
+    sp = sub.add_parser("xai-login", help="sign in to xAI with a device code (no API key); prints a link and a code")
+    sp.set_defaults(func=cmd_xai_login)
     sp = sub.add_parser("probe", help="run one source adapter search live and print the listings")
     probe.add_arguments(sp)
     sp.set_defaults(func=probe.run)

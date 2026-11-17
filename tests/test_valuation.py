@@ -34,8 +34,9 @@ def comp(store, price, kind="ebay_sold", days=1.0, channel="allegro", condition=
     store.add_comp(KEY, condition, channel, Decimal(price), ago(days), kind, ref or f"{kind}:{price}:{days}")
 
 
-def lst(sid, price, *, source="allegro_lokalnie", currency="PLN"):
-    return Listing(source=source, source_id=sid, url=f"https://example.test/{source}/{sid}", title=sid, description="",
+def lst(sid, price, *, source="allegro_lokalnie", currency="PLN", title=None):
+    return Listing(source=source, source_id=sid, url=f"https://example.test/{source}/{sid}",
+                   title=sid if title is None else title, description="",
                    price=Decimal(price), currency=currency, country=None, city=None, lat=None, lon=None,
                    seller_hash=None, seller_age_days=None, seller_ratings=None, seller_score=None, ships=True,
                    pickup_only=False, is_business=False, photos=[], posted_at=None, seen_at=NOW)
@@ -132,6 +133,29 @@ def test_stale_retail_price_is_not_a_ceiling(store):
     assert e.ceiling_pln is None and e.median_pln == Decimal("5000.00")
 
 
+def test_expensive_asks_do_not_set_the_exit_when_a_cheap_cluster_exists(store):
+    """Fifteen fantasy asks must not hide three real ones, and must not delete those real ones as 'low outliers'."""
+    for i, price in enumerate(("3200", "3400", "3600")):
+        comp(store, price, "active_ask", days=1, ref=f"low:{i}")
+    for i in range(8):
+        comp(store, "14000", "active_ask", days=1, ref=f"high:{i}")
+    e = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert e is not None and e.median_pln == Decimal("3128.00")  # 3400 x the 0.92 ask-to-sale ratio
+    assert "outlier_dropped:8" in e.notes
+    assert all(c.price_pln < Decimal("4000") for c in e.comps)
+
+
+def test_outlier_ask_does_not_set_the_exit(store):
+    """One price several times the rest of the set is not a benchmark. Three agreeing sales still are."""
+    for i in range(3):
+        comp(store, "3000", "ebay_sold", days=1 + i, ref=f"sold:{i}")
+    comp(store, "20000", "active_ask", days=1, ref="swap-priced")
+    e = valuation.estimate(store, KEY, "used", "allegro", DAY)
+    assert e is not None and e.median_pln == Decimal("3000.00")
+    assert "outlier_dropped:1" in e.notes
+    assert all(c.price_pln < Decimal("4000") for c in e.comps)
+
+
 def test_returns_none_when_no_comps(store):
     assert valuation.estimate(store, KEY, "used", "allegro", DAY) is None
     comp(store, "3000", days=45)  # only older than 30 days: trend material, not a valuation
@@ -175,15 +199,17 @@ def test_own_channel_preferred_over_fallback(store):
 
 
 def test_pl_fallback_pool_with_reduced_weight(store):
+    """Allegro Lokalnie is the used benchmark when it has a comp. OLX is not mixed in."""
     comp(store, "3000", channel="olx")
     comp(store, "3200", "probably_sold", channel="allegro_lokalnie")
     comp(store, "9000", channel="kleinanzeigen")  # EU: not in a PL channel's pool
     e = valuation.estimate(store, KEY, "used", "allegro", DAY)
-    assert e.notes == ["fallback_pl"]
-    assert sorted((c.channel, c.weight) for c in e.comps) == [("allegro_lokalnie", 0.35), ("olx", 0.7)]
+    assert e.notes == ["allegro_used"]
+    assert [(c.channel, c.weight) for c in e.comps] == [("allegro_lokalnie", 0.5)]  # probably_sold × 1
     assert all(c.fallback for c in e.comps)
-    assert e.n_effective == pytest.approx(1.05)
-    assert e.n_sold == 2 and e.n_sold_effective == pytest.approx(1.05)  # 0.5 × 0.7 + 1.0 × 0.7
+    assert e.n_effective == pytest.approx(0.5)
+    assert e.n_sold == 1 and e.n_sold_effective == pytest.approx(0.5)
+    assert e.median_pln == Decimal("3200.00")
 
 
 def test_eu_fallback_converts_at_comp_date(store):
@@ -224,10 +250,10 @@ def test_missing_fx_rate_skips_comp_with_note(store):
 def test_ledger_probably_sold_and_live_asks_feed_the_estimate(store):
     src = "allegro_lokalnie"
     arm = ledger.arm_id(src, "rtx 4090")
-    base = [lst(f"m{i}", p) for i, p in enumerate(("3000", "3200", "3400", "3600"))]
+    base = [lst(f"m{i}", p, title=f"RTX 4090 24GB sample {i}") for i, p in enumerate(("3000", "3200", "3400", "3600"))]
     t0 = ago(2)
     ledger.observe(store, src, base, t0, arm=arm)
-    new = lst("new", "3100")
+    new = lst("new", "3100", title="RTX 4090 gone")
     ledger.observe(store, src, base + [new], t0 + timedelta(hours=4), arm=arm)
     ledger.observe(store, src, base, t0 + timedelta(hours=8), arm=arm)
     ledger.observe(store, src, base, t0 + timedelta(hours=12), arm=arm)
@@ -266,6 +292,7 @@ def test_params_and_channels_from_repo_config():
     assert p.ask_to_sale_ratio == Decimal("0.92") and p.weights["probably_sold"] == 0.5
     assert (p.fallback_pl_pool, p.fallback_eu_pool_for_pl, p.fallback_eu_pool_for_eu) == (0.7, 0.5, 0.7)
     assert p.ceiling_factor == Decimal("0.95") and p.fx_max_back_days == 4
+    assert p.outlier_low == Decimal("0.5") and p.outlier_high == Decimal("3.0")
     assert ledger.comp_weights() == p.weights  # one source of truth for the weights
     with pytest.raises(KeyError):
         valuation.Params.from_config(config.Config({"valuation": {"weights": {}}}))
@@ -314,6 +341,18 @@ def test_ingest_refreshes_active_asks_by_ref(store):
     assert len(store.comps(KEY)) == 2
     assert rows["active_ask"]["price_pln"] == "4085.00" and rows["active_ask"]["sold_at"] == ago(1).isoformat()
     assert rows["ebay_sold"]["price_pln"] == "3780.00"  # 900 × 4.20 at its own date
+
+
+def test_like_new_comps_price_a_used_buy_and_never_a_new_one(store):
+    comp(store, "3000", condition="used")
+    comp(store, "3200", condition="like_new")
+    comp(store, "9000", condition="new")
+    assert len(valuation.estimate(store, KEY, "used", "allegro", DAY).comps) == 2
+    assert len(valuation.estimate(store, KEY, "new", "allegro", DAY).comps) == 1
+    assert valuation.benchmark_condition("new") == "new"
+    assert valuation.benchmark_condition("like_new") == "used"
+    assert valuation.benchmark_condition("unknown") == "used"
+    assert valuation.benchmark_condition(None) == "used"
 
 
 def test_unknown_condition_comps_count_as_used(store):
@@ -381,6 +420,50 @@ def test_eu_exit_pool_includes_pl(store):
     comp(store, "3000", channel="olx")
     e = valuation.estimate(store, KEY, "used", "ebay_de", DAY)
     assert e.notes == ["fallback_eu"] and e.comps[0].weight == 0.7
+
+
+def test_used_exit_prefers_allegro_over_ebay_asks_and_the_new_ceiling(store):
+    """eBay asks and the new-retail ceiling do not price a used exit once Allegro Lokalnie has used comps."""
+    for price in ("50000", "52000", "54000"):
+        comp(store, price, "active_ask", channel="ebay_pl", condition="unknown", ref=f"ebay:{price}")
+    comp(store, "41251.51", "retail_new", days=2, condition="new", channel="ceneo", ref="retail")
+    for price in ("24000", "26000", "29000", "32000"):
+        comp(store, price, "ebay_sold", channel="allegro_lokalnie", condition="used", ref=f"al:{price}")
+    e = valuation.estimate(store, KEY, "used", "ebay_pl", DAY)
+    assert e.notes == ["allegro_used"]
+    assert {c.channel for c in e.comps} == {"allegro_lokalnie"}
+    assert e.median_pln == Decimal("27500.00")  # midpoint of 26000 and 29000
+    assert e.ceiling_pln == Decimal("39188.93")  # 41251.51 × 0.95, and it does not replace the used price
+    assert e.p25_pln < e.ceiling_pln and "capped_at_ceiling" not in e.notes
+
+
+def test_one_allegro_comp_is_not_topped_up_from_ebay(store):
+    for price in ("5000", "5200", "5400"):
+        comp(store, price, "ebay_sold", channel="ebay_pl", condition="used", ref=f"fill:{price}")
+    comp(store, "1800", "ebay_sold", channel="allegro_lokalnie", condition="used", ref="only-al")
+    e = valuation.estimate(store, KEY, "used", "ebay_pl", DAY)
+    assert e.notes == ["allegro_used"]
+    assert [c.channel for c in e.comps] == ["allegro_lokalnie"]
+    assert e.median_pln == Decimal("1800.00")
+
+
+def test_new_exit_prefers_allegro_new_asks(store):
+    for price in ("4000", "4200", "4500"):
+        comp(store, price, "ebay_sold", channel="ebay_pl", condition="new", ref=f"ebay-new:{price}")
+    for price in ("2500", "2600", "2700"):
+        comp(store, price, "ebay_sold", channel="allegro_lokalnie", condition="new", ref=f"al-new:{price}")
+    e = valuation.estimate(store, KEY, "new", "olx", DAY)
+    assert e.notes == ["allegro_new"]
+    assert {c.channel for c in e.comps} == {"allegro_lokalnie"}
+    assert e.median_pln == Decimal("2600.00")
+
+
+def test_no_allegro_comp_keeps_the_channel_fallback(store):
+    for price in ("50000", "52000", "54000"):
+        comp(store, price, "ebay_sold", channel="ebay_pl", condition="used", ref=f"ebay-own:{price}")
+    e = valuation.estimate(store, KEY, "used", "ebay_pl", DAY)
+    assert e.notes == [] and {c.channel for c in e.comps} == {"ebay_pl"}
+    assert e.median_pln == Decimal("52000.00")
 
 
 def test_warm_fx_uses_callers_params(store):

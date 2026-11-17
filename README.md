@@ -25,7 +25,8 @@ single-platform bots. Deal Hunter's edge:
   4-8 weeks of watched time to mature (see [Cold start](#cold-start)).
 - **EU long-tail coverage.** Sources that nobody else watches: Allegro Lokalnie, sprzedajemy.pl, Kleinanzeigen,
   HardverApro (HU), Bazos (CZ, SK), Marktplaats (NL), eBay DE/PL through the official API, Pepper.pl and
-  hotukdeals feeds, and Polish retail shops for price errors. Allegro.pl and OLX come through an alert mailbox.
+  hotukdeals feeds, and Polish retail shops for price errors. Allegro.pl is the official REST API when the app
+  is allowed to search; OLX comes through an alert mailbox. Allegro saved-search mail still works alongside the API.
 - **PL JDG economics.** The net calculation covers margin-scheme VAT, import VAT and duty, the 2026 EU
   consignment and handling fees, platform fees, FX spread, returns reserve (2-year B2C warranty), a scam/DOA
   haircut and income tax. Every figure on a card shows its inputs. See [`docs/ECONOMICS.md`](docs/ECONOMICS.md).
@@ -72,6 +73,7 @@ export PATH="$PWD/.venv/bin:$PATH"          # puts `dh` on the PATH
 dh round --once --dry                        # one foreground round, no push (needs models, or add --no-llm)
 dh deals                                     # list what it found
 dh start                                     # start the agent as the systemd user unit `deal-hunter`
+dh start --page-only                         # web page only; the hunter does not search
 dh status                                    # running?, rounds, health, ntfy topic, log repo, improvement loop
 dh playbook                                  # active playbook; --pending, --rollback N, --maintenance on|off ...
 dh eval                                      # must-pass and golden scores of the active playbook
@@ -110,7 +112,7 @@ walks you through these interactively. Spec section 15, updated for what was bui
 a feature on; without them the feature stays off and the rest of the agent still works.
 
 1. **The private GitHub log repo `deal-hunter-log` (gated: log publishing).** Done: the repo exists and
-   `config/publish.yaml` points at `git@github.com:michalkonik/deal-hunter-log.git`. An empty repo, or one with
+   `config/publish.yaml` points at `git@github.com:michal-koniu/deal-hunter-log.git`. An empty repo, or one with
    only `main`, is fine: the publisher creates the `log` branch itself on its first sync and pushes only `log`,
    never `main`. For another owner, set the clone URL in `config/local/publish.yaml`:
    ```yaml
@@ -119,20 +121,24 @@ a feature on; without them the feature stays off and the rest of the agent still
    ```
    Without a clone and a remote, the publisher records a `no_clone` health event and the agent keeps working.
 2. **Create the private repo `deal-hunter`** for this code, if you have not already.
-3. **Alert mailbox (gated: Allegro.pl and OLX; also Kleinanzeigen and eBay alerts).** Create a dedicated mailbox,
+3. **Alert mailbox (gated: OLX, and extra Allegro / Kleinanzeigen / eBay alerts).** Create a dedicated mailbox,
    store its IMAP login as `bw-secret dh-mail#imap` (JSON), save narrow searches on the platforms with that
    address, and enable the adapter (restart the agent after adding the secret). Full steps in [`docs/SOURCES.md`](docs/SOURCES.md#alert-mailbox-set-up).
-4. **eBay developer keys (gated: eBay DE/PL).** Store `bw-secret ebay#client_id` and `ebay#client_secret` (then
-   `dh stop` and `dh start`: the keys, like the IMAP login, are read once per run). Apply
-   for the Marketplace Insights scope to get sold prices; without it eBay supplies active asks only.
-5. **Email fallback for pushes (optional).** `bw-secret dh-mail#smtp` (JSON). Without it, a failed ntfy push is
+4. **eBay developer keys (gated: eBay DE/PL).** Store every application you have: `ebay#client_id` and
+   `ebay#client_secret`, then `ebay2`, `ebay3`, … (then `dh stop` and `dh start`: the keys, like the IMAP login,
+   are read once per run). A quota on one application switches to the next. Apply for the Marketplace Insights
+   scope on each application to get sold prices; without it eBay supplies active asks only.
+5. **Allegro REST keys (gated: allegro.pl search).** Store `allegro#client_id` and `allegro#client_secret`.
+   The hunter sends the registered User-Agent on every call and does not open www.allegro.pl. Allegro has to
+   verify the application for public offer search; until it does, the source records `not_verified`.
+6. **Email fallback for pushes (optional).** `bw-secret dh-mail#smtp` (JSON). Without it, a failed ntfy push is
    queued and retried for up to 6 hours.
-6. **Install ntfy** and subscribe to the topic from `dh status`.
-7. **Take [`ACCOUNTANT-QUESTIONS.md`](ACCOUNTANT-QUESTIONS.md) to your accountant**, then update
+7. **Install ntfy** and subscribe to the topic from `dh status`.
+8. **Take [`ACCOUNTANT-QUESTIONS.md`](ACCOUNTANT-QUESTIONS.md) to your accountant**, then update
    `config/economics.yaml` (frozen layer: edit it only while the agent is stopped).
-8. **Check the model roles** in `config/models.yaml` against `curl -s localhost:8080/running`, or map them to
+9. **Check the model roles** in `config/models.yaml` against `curl -s localhost:8080/running`, or map them to
    already-loaded models in `config/local/models.yaml` ([`docs/CONFIGURATION.md`](docs/CONFIGURATION.md#modelsyaml)).
-9. **Decisions still open.** Vinted (no adapter exists, off), logged-in eBay Product Research (not implemented),
+10. **Decisions still open.** Vinted (no adapter exists, off), logged-in eBay Product Research (not implemented),
    and whether to allow paid LLM APIs (off; `models.paid_api.monthly_cap_usd` is 0, so no paid call is ever made).
 
 ## Documentation

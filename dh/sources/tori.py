@@ -16,7 +16,7 @@ from .base import Adapter, AdapterError, Query, norm, price_of, product_ld, sell
 
 BASE = "https://www.tori.fi"
 API = f"{BASE}/recommerce/forsale/search/api/search/SEARCH_ID_BAP_COMMON"
-WANTED_TYPES = {"ostetaan"}
+WANTED_TYPES = {"ostetaan", "vaihdetaan", "vaihto"}  # Ostetaan = wanted, Vaihdetaan/Vaihto = a swap
 
 
 class Tori(Adapter):

@@ -41,9 +41,12 @@ def test_sold_and_wanted_dropped():
          "canonical_url": "https://www.tori.fi/recommerce/forsale/item/2"},
         {"id": "3", "heading": "C", "price": {"amount": 30, "currency_code": "EUR"},
          "trade_type": "Myydään", "flags": ["private"],
-         "canonical_url": "https://www.tori.fi/recommerce/forsale/item/3"}]}
+         "canonical_url": "https://www.tori.fi/recommerce/forsale/item/3"},
+        {"id": "4", "heading": "Vaihdetaan GTX 1070", "price": {"amount": 150, "currency_code": "EUR"},
+         "trade_type": "Vaihdetaan", "flags": ["private"],
+         "canonical_url": "https://www.tori.fi/recommerce/forsale/item/4"}]}
     out = parse_search(json.dumps(docs))
-    assert [l.source_id for l in out] == ["3"]  # sold + wanted gone
+    assert [l.source_id for l in out] == ["3"]  # sold, wanted and swap gone
 
 
 def test_price_edge_cases():

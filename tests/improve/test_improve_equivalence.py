@@ -108,7 +108,8 @@ def test_offline_judge_matches_the_production_round(store, tmp_path, llm, alive_
             ev = store.conn.execute("select tier, note from evaluations where listing_id=?", (lid,)).fetchone()
             ex = store.conn.execute("select key from extractions where listing_id=?", (lid,)).fetchone()
             prod = (ex["key"] if ex else None, band(ev["tier"]),
-                    bool(dropped & {"bait_or_parts", "no_key", "price_range", "hard_exclude"}))
+                    bool(dropped & {"bait_or_parts", "no_key", "price_range", "hard_exclude",
+                                    "rules_rejected"}))
             # the judge reads what production stored: the cached LLM output (if still current) and the verification
             o = await judge.judge(l, lid=lid, cached=replay.cached_extraction(store, lid, l.title),
                                   verified_age_s=0.0 if lid in replay.verified_listings(store) else None)

@@ -8,9 +8,10 @@ description: Set up Deal Hunter end to end on this machine after cloning the rep
 **Goal:** from a bare clone to a running agent the owner can trust, with every secret stored safely and every
 claim verified by a command, not assumed.
 
-The owner's only manual step is `git clone`. Everything else you do with your shell tools. Ask the owner only
-for *decisions* (which models, optional sources, where the log repo lives) and for secret *values*, securely
-(step 4). Never skip a verification; never claim success without the printed evidence.
+The owner's only manual step is `git clone`. Everything else you do with your shell tools. Ask the owner for
+*decisions* and for secret *values*, securely (steps 3 and 4). The model question in step 3 is not optional:
+ask it even when the shipped local models look right. Never skip a verification; never claim success without
+the printed evidence.
 
 Paths: `R` = this repo's root (the directory containing `pyproject.toml` - use the directory you were invoked
 from; if unsure, `pwd` and confirm it contains `dh/` and `pyproject.toml`). `S` = `$R/.claude/skills/setup-deal-hunter`.
@@ -51,8 +52,9 @@ the one file written for you).
 
 ## Steps
 
-Work through them in order. Before the first one, print the plan (steps 1-10, with what you will ask for) so the
-owner knows what is coming, and keep a visible task list of the steps.
+Work through them in order. Before the first one, print the plan (steps 1-10) and name the questions you will ask:
+which model powers each role (step 3), each access gap (step 4), and the owner settings (step 5). Keep a visible
+task list of the steps. Step 3 is a question you wait on. It is not a check you can pass by leaving the defaults.
 
 ### 1. Preflight
 `bash $S/scripts/setup.sh check` (run from anywhere; it finds the repo). It prints `KEY=VALUE` lines: Python
@@ -68,19 +70,49 @@ prints the version. Then run the test suite once, in the background:
 `.venv/bin/pytest -q` (network tests are skipped by default). Report passed/failed; a failure here means the
 environment is wrong, not the agent - fix it before going on.
 
-### 3. Which models do the LLM jobs
-`bash $S/scripts/setup.sh models` shows what llama-swap serves and what `config/models.yaml` wants.
-- The roles match what is loaded or loadable and RAM allows it: keep the defaults.
-- Something else is loaded (a chat model, another agent): map the roles to it in `config/local/models.yaml`
-  (see `reference/steps.md` for the file shape and for how to phrase the choice). `dh stop` then leaves those
-  models loaded.
-- No llama-swap at all: ask whether the owner wants LLM features now (they can point `base_url` at any
-  OpenAI-compatible endpoint) or start rules-only (`dh round --once --dry --no-llm`) and wire models later.
-Never guess a model name: use exactly what `curl -s localhost:8080/running` lists.
+### 3. Ask what powers the hunter, then set that up
+Run `bash $S/scripts/setup.sh models` first so you know what llama-swap is serving. Then **ask the owner**
+before you write `config/local/models.yaml` and before you start the agent. Do not keep the shipped defaults
+just because they match. The question, in one go:
+
+1. **Local llama-swap** (the normal answer). No API key and no monthly spend. Shipped roles, unless they
+   name others: worker `gemma-4-26b-a4b-pool`, senior and advisor `qwen3.8-flash-next-uncensored`. Use a
+   name only if `curl -s localhost:8080/v1/models` lists it.
+2. **A commercial model for some roles, or for all of them.** The choices are Grok, Gemini, Claude and
+   ChatGPT. The worker does most of the calls, so the usual mix is worker local and senior plus advisor
+   commercial. One role sits on one provider. Grok needs no API key. Run `dh xai-login`. It prints a link
+   and a code. Send both to the owner as soon as they appear, and leave the command running until it prints
+   `xai session stored`. They approve at accounts.x.ai. The session is stored for Deal Hunter. A console
+   API key is only when they already have one.
+
+If they pick local:
+- Nothing else loaded, or only those role models: write no provider block.
+- A different model is already loaded: `dh start` will refuse, because loading the role models would evict
+  it. Ask whether to map the local roles onto that loaded model, or to wait. Do not unload it yourself.
+- No llama-swap at all: ask whether to start rules-only (`dh round --once --dry --no-llm`) or to use a
+  commercial provider instead.
+
+If they pick a commercial provider, ask the rest before you write anything, and do not invent the answers:
+- which roles, and which of the four providers for each;
+- the model id, copied from that provider's model list;
+- the monthly cap in USD they accept (a missing cap or `0` means the provider stays off);
+- the USD price per million input tokens and per million output tokens, from that provider's price page,
+  shown to them before it is written.
+
+For Gemini, Claude, ChatGPT, and a Grok console key, store the key with
+`bash $S/scripts/put_secret.sh <ref>` so the value never enters the chat. References: `grok#api_key`,
+`gemini#api_key`, `claude#api_key`, `openai#api_key`. Grok device login stores its own session; do not ask
+for a key after `dh xai-login` succeeds. Preset base URLs and the yaml shape are in `reference/steps.md`.
+Write `auth: xai_oauth` for that login. A role listed under `providers` is not loaded on llama-swap. When
+every role is remote, `dh start` does not load llama-swap and does not apply the 12 GB floor. After the
+file is written, `dh stop && dh start`.
+
+Paid endpoints stay off until this question is answered. Never turn one on because it would "work better".
 
 ### 4. Access: every source the agent cannot see yet (ask about ALL of them)
 **A disabled source is invisible in `dh status`** - with no credentials the mailbox adapter is not even built, so
-no health event is recorded and a clean-looking status proves nothing about Allegro or OLX. Never assume the owner
+no health event is recorded and a clean-looking status proves nothing about OLX. Allegro with no keys records
+one `no_keys` event and does not search. Never assume the owner
 does not have a credential, and never move on silently: run the matrix, show it, ask once per gap, record the answer.
 
 ```bash
@@ -88,16 +120,29 @@ bash $S/scripts/setup.sh access   # one line per source: live=yes|no, via=http|r
 ```
 
 Ask the owner about each `access-gap` line, offering the concrete choice (this is the step a new owner is judged
-on - the agent runs fine without these, and is blind without them):
+on - the agent runs fine without these, and is blind without them). Two questions are mandatory, the same way
+the model question in step 3 is: ask them even when a key is already stored.
 - **`dh-mail#imap`** - JSON `{"host","port","user","password","folder"}` for the alert mailbox. Without it
-  **Allegro.pl and OLX.pl are invisible** (both block polite polling; their saved-search alert mail is the only
-  legitimate route) and eBay/Kleinanzeigen alerts are lost. It takes a dedicated mailbox with IMAP SSL 993, accounts
-  on the platforms registered to *that* address, and saved searches - about an hour of the owner's clicking, so ask
-  early even if they cannot do it today. Check a live mailbox with `bash $S/scripts/setup.sh mailbox` (read-only:
-  it shows the unseen count and whether each mail would pass the DKIM rule; nothing is marked read).
-- **`ebay#client_id`, `ebay#client_secret`** - eBay developer keys (eBay bans scrapers, the API is the only route).
-  Also tell the owner to apply for the **Marketplace Insights** scope in the same portal: sold prices are the fastest
-  way to reach tier 1 before the ledger matures.
+  **OLX.pl is invisible** (it blocks polite polling; saved-search alert mail is the only route). Allegro.pl,
+  Kleinanzeigen and eBay alerts are lost too. Allegro.pl search itself is the REST keys below, not this mailbox.
+  It takes a dedicated mailbox with IMAP SSL 993, accounts on the platforms registered to *that* address, and
+  saved searches - about an hour of the owner's clicking, so ask early even if they cannot do it today. Check a
+  live mailbox with `bash $S/scripts/setup.sh mailbox` (read-only: it shows the unseen count and whether each
+  mail would pass the DKIM rule; nothing is marked read).
+- **eBay keys — always ask whether they have one application or more.** Ask even when `ebay#client_id` is
+  already stored. Store every set they provide, in order: item `ebay`, then `ebay2`, `ebay3`, … up to `ebay8`.
+  Each set is App ID (`client_id`), Cert ID (`client_secret`), and Dev ID (`dev_id`, stored and never sent).
+  A missing `client_id` ends the list, so do not skip a number. A quota (HTTP 429) on one application switches
+  to the next; one application still backs off. Also tell them to apply for the **Marketplace Insights** scope
+  on each application: sold prices are the fastest way to reach tier 1 before the ledger matures, and that
+  scope is granted per application. `not_granted` means every stored key lacks it.
+- **`allegro#client_id`, `allegro#client_secret`** - Allegro REST Client ID and Client Secret. Ask for both.
+  The hunter sends the registered User-Agent on every call, including the token request. The shipped header is
+  `deal-hunter/1.0 (+https://github.com/michalkonik/family-finance-planner)`. A different registered header must
+  be set as `adapters.allegro.user_agent` in config before the first call, or Allegro can block the key. It is
+  not a secret. The hunter never opens www.allegro.pl. `/offers/listing` may return `not_verified` until Allegro
+  grants that application public offer search; do not work around that by fetching the website. Saved-search
+  mail still arrives through the mailbox.
 - **`dh-mail#smtp`** - JSON, optional e-mail fallback for pushes.
 Store each with `bash $S/scripts/put_secret.sh <item>#field [--stdin]`: on a Bitwarden-backed machine it writes the
 vault item itself (folder from `BW_AGENT_FOLDERS`, using `~/.config/bw/session`; if the vault is locked it fails
@@ -149,7 +194,9 @@ wired yet). This is also the command to re-check after any config edit.
 
 ### 9. The remaining owner-only items
 Print the list from `OWNER-TODO.md` that still applies to them, tailored: alert mailbox set-up (a dedicated
-mailbox + saved searches, ~1 h, the step that unlocks Allegro and OLX), eBay Marketplace Insights application,
+mailbox + saved searches, ~1 h, the step that unlocks OLX and extra Allegro / Kleinanzeigen / eBay alerts),
+every eBay application they have (not only the first), Allegro Client ID and Client Secret, eBay Marketplace
+Insights on each application,
 the accountant questions file, and the cold-start rule (tier 1 needs >= 12 recent *sold* comparables; the ledger
 needs 4-8 weeks of watched time - judge it after weeks, not hours). To re-check the mailbox later, run
 `bash $S/scripts/setup.sh mailbox` (it prints the folder, the unseen count and per-mail DKIM verdict, plus the
@@ -162,7 +209,7 @@ Verified: rounds <n>, health <clean | list>, models <roles -> names>, tests <n p
 Access: live <N>/<total> sources (setup.sh access). Dark: <source - what unlocks it>, ...
 Secrets stored: <list | none> (never shown)
 Local config: <files you created, one line each>
-Optional next steps: <mailbox / eBay keys / log repo / ntfy subscribe / accountant>
+Optional next steps: <mailbox / more eBay keys / Allegro REST keys / log repo / ntfy subscribe / accountant>
 Data: DB var/dh.db, screenshots var/screenshots/, log clone ~/.local/share/deal-hunter/log
 Undo: .venv/bin/dh stop; then `gio trash $R` removes the checkout (config/local/ is inside it)
 ```

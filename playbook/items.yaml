@@ -706,3 +706,11 @@
   sentinel: false
   min_pln: 1000
   value: gaming pc
+- id: query.rtx_5080_ti
+  kind: query
+  target: all
+  provenance: proposal:failures:empty_query
+  helpful: 0
+  harmful: 0
+  sentinel: false
+  value: rtx 5080 ti

@@ -6,8 +6,10 @@ when eBay does not grant the scope (the token request answers 400 invalid_scope)
 health event ("Marketplace Insights not granted", kind not_granted). Wrong keys (invalid_client / 401 on the token
 request) disable it with kind bad_credentials. Refusals (403/429) of the search are not a scope signal.
 
-It shares the per-host ApiClient of dh.sources.ebay (`api_client_for("api.ebay.com")`): common pacing and backoff.
-A refused search counts on that shared client like any other refusal.
+It shares the per-host ApiClient of dh.sources.ebay (`api_client_for("api.ebay.com")`): common pacing, the same key
+pool (`ebay`, `ebay2`, …), and backoff. A refused search counts on that shared client like any other refusal.
+`invalid_scope` disables the source only when every stored key lacks the scope. HTTP 429 on one key switches
+to the next key when more than one key is stored. 403/429 are not a scope signal.
 """
 from __future__ import annotations
 
@@ -39,6 +41,7 @@ class EbayInsights:
         self._secret_fn = secret_fn or ebay._cached_bw_secret
         self._client = client
         self._token: tuple[str, float] | None = None
+        self._token_index: int | None = None
         self.disabled_reason: str | None = None
         self._health_done = False
 
@@ -61,23 +64,37 @@ class EbayInsights:
         if store is not None:
             store.add_health("ebay_insights", kind, detail)
 
+    def _sets(self) -> list[tuple[str, str]]:
+        return self.client.ring_for(self._secret_fn).load()
+
     async def _auth(self) -> str | None:
         """Bearer token carrying the insights scope, None (and disabled) when keys or scope are missing."""
-        if self._token and self._token[1] > time.time() + 60:
-            return self._token[0]
-        import base64
-        cid, sec = self._secret_fn("ebay#client_id"), self._secret_fn("ebay#client_secret")
-        if not (cid and sec):
-            self._disable("no_keys", "no eBay keys (bw-secret ebay#client_id / ebay#client_secret): Marketplace Insights disabled")
+        if not self.enabled:
             return None
+        sets = self._sets()
+        if not sets:
+            self._disable("no_keys", "no eBay keys (bw-secret ebay#client_id / ebay#client_secret, further sets ebay2 …): Marketplace Insights disabled")
+            return None
+        if len(sets) == 1:
+            return await self._auth_one(sets[0])
+        return await self._auth_pool(sets)
+
+    async def _post_token(self, cid: str, sec: str, rotate: bool) -> tuple[int, dict]:
+        import base64
         basic = base64.b64encode(f"{cid}:{sec}".encode()).decode()
         status, text = await self.client.call(
             "POST", ebay.TOKEN_URL, {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
-            urlencode({"grant_type": "client_credentials", "scope": INSIGHTS_SCOPE}))
+            urlencode({"grant_type": "client_credentials", "scope": INSIGHTS_SCOPE}), rotate_quota=rotate)
         try:
             j = json.loads(text)
         except ValueError:
             j = {}
+        return status, j if isinstance(j, dict) else {}
+
+    async def _auth_one(self, pair: tuple[str, str]) -> str | None:
+        if self._token and self._token[1] > time.time() + 60:
+            return self._token[0]
+        status, j = await self._post_token(pair[0], pair[1], False)
         if status == 200 and j.get("access_token"):
             self._token = (j["access_token"], time.time() + float(j.get("expires_in", 7200)))
             return self._token[0]
@@ -90,6 +107,83 @@ class EbayInsights:
             return None
         raise AdapterError(f"ebay_insights: token request failed (status {status})")
 
+    async def _auth_pool(self, sets: list[tuple[str, str]]) -> str | None:
+        """Try each key. Scope missing on one key is not fatal while another key can still be asked."""
+        ring = self.client.ring
+        scope_miss = cred_miss = 0
+        for idx, (cid, sec) in enumerate(sets):
+            cached = ring.token(INSIGHTS_SCOPE, idx)
+            if cached and ring.ready(idx):
+                return cached
+            if not ring.ready(idx):
+                continue
+            try:
+                status, j = await self._post_token(cid, sec, True)
+            except ebay.QuotaExceeded as e:
+                ring.cool(idx, self.client.clock() + e.retry_after)
+                ring.drop_token(INSIGHTS_SCOPE, idx)
+                continue
+            if status == 200 and j.get("access_token"):
+                exp = time.time() + float(j.get("expires_in", 7200))
+                ring.put_token(INSIGHTS_SCOPE, idx, j["access_token"], exp)
+                self._token = (j["access_token"], exp)  # last good token; a 401 on search clears the ring copy
+                self._token_index = idx
+                return j["access_token"]
+            err = j.get("error")
+            if err == "invalid_scope":
+                scope_miss += 1
+                continue
+            if err == "invalid_client" or status == 401:
+                cred_miss += 1
+                continue
+            raise AdapterError(f"ebay_insights: token request failed (status {status})")
+        if scope_miss and scope_miss == len(sets):
+            self._disable("not_granted", NOT_GRANTED)
+            return None
+        if cred_miss and cred_miss + scope_miss == len(sets):
+            self._disable("bad_credentials", "eBay rejected the client credentials (invalid_client): Marketplace Insights disabled")
+            return None
+        if ring.pick() is None:
+            raise AdapterError("api backing off")
+        raise AdapterError("ebay_insights: token request failed")
+
+    async def _sales(self, q: str, tok: str, rotate: bool) -> tuple[int, str]:
+        url = f"{SALES_URL}?{q}"
+        base = {"X-EBAY-C-MARKETPLACE-ID": self.marketplace}
+        if not rotate:
+            return await self.client.call("GET", url, {"Authorization": f"Bearer {tok}", **base})
+        ring = self.client.ring
+        sets = ring.load()
+        order: list[int] = []
+        if self._token_index is not None:
+            order.append(self._token_index)
+        order += [i for i in range(len(sets)) if i not in order]
+        saw_quota = False
+        for idx in order:
+            if not ring.ready(idx):
+                continue
+            bearer = ring.token(INSIGHTS_SCOPE, idx)
+            if not bearer:
+                status, j = await self._post_token(sets[idx][0], sets[idx][1], True)
+                if not (status == 200 and j.get("access_token")):
+                    continue
+                bearer = j["access_token"]
+                ring.put_token(INSIGHTS_SCOPE, idx, bearer, time.time() + float(j.get("expires_in", 7200)))
+            try:
+                status, text = await self.client.call(
+                    "GET", url, {"Authorization": f"Bearer {bearer}", **base}, rotate_quota=True)
+            except ebay.QuotaExceeded as e:
+                ring.cool(idx, self.client.clock() + e.retry_after)
+                ring.drop_token(INSIGHTS_SCOPE, idx)
+                saw_quota = True
+                continue
+            self._token_index = idx
+            self._token = (bearer, time.time() + 3600)
+            return status, text
+        if saw_quota:
+            raise AdapterError("api backing off")
+        raise AdapterError("ebay_insights: search failed")
+
     async def sold_comps(self, key: str, fetcher=None) -> list[CompRow]:
         if not self.enabled:
             return []
@@ -99,12 +193,14 @@ class EbayInsights:
         if tok is None:
             return []
         q = urlencode({"q": ebay.query_for_key(key), "limit": self.limit})
-        # A refusal (403/429) is raised by the shared ApiClient, which backs off for everyone: not treated as "scope
-        # missing" (the token request is the scope gate). It propagates as AdapterError.
-        status, text = await self.client.call("GET", f"{SALES_URL}?{q}", {
-            "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
+        # A refusal (403/429) is raised by the shared ApiClient. With one key that backs off the host. With more
+        # than one key a 429 cools that key and the next key is tried. Neither case is a scope signal.
+        rotate = len(self._sets()) > 1
+        status, text = await self._sales(q, tok, rotate)
         if status == 401:
             self._token = None
+            if self._token_index is not None and self.client.ring is not None:
+                self.client.ring.drop_token(INSIGHTS_SCOPE, self._token_index)
             raise AdapterError("ebay_insights: token rejected")
         if status != 200:
             raise AdapterError(f"ebay_insights: search status {status}")

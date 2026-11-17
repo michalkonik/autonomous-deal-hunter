@@ -58,7 +58,7 @@ from . import triage as triagemod
 from .llm import LLMUnavailable
 from .bandit import Bandit, value_units
 from .config import Config, assert_frozen_unchanged
-from .match import rules_extract
+from .match import has_papers, rules_extract
 from .models import Deal, Extraction, Listing
 from .money import RecordingFx, q2
 from .playbook_io import load_items
@@ -386,8 +386,19 @@ class RoundContext:
         self.usage["seconds"] += float(seconds)
 
     def on_paid(self, role: str, usd: float) -> None:
-        """llm.Client(on_paid=ctx.on_paid): paid-API spend of this round (USD) for the books."""
+        """llm.Client(on_paid=ctx.on_paid): paid-API spend of this round (USD) for the books.
+        Each provider is booked on its own row so its monthly cap is not mixed with another's."""
         self.usage["paid_usd"] = float(self.usage.get("paid_usd", 0.0)) + float(usd)
+        prov = None
+        llm = getattr(self, "llm", None)
+        if llm is not None and hasattr(llm, "provider_of"):
+            try:
+                prov = llm.provider_of(role)
+            except Exception:  # noqa: BLE001 - a missing route still counts in the total
+                prov = None
+        if prov:
+            by = self.usage.setdefault("paid_by_provider", {})
+            by[prov] = float(by.get(prov, 0.0)) + float(usd)
 
 
 class _CountingLLM:
@@ -427,9 +438,19 @@ class _CountingLLM:
         return await asyncio.shield(fut)  # one caller's cancellation never cancels the others' shared check
 
     async def chat_json(self, *a, **kw):
-        foreign = await self._foreign_now()
-        if foreign:
-            raise LLMUnavailable("llama-swap runs a model outside the roles: " + ", ".join(foreign))
+        role = a[0] if a else kw.get("role")
+        remote = False
+        provider_of = getattr(self._inner, "provider_of", None)
+        if callable(provider_of):
+            try:
+                remote = bool(provider_of(role))
+            except Exception:  # noqa: BLE001
+                remote = False
+        # A remote call does not load or evict a llama-swap model, so another workload's model is not a reason to skip it.
+        if not remote:
+            foreign = await self._foreign_now()
+            if foreign:
+                raise LLMUnavailable("llama-swap runs a model outside the roles: " + ", ".join(foreign))
         self._stats.llm_calls += 1
         return await self._inner.chat_json(*a, **kw)
 
@@ -640,7 +661,10 @@ class _Round:
             ad = self.ctx.adapters[a.source]
             dom = getattr(ad, "domain", "") or a.source
             if getattr(ad, "enabled", True) is False:
-                continue  # e.g. eBay without API keys: reported once by the adapter, not an arm
+                note = getattr(ad, "note_disabled", None)
+                if note is not None:
+                    note(self.store)  # one health event, deduped by the adapter; the arms are not searched
+                continue
             if self.ctx.fetcher.disabled(dom) or self.ctx.fetcher.blocked(dom):
                 self.stats.skipped_arms += 1
                 continue
@@ -863,6 +887,11 @@ class _Round:
             self.store.save_extraction(lid, rules)
             self._mark_eval(lid, l, note="bait")
             return self.stats.drop("bait_or_parts")
+        if "rules_rejected" in rules.notes:
+            # server RAM, a brand clash, a part number that disagrees with the title: the LLM must not invent a key
+            self.store.save_extraction(lid, rules)
+            self._mark_eval(lid, l, note="rules_rejected")
+            return self.stats.drop("rules_rejected")
         if rules.key is None and (not _HW.search(l.title or "") or _SYSTEM_WORDS.search(l.title or "")):
             self.store.save_extraction(lid, rules)
             self._mark_eval(lid, l, note="no_key")
@@ -936,7 +965,9 @@ class _Round:
         out = self.shipping.get("outbound_pln") or {}
         outbound = Decimal(str(out.get(category, out.get("default", 25))))
         origin = economics.norm_country(l.country or "PL")
-        if l.pickup_only or l.ships is False:
+        # A domestic-only classified (Tori, Kleinanzeigen, Marktplaats, 2ememain) does not ship to
+        # Poland. Pricing it as the EU parcel rate made a Finnish pickup look like a 60 PLN delivery.
+        if l.pickup_only or l.ships is False or shipping.domestic_classified(l.source):
             if l.lat is None or l.lon is None:
                 return None
             return Decimal("0"), outbound, round(haversine_km(self.origin, (l.lat, l.lon)), 1)
@@ -1005,7 +1036,7 @@ class _Round:
     async def _appraise(self, l: Listing, lid: int, ex: Extraction, price_pln: Decimal | None,
                         verified_age_s: float | None = None, stock_photo: bool = False) -> Appraisal | None:
         cfg = self.cfg
-        cond = ex.condition if ex.condition in ("new", "like_new") else "used"
+        cond = valuation.benchmark_condition(ex.condition)
         if ex.key == PC_KEY:
             est = await self._partout(l, lid, ex, cond)
             ests = {est.channel: est} if est is not None else {}
@@ -1084,6 +1115,8 @@ class _Round:
         tr = tiering.assign(cons_usd, exp_usd, effort, conf, cap_usd, cfg.rules, ship_pl=ship == 1)
         if ship == 1:
             tr.reasons.append("ships directly to Poland: 5% floor bonus, no forwarding needed")
+        elif shipping.easy_poland(l.source, l.country, ship):
+            tr.reasons.append("Polish offer: easy to collect in Poland")
         if tr.tier is None:  # below the floor and not within 20%: a rising market can still make it a tier-4 watch
             tr = trend_signal(est.trend_30d, cons_usd, cap_usd, conf, cfg.rules, self.sc, tr.floor_usd) or tr
         return Appraisal(l, lid, ex, est, net, inp, rk2, ch, cons_usd, exp_usd, cap_usd, effort, conf, why, tr, fxr,
@@ -1193,24 +1226,48 @@ class _Round:
         return await self._save(a, arm, verified)
 
     # ------------------------------------------------------------ value gate (dh/valuegate.py)
+    def _watch(self, a: Appraisal, v: valuegate.Verdict) -> None:
+        a.tier.tier = 5
+        a.tier.reasons.append(v.note)
+        a.why.append(v.note)
+
     def _value_gate(self, a: Appraisal) -> Appraisal | None:
         """Evidence-and-edge screen between pricing and saving: keeps the tier, forces it to the tier-5 watchlist
-        (stored and shown, never pushed, never re-fetched), or drops the listing outright. Skipped for part-out
-        PCs - their value is the sum of their parts, not one key's comparables."""
-        if not self.gate.enabled or a.ex.key is None or a.ex.key == PC_KEY:
+        (stored and shown, never pushed, never re-fetched), or drops the listing outright. Part-out PCs skip the
+        one-key market screen (their value is the sum of their parts) and the shop-price check. A new item with
+        no receipt and no guarantee must be strictly under the same model's shop price. Every kept tier still
+        has to clear `min_return_on_capital`: a real but thin gap is a watch. Like-new is priced as used."""
+        if not self.gate.enabled or a.ex.key is None:
             return a
-        cond = a.ex.condition if a.ex.condition in ("new", "like_new") else "used"
-        ck = (a.ex.key, cond)
-        if ck not in self.gate_cache:
-            self.gate_cache[ck] = valuegate.collect(self.store, a.ex.key, cond, self.ctx.now(), self.gate)
-        v = valuegate.verdict(a.inp.buy_price, self.gate_cache[ck], self.gate)
-        if v.action == "drop":
-            self.stats.drop(f"value_gate_{v.code}")
-            return None
-        if v.action == "watch":
-            a.tier.tier = 5
-            a.tier.reasons.append(v.note)
-            a.why.append(v.note)
+        if a.ex.key != PC_KEY:
+            cond = valuation.benchmark_condition(a.ex.condition)
+            ck = (a.ex.key, cond)
+            if ck not in self.gate_cache:
+                self.gate_cache[ck] = valuegate.collect(self.store, a.ex.key, cond, self.ctx.now(), self.gate)
+            buy = valuegate.buy_pln(a.inp, getattr(a, "fxr", None))
+            v = valuegate.verdict(buy, self.gate_cache[ck], self.gate)
+            if v.code == "gate_no_data":
+                return a
+            if v.action == "drop":
+                self.stats.drop(f"value_gate_{v.code}")
+                return None
+            if v.action == "watch":
+                self._watch(a, v)
+                return a
+            if a.ex.condition == "new":
+                listing = getattr(a, "listing", None)
+                papers = has_papers(getattr(listing, "title", "") or "",
+                                    getattr(listing, "description", "") or "") if listing is not None else False
+                shop = valuegate.paperless_new_watch(buy, self.gate_cache[ck].retail_floor, papers, self.gate)
+                if shop is not None and a.tier.tier is not None and a.tier.tier < 5:
+                    self._watch(a, shop)
+                    return a
+        # a rising-market tier 4 is under the floor on purpose; the return check must not erase that signal
+        trend = any(str(r).startswith("trend:") for r in (a.tier.reasons or ()))
+        thin = None if trend else valuegate.thin_margin(
+            getattr(a, "cons_usd", None), getattr(a, "capital_usd", None), self.gate)
+        if thin is not None and a.tier.tier is not None and a.tier.tier < 5:
+            self._watch(a, thin)
         return a
 
     # ------------------------------------------------------------ finalist triage (dh/triage.py)

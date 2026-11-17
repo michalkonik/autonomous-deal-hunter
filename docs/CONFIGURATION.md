@@ -25,12 +25,13 @@ takes `item#field`:
 
 | Reference | Used by | Content | If missing |
 |---|---|---|---|
-| `bw-secret ebay#client_id`, `ebay#client_secret` | eBay Browse and Marketplace Insights | eBay developer keys | eBay adapters disable themselves and record one `no_keys` health event |
+| `bw-secret ebay#client_id`, `ebay#client_secret` | eBay Browse and Marketplace Insights | eBay developer keys. Further applications are `ebay2` … `ebay8` with the same fields. A missing `client_id` ends the list. `dev_id` is stored and not sent | eBay adapters disable themselves and record one `no_keys` health event |
+| `bw-secret allegro#client_id`, `allegro#client_secret` | Allegro.pl public offer search | Allegro REST client id and secret | The Allegro adapter records one `no_keys` event. A verified app that Allegro has not granted `/offers/listing` records `not_verified` |
 | `bw-secret dh-mail#imap` | The alert mailbox | JSON `{"host","port","user","password","folder"}`; `folder` defaults to `INBOX` | The mailbox adapter disables itself, one `no_credentials` health event |
 | `bw-secret dh-mail#smtp` | Email fallback for tier-1 pushes | JSON `{"host","port","user","password","to"}` (STARTTLS) | A failed ntfy push is queued and retried for 6 h |
 
 **Adding or changing a secret needs a restart.** The eBay keys and the IMAP login are read once per process (a
-missing one is remembered as missing): after you store `ebay#client_id` / `ebay#client_secret` or `dh-mail#imap`,
+missing one is remembered as missing): after you store `ebay#client_id` / `ebay#client_secret`, `allegro#client_id` / `allegro#client_secret`, or `dh-mail#imap`,
 run `dh stop` and `dh start`. Only `dh-mail#smtp` is read at each fallback e-mail.
 
 The ntfy topic is not a secret in Bitwarden: a random 24-character string is generated on first use and written to
@@ -51,6 +52,9 @@ Which LLM does which job. All calls go through one OpenAI-compatible endpoint (l
 | `paid_api.base_url`, `api_key_secret` | `null`, `null` | OpenAI-compatible endpoint, and a `bw-secret item#field` reference for its key (never stored in the repo or the DB) |
 | `paid_api.roles` | `{}` | Role -> model name on the paid endpoint, e.g. `{advisor: some-model}` |
 | `paid_api.usd_per_mtok_in`, `usd_per_mtok_out`, `pln_per_usd` | `0`, `0`, `4.0` | Price per million tokens (USD) used to cost each call, and the rate used to show the spend in PLN. The books record it as a `paid_api` row per round (USD in `units`) and `dh books` shows it |
+| `providers.<name>` | `{}` | Another endpoint. Same keys as `paid_api` (`base_url`, `api_key_secret`, `monthly_cap_usd`, prices, `roles`) except there is no `enabled: true` switch: the block is on unless `enabled: false`. `auth: xai_oauth` with `wire: responses` is `dh xai-login`: a device code approved at accounts.x.ai, stored in `~/.config/deal-hunter/xai-oauth.json`, no API key, calls `https://cli-chat-proxy.grok.com/v1`. `auth: grok_session` is the existing `grok login` file instead. A role listed here is not loaded on llama-swap. One role can sit on only one provider (`paid_api` counts). Each provider's spend is its own books row, `paid:<name>`, and its own monthly cap. An API key is a `bw-secret` reference, never the value |
+
+A role with no remote entry stays on `roles.<role>` at `base_url` (llama-swap). When every role is remote, `dh start` does not load or unload llama-swap and does not apply the free-RAM floor. Store a key with `bash .claude/skills/setup-deal-hunter/scripts/put_secret.sh grok#api_key` (it prompts on your terminal; do not paste the key into a chat), then put the provider block in `config/local/models.yaml` and restart.
 | `min_free_ram_gb` | `12` | `dh start` and `dh round` refuse below this much free RAM |
 | `timeouts.connect_s`, `read_s` | `5`, `60` | LLM HTTP timeouts |
 | `breaker.failures`, `cooldown_s` | `3`, `120` | After 3 consecutive transport errors the client refuses calls for 120 s and the round continues on rules |
@@ -171,11 +175,12 @@ Owner-tunable pacing and limits (not frozen). See [`TUNING.md`](TUNING.md) for w
 
 | Key | Default | Meaning |
 |---|---|---|
-| `fetch.user_agent` | `DealHunter/0.1 (personal price research; +https://github.com/michalkonik)` | Sent on every request |
+| `fetch.user_agent` | `DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)` | Sent on every request |
 | `fetch.min_interval_s`, `jitter_s` | `4`, `2` | Minimum gap between requests to one domain, plus 0 to 2 s of jitter; raised to a site's Crawl-delay |
 | `fetch.backoff_start_s`, `backoff_cap_s` | `60`, `3600` | Block backoff doubles from 60 s to 1 h |
 | `fetch.disable_after_blocks` | `3` | Consecutive blocks that disable a domain for the session |
-| `fetch.robots_ttl_s`, `max_crawl_delay_s` | `86400`, `60` | robots.txt cache and the longest Crawl-delay honoured |
+| `fetch.robots_ttl_s`, `max_crawl_delay_s` | `86400`, `60` | robots.txt cache and the longest Crawl-delay honoured. Used only when `obey_robots` is true |
+| `fetch.obey_robots` | `true` in code, `false` in this `sources.yaml` | When false, robots.txt is not fetched and not applied. A 403, a 429 and a challenge page still stop the request. Proxies, captcha solving and logged-in fetches stay refused |
 | `fetch.timeout_s` | `30` | Request timeout |
 | `fetch.proxies`, `solve_captcha`, `logged_in` | `false` | Policy keys. They exist so the rule is visible; the loader **refuses to start** if any is truthy (see above). There is no proxy, captcha or login code |
 | `sweep_timeout_s` | `300` *(built-in default)* | One source's sweep is cut after this |
@@ -229,11 +234,11 @@ Push title format: `T1 <star> +$640 <product key> · <source> <city>`.
 | Key | Default | Meaning |
 |---|---|---|
 | `interval_min` | `30` | Minutes between log-repo syncs |
-| `remote` | `git@github.com:michalkonik/deal-hunter-log.git` | Clone URL of `deal-hunter-log`; used only when `log_dir` is not yet a clone. Another owner overrides it in `config/local/publish.yaml` |
+| `remote` | `git@github.com:michal-koniu/deal-hunter-log.git` | Clone URL of `deal-hunter-log`; used only when `log_dir` is not yet a clone. Another owner overrides it in `config/local/publish.yaml` |
 | `branch` | `log` | Must stay `log`; any other value is refused with a `bad_branch` health event |
 | `log_dir` | `~/.local/share/deal-hunter/log` | Local clone of the log repo |
 | `cards_dir` | `var/cards/deals` | Where cards are written (relative to the repo root) |
-| `repo_web_url` | `https://github.com/michalkonik/deal-hunter-log` | Used to link the card in pushes; `null` leaves the "Card" button out |
+| `repo_web_url` | `https://github.com/michal-koniu/deal-hunter-log` | Used to link the card in pushes; `null` leaves the "Card" button out |
 
 ## books.yaml
 

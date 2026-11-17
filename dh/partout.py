@@ -5,8 +5,9 @@
    the other parts blanked out, RAM/SSD from their own snippets, CPU as a free-form `cpu:<model>` key); the LLM
    (worker, listing only inside <listing>, schema-validated, at most 6 components, keys re-validated) fills the
    kinds the rules did not find. Without an LLM client only the rules run.
-2. Each component is valued with `valuation.estimate` (any condition, the part-out exit channel). Components without a
-   comparable (CPUs have no comparable feed yet) add nothing and are listed as `unvalued:<key>` in the notes.
+2. Each component is valued with `valuation.estimate` (any condition, the part-out exit channel). A part with fewer
+   than `min_comps` agreeing comps is unvalued (`thin_market:<key>`): one stray ask is not a market price. Components
+   without a comparable (CPUs have no comparable feed yet) add nothing and are listed as `unvalued:<key>` in the notes.
 3. Sum of per-part P25 / median / P75, minus the parting cost (12 %), minus the outbound shipping of every valued part
    except the largest single leg (data/shipping.yaml outbound_pln by category; the net engine already charges one leg).
    The weakest part sets n_effective / n_sold / n_sold_effective, so confidence reflects the thinnest evidence.
@@ -35,8 +36,11 @@ from .store import Store
 ROOT = Path(__file__).resolve().parents[1]
 KINDS = ("gpu", "cpu", "ram", "ssd")
 
-_RAM_SNIP = re.compile(r"(?:\d\s*[x*]\s*)?\d{1,3}\s*(?:gb|go)\s*(?:ram\s*)?ddr\s*[345](?!\d)|"
-                       r"ddr\s*[345]\s*(?:\d\s*[x*]\s*)?\d{1,3}\s*(?:gb|go)(?![a-z])")
+_RAM_SNIP = re.compile(
+    r"(?:\d\s*[x*]\s*)?\d{1,3}\s*(?:gb|go)\s*(?:ram\s*)?ddr\s*[345](?!\d)"
+    r"(?:\s+\d\s*[x*]\s*\d{1,3}\s*(?:gb|go)?)?|"
+    r"ddr\s*[345](?!\d)\s*(?:\d\s*[x*]\s*)?\d{1,3}\s*(?:gb|go)"
+    r"(?:\s+\d\s*[x*]\s*\d{1,3}\s*(?:gb|go)?)?(?![a-z])")
 _SSD_SNIP = re.compile(r"\d{1,2}(?:[.,]\d+)?\s*(?:tb|gb)\s*(?:(?:nvme|ssd|m\.?2|sata)\s*)+|"
                        r"(?:(?:nvme|ssd|m\.?2|sata)\s*)+\d{1,2}(?:[.,]\d+)?\s*(?:tb|gb)")
 _RYZEN = re.compile(r"ryzen\s*([3579])\s*(?:pro\s*)?(\d{4,5}\s*(?:x3d|xt|x|gt|g|f|ge|h|hs|u)?)(?![a-z0-9])")
@@ -152,12 +156,18 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
         return None
     cfg = _params()
     channel = exit_channel or cfg["exit_channel"]
+    need = int(cfg["min_comps"])
     parts = comps if comps is not None else await components(listing, extraction, client, int(cfg["max_components"]))
-    valued, unvalued = [], []
+    valued, unvalued, thin = [], [], []
     for c in parts:
         est = valuation.estimate(store, c.key, condition, channel, day, params=params, channels=channels,
                                  exclude_listing_ids=())
-        (valued if est is not None else unvalued).append((c, est))
+        if est is None or len(est.comps) < need:
+            unvalued.append((c, None))
+            if est is not None:
+                thin.append(c.key)
+        else:
+            valued.append((c, est))
     if not valued:
         return None
     keep = Decimal(1) - Decimal(str(cfg["parting_cost"]))
@@ -171,6 +181,7 @@ async def value(listing: Listing, extraction: Extraction | None, store: Store, d
     dts = [e.days_to_sell for _, e in valued if e.days_to_sell is not None]
     notes = ["partout", f"parts:{len(valued) + len(unvalued)}", f"valued:{len(valued)}", f"extra_legs_pln:{q2(extra)}"]
     notes += [f"part:{c.key}" for c, _ in valued] + [f"unvalued:{c.key}" for c, _ in unvalued]
+    notes += [f"thin_market:{k}" for k in thin]
     notes += sorted({n for _, e in valued for n in e.notes})
     return valuation.ExitEstimate(
         channel=channel, key=(extraction.key if extraction and extraction.key else "pc:bundle"), condition=condition,

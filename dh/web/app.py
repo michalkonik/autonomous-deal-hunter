@@ -26,6 +26,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, RedirectRespons
 from starlette.routing import Route
 
 from .. import cards, ledger, playbook_io, publish
+from ..shipping import easy_poland
 from ..books import realised_net
 from ..customs import Customs
 from ..money import Fx
@@ -49,6 +50,14 @@ def _bad(msg: str) -> HTTPException:
 
 def _q2(x) -> str:
     return str(Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _default_rank(d, info) -> tuple:
+    """Starred first, then the better tier, then easy access to Poland, then the larger conservative net."""
+    source = info["source"] if info is not None else None
+    country = info["country"] if info is not None else None
+    easy = easy_poland(source, country, d.ship_pl)
+    return (not d.star, d.tier, not easy, -d.cons_net_usd, d.id)
 
 
 def _skey(sort: str, d, i) -> object:
@@ -296,8 +305,8 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
             deals = [d for d in deals if bool((last.get(d.id) or {}).get("fp")) == want]
         if "sort" in f:
             deals.sort(key=lambda d: _skey(f["sort"], d, info.get(d.listing_ref)), reverse=f.get("dir") == "desc")
-        else:  # default order: starred first, then tier, then the best conservative net
-            deals.sort(key=lambda d: (not d.star, d.tier, -d.cons_net_usd, d.id))
+        else:  # starred, then tier, then easy access to Poland, then the best conservative net
+            deals.sort(key=lambda d: _default_rank(d, info.get(d.listing_ref)))
         shd = {}
         for col in SORT_COLS:
             q2 = {k: str(v) for k, v in f.items()}
@@ -500,10 +509,28 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
         cadence = {k: sched.get(k) for k in ("round_interval_s", "budget", "budget_max", "max_searches_per_source",
                                              "max_llm_items", "reeval_hours", "round_timeout_s")}
         roles = models.get("roles") or {}
+        from ..llm import ProviderConflict, remote_routes
+        try:
+            routes = remote_routes(models)
+        except ProviderConflict as e:
+            routes, remote_summary = {}, str(e)
+        else:
+            if not routes:
+                remote_summary = "off (local models only)"
+            else:
+                by: dict[str, list[str]] = {}
+                caps: dict[str, float] = {}
+                for role, route in routes.items():
+                    by.setdefault(route.provider, []).append(f"{role}={route.model}")
+                    caps[route.provider] = route.cap_usd
+                remote_summary = "; ".join(
+                    f"{name} cap ${caps[name]:g}: {', '.join(sorted(items))}" for name, items in sorted(by.items()))
+        shown = {role: (f"{routes[role].provider}: {routes[role].model}" if role in routes else f"local: {name}")
+                 for role, name in roles.items()}
         web = data.get("web") or {}
         return render(request, "params.html", rows=rows, watches=watches, drop_pct=retail.get("drop_pct"),
-                      countries=countries, queries=queries, money=money, cadence=cadence, roles=roles,
-                      paid_enabled=bool((models.get("paid_api") or {}).get("enabled")),
+                      countries=countries, queries=queries, money=money, cadence=cadence, roles=shown,
+                      remote_summary=remote_summary,
                       feed_sources=sources.get("feed_sources") or sched.get("feed_sources") or [],
                       web_host=web.get("host", "0.0.0.0"), web_port=web.get("port", 8711))
 
@@ -546,7 +573,10 @@ def _deal_id(request: Request) -> int:
     return int(v)
 
 
-SOURCE_COUNTRY = {"allegro": "PL", "allegro_lokalnie": "PL", "sprzedajemy": "PL", "olx": "PL", "pepper_pl": "PL",
+SOURCE_COUNTRY = {"allegro": "PL", "allegro_lokalnie": "PL", "sprzedajemy": "PL", "refurbed": "PL",
+                  "taniekomputery": "PL", "asgoodasnew": "DE", "amso": "PL", "luxtrade": "PL",
+                  "devicestore": "PL", "gebrauchtetechnik": "DE", "olx": "PL",
+                  "pepper_pl": "PL",
                   "vinted": "PL", "ebay": "PL, DE", "kleinanzeigen": "DE", "willhaben": "AT", "sbazar": "CZ",
                   "bazos_cz": "CZ", "bazos_sk": "SK", "bazos_at": "AT", "hardverapro": "HU", "marktplaats": "NL",
                   "hotukdeals": "UK"}

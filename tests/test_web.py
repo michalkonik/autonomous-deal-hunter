@@ -66,6 +66,24 @@ def test_mark_validation_and_csrf(tmp_path):
     assert post(c, d.id, status="bought").status_code == 303
 
 
+def test_same_tier_puts_easy_poland_access_first(tmp_path):
+    """Inside one tier, a Polish offer or a listing that ships to Poland ranks ahead of a higher net abroad.
+    A better tier still ranks first."""
+    st, c, _ = build(tmp_path)
+    far, _, _ = make_deal(st, sid="far", seller="far", key="KEY-FAR")
+    near, _, _ = make_deal(st, sid="near", seller="near", key="KEY-NEAR", source="olx")
+    best, _, _ = make_deal(st, sid="best", seller="best", key="KEY-BEST")
+    st.conn.execute("update deals set tier=2, star=0, cons_net_usd=?, ship_pl=0 where id=?", ("500", far.id))
+    st.conn.execute("update listings set country='DE', source='kleinanzeigen' where id=?", (far.listing_ref,))
+    st.conn.execute("update deals set tier=2, star=0, cons_net_usd=?, ship_pl=0 where id=?", ("50", near.id))
+    st.conn.execute("update deals set tier=1, star=0, cons_net_usd=?, ship_pl=0 where id=?", ("10", best.id))
+    st.conn.execute("update listings set country='DE', source='kleinanzeigen' where id=?", (best.listing_ref,))
+    st.conn.commit()
+    html = c.get("/").text
+    pos = [html.index(f"/deal/{i}") for i in (best.id, near.id, far.id)]
+    assert pos == sorted(pos)
+
+
 def test_deals_sorted_star_tier_net(tmp_path):
     st, c, _ = build(tmp_path)
     ids = {}

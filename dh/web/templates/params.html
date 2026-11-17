@@ -44,7 +44,7 @@
 <h2>Models</h2>
 <div class="card"><table>
 {% for role, name in roles.items() %}<tr><th>{{role}}</th><td>{{name}}</td></tr>{% endfor %}
-<tr><th>Paid API</th><td>{{"enabled (capped)" if paid_enabled else "off (local models only)"}}</td></tr></table></div>
+<tr><th>Remote providers</th><td>{{remote_summary}}</td></tr></table></div>
 
 <h2>Web page</h2>
 <p class="mut">{{web_host}}:{{web_port}} (LAN)</p>

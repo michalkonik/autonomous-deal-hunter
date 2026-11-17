@@ -1,12 +1,14 @@
 """eBay Browse API (official, keyed). eBay web pages are never scraped.
 
-Keys: `bw-secret ebay#client_id` / `ebay#client_secret`. Without them the adapter is disabled and records ONE
-health event ("no eBay keys"); nothing is requested.
+Keys: Bitwarden items `ebay`, then `ebay2` … `ebay8`, fields `client_id` and `client_secret` (`dev_id` is stored
+and never sent). A missing `client_id` ends the list. An item with an id and no secret is skipped. Without any
+complete pair the adapter is disabled and records ONE health event ("no eBay keys"); nothing is requested.
+With two or more pairs, HTTP 429 cools that application and the next pair is used at once. With one pair, 429
+and 403 still back off 60 s doubling to 1 h and the client disables after 3 consecutive refusals.
 
 ApiClient exception (documented in docs/ADDING-A-SOURCE.md): the OAuth token call is a POST and the API answers
 unauthenticated GETs with a 403 error page that the web Fetcher would count as a bot block, so official API calls
-go through this small client instead of `Fetcher`. It still paces requests per host (>= `min_interval_s`), honours
-429/403 with a 60 s-doubling backoff (cap 1 h) and disables itself after 3 consecutive refusals. It skips
+go through this small client instead of `Fetcher`. It still paces requests per host (>= `min_interval_s`). It skips
 robots.txt ONLY for this documented, keyed API (api.ebay.com serves no robots.txt: 404). It sends the honest UA.
 """
 from __future__ import annotations
@@ -26,7 +28,7 @@ import httpx
 from ..models import CompRow, Listing
 from .base import Adapter, AdapterError, Query, filter_query, now_utc, price_of, seller_hash
 
-UA = "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
+UA = "DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)"
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 GROUP_URL = "https://api.ebay.com/buy/browse/v1/item/get_items_by_item_group?item_group_id={}"
@@ -42,6 +44,95 @@ SHIP_TO = "PL"
 FOR_PARTS_IDS = {"7000"}  # "For parts or not working"
 ALLOWED_API_HOSTS = frozenset({"api.ebay.com"})
 Request = Callable[..., Awaitable[tuple[int, str]]]
+MAX_KEY_SETS = 8
+_generation = 0
+
+
+class QuotaExceeded(AdapterError):
+    """One application's daily or burst quota (HTTP 429). Not a host-wide refusal when another key is ready."""
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f"api quota ({retry_after:.0f}s)")
+
+
+def item_name(n: int) -> str:
+    """0 -> ebay, 1 -> ebay2, … so a gap in `ebay2` stops the walk before `ebay3`."""
+    return "ebay" if n == 0 else f"ebay{n + 1}"
+
+
+def candidate_refs() -> tuple[str, ...]:
+    refs: list[str] = []
+    for n in range(MAX_KEY_SETS):
+        item = item_name(n)
+        refs.append(f"{item}#client_id")
+        refs.append(f"{item}#client_secret")
+    refs.extend(("allegro#client_id", "allegro#client_secret"))
+    return tuple(refs)
+
+
+def load_key_sets(secret_fn: Callable[[str], str | None]) -> list[tuple[str, str]]:
+    """Complete (client_id, client_secret) pairs in item order. Stop at the first missing client id."""
+    out: list[tuple[str, str]] = []
+    for n in range(MAX_KEY_SETS):
+        item = item_name(n)
+        cid = secret_fn(f"{item}#client_id")
+        if not cid:
+            break
+        sec = secret_fn(f"{item}#client_secret")
+        if sec:
+            out.append((cid, sec))
+    return out
+
+
+class KeyRing:
+    """Key sets plus per-index quota cooldowns and bearer tokens, on one ApiClient."""
+
+    def __init__(self, secret_fn: Callable[[str], str | None], clock: Callable[[], float]):
+        self.secret_fn, self.clock = secret_fn, clock
+        self.sets: list[tuple[str, str]] | None = None
+        self.cool_until: dict[int, float] = {}
+        self.tokens: dict[tuple[str, int], tuple[str, float]] = {}
+        self.gen = -1
+
+    def load(self) -> list[tuple[str, str]]:
+        if self.sets is None or self.gen != _generation:
+            self.sets = load_key_sets(self.secret_fn)
+            self.cool_until.clear()
+            self.tokens.clear()
+            self.gen = _generation
+        return self.sets
+
+    def ready(self, index: int) -> bool:
+        return self.clock() >= self.cool_until.get(index, 0.0)
+
+    def cool(self, index: int, until: float) -> None:
+        self.cool_until[index] = until
+
+    def pick(self) -> int | None:
+        sets = self.load()
+        for i in range(len(sets)):
+            if self.ready(i):
+                return i
+        return None
+
+    def soonest(self) -> float:
+        sets = self.load()
+        if not sets:
+            return 0.0
+        return min(self.cool_until.get(i, 0.0) for i in range(len(sets)))
+
+    def token(self, scope: str, index: int) -> str | None:
+        t = self.tokens.get((scope, index))
+        if t and t[1] > time.time() + 60:
+            return t[0]
+        return None
+
+    def put_token(self, scope: str, index: int, tok: str, exp: float) -> None:
+        self.tokens[(scope, index)] = (tok, exp)
+
+    def drop_token(self, scope: str, index: int) -> None:
+        self.tokens.pop((scope, index), None)
 
 
 async def _httpx_request(method: str, url: str, headers: dict, data: str | None, timeout: float) -> tuple[int, str]:
@@ -65,8 +156,19 @@ class ApiClient:
         self.refusals = 0
         self.disabled = False
         self._lock = asyncio.Lock()
+        self.ring: KeyRing | None = None
+        self._ring_gen = -1
+        self._ring_fn: Callable[[str], str | None] | None = None
 
-    async def call(self, method: str, url: str, headers: dict | None = None, data: str | None = None) -> tuple[int, str]:
+    def ring_for(self, secret_fn: Callable[[str], str | None]) -> KeyRing:
+        if self.ring is None or self._ring_gen != _generation or self._ring_fn is not secret_fn:
+            self.ring = KeyRing(secret_fn, self.clock)
+            self._ring_gen = _generation
+            self._ring_fn = secret_fn
+        return self.ring
+
+    async def call(self, method: str, url: str, headers: dict | None = None, data: str | None = None,
+                   rotate_quota: bool = False) -> tuple[int, str]:
         host = (urlsplit(url).hostname or "").lower()
         if host not in ALLOWED_API_HOSTS:  # the robots skip is for the documented eBay API only
             raise AdapterError(f"ApiClient refuses host {host!r}: not in ALLOWED_API_HOSTS")
@@ -88,6 +190,13 @@ class ApiClient:
                 self._last = self.clock()
                 raise AdapterError(f"api transport error: {type(e).__name__}") from e
             self._last = self.clock()
+            if status == 429 and rotate_quota:
+                # Another stored application can take this call. Do not cool the host or burn a refusal.
+                wait_s = self.b0
+                ra = str(rhead.get("retry-after", "")).strip()
+                if ra.isdigit():
+                    wait_s = min(max(float(ra), self.b0), self.cap)
+                raise QuotaExceeded(wait_s)
             if status in (429, 403):
                 self.refusals += 1
                 wait_s = self._next_backoff
@@ -130,10 +239,12 @@ def _cached_bw_secret(ref: str) -> str | None:
 
 
 def clear_secret_cache() -> None:
+    global _generation
     _secrets.clear()
+    _generation += 1
 
 
-KEY_REFS = ("ebay#client_id", "ebay#client_secret")
+KEY_REFS = candidate_refs()
 
 
 def prefetch_secrets(refs: tuple[str, ...] = KEY_REFS) -> None:
@@ -175,43 +286,62 @@ class EbayBrowse(Adapter):
         self.limit = limit
         self.weight = weight
         self._secret_fn = secret_fn
-        self._keys: tuple[str, str] | None | bool = False  # False = not resolved yet
+        self._keys: list[tuple[str, str]] | None | bool = False  # False = not resolved yet
+        self._gen = -1
         self.client = client or api_client_for("api.ebay.com")
         self._token: tuple[str, float] | None = None
         #: source_id -> item group id for variation listings found by the last parse_search
         self.variations: dict[str, str] = {}
 
     # ---------------------------------------------------------------- keys / health
-    def _resolve(self) -> tuple[str, str] | None:
-        if self._keys is False:
-            fn = self._secret_fn or _cached_bw_secret
-            cid, sec = fn("ebay#client_id"), fn("ebay#client_secret")
-            self._keys = (cid, sec) if cid and sec else None
+    def _secret(self) -> Callable[[str], str | None]:
+        return self._secret_fn or _cached_bw_secret
+
+    def _resolve(self) -> list[tuple[str, str]] | None:
+        if self._keys is False or self._gen != _generation:
+            sets = self.client.ring_for(self._secret()).load()
+            self._keys = sets or None
+            self._gen = _generation
         return self._keys or None
+
+    def _multi(self) -> bool:
+        sets = self._resolve()
+        return bool(sets) and len(sets) > 1
 
     @property
     def enabled(self) -> bool:
         return self._resolve() is not None
 
+    def note_disabled(self, store) -> None:
+        """One `no_keys` event for every marketplace. The scheduler calls this when it skips the arms."""
+        self._note_store(store)
+
     def _note_disabled(self, fetcher) -> None:
         store = getattr(fetcher, "store", None)
-        if store is None:
-            return
+        if store is not None:
+            self._note_store(store)
+
+    def _note_store(self, store) -> None:
         # one event in total for all marketplaces (they share the same keys)
         if store.conn.execute("select 1 from health where kind='no_keys' and source like 'ebay%'").fetchone():
             return
-        store.add_health("ebay", "no_keys", "no eBay keys (bw-secret ebay#client_id / ebay#client_secret): adapters disabled")
+        store.add_health("ebay", "no_keys",
+                         "no eBay keys (bw-secret ebay#client_id / ebay#client_secret, further sets ebay2 …): adapters disabled")
 
     def _hook(self, fetcher):
         store = getattr(fetcher, "store", None)
         if store is not None:
             self.client.on_event = lambda k, d: store.add_health(self.name, k, d)
 
+    def _note_quota(self, index: int, n: int) -> None:
+        self.client.on_event("quota", f"eBay key {index + 1} of {n} hit a quota; switched to the next key")
+
     # ---------------------------------------------------------------- API
     async def _auth(self) -> str:
+        """Bearer for the single stored application. Cached on this adapter so a second search does not re-auth."""
         if self._token and self._token[1] > time.time() + 60:
             return self._token[0]
-        cid, sec = self._resolve()
+        cid, sec = self._resolve()[0]
         basic = base64.b64encode(f"{cid}:{sec}".encode()).decode()
         status, text = await self.client.call(
             "POST", TOKEN_URL, {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
@@ -223,6 +353,63 @@ class EbayBrowse(Adapter):
             raise AdapterError(f"{self.name}: token request failed (status {status})") from e
         self._token = (tok, time.time() + float(j.get("expires_in", 7200)))
         return tok
+
+    async def _token_for(self, index: int, cid: str, sec: str) -> str:
+        ring = self.client.ring
+        cached = ring.token(SCOPE, index) if ring is not None else None
+        if cached:
+            return cached
+        basic = base64.b64encode(f"{cid}:{sec}".encode()).decode()
+        status, text = await self.client.call(
+            "POST", TOKEN_URL, {"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"},
+            urlencode({"grant_type": "client_credentials", "scope": SCOPE}), rotate_quota=True)
+        try:
+            j = json.loads(text)
+            tok = j["access_token"]
+        except (ValueError, KeyError, TypeError) as e:
+            raise AdapterError(f"{self.name}: token request failed (status {status})") from e
+        if status != 200:
+            raise AdapterError(f"{self.name}: token request failed (status {status})")
+        ring.put_token(SCOPE, index, tok, time.time() + float(j.get("expires_in", 7200)))
+        return tok
+
+    async def _rotating(self, method: str, url: str, headers: dict) -> tuple[int, str]:
+        """Try each ready key. A 429 cools that key only; a 403 stays a host refusal inside ApiClient.call."""
+        ring = self.client.ring
+        sets = ring.load()
+        tried = 0
+        while tried < len(sets):
+            idx = ring.pick()
+            if idx is None:
+                wait = max(0.0, ring.soonest() - self.client.clock())
+                raise AdapterError(f"api backing off for {wait:.0f}s more")
+            cid, sec = sets[idx]
+            try:
+                tok = await self._token_for(idx, cid, sec)
+                status, text = await self.client.call(
+                    method, url, {**headers, "Authorization": f"Bearer {tok}"}, rotate_quota=True)
+            except QuotaExceeded as e:
+                ring.cool(idx, self.client.clock() + e.retry_after)
+                ring.drop_token(SCOPE, idx)
+                self._note_quota(idx, len(sets))
+                tried += 1
+                continue
+            if status == 401:
+                ring.drop_token(SCOPE, idx)
+                try:
+                    tok = await self._token_for(idx, cid, sec)
+                except QuotaExceeded as e:
+                    ring.cool(idx, self.client.clock() + e.retry_after)
+                    self._note_quota(idx, len(sets))
+                    tried += 1
+                    continue
+                status, text = await self.client.call(
+                    method, url, {**headers, "Authorization": f"Bearer {tok}"}, rotate_quota=True)
+                if status == 401:
+                    raise AdapterError(f"{self.name}: token rejected")
+            return status, text
+        wait = max(0.0, ring.soonest() - self.client.clock())
+        raise AdapterError(f"api backing off for {wait:.0f}s more")
 
     def search_url(self, q: Query) -> str:
         parts = [f"itemLocationCountry:{self.country}"]
@@ -237,16 +424,20 @@ class EbayBrowse(Adapter):
             return []
         if fetcher is not None:
             self._hook(fetcher)
-        tok = await self._auth()
-        status, text = await self.client.call("GET", self.search_url(query), {
-            "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
-        if status == 401:
-            self._token = None
-            raise AdapterError(f"{self.name}: token rejected")
+        headers = {"X-EBAY-C-MARKETPLACE-ID": self.marketplace}
+        if self._multi():
+            status, text = await self._rotating("GET", self.search_url(query), headers)
+        else:
+            tok = await self._auth()
+            status, text = await self.client.call("GET", self.search_url(query), {
+                "Authorization": f"Bearer {tok}", **headers})
+            if status == 401:
+                self._token = None
+                raise AdapterError(f"{self.name}: token rejected")
         if status != 200:
             raise AdapterError(f"{self.name}: search status {status}")
         ls = filter_query(parse_search(text, self), query, to_pln or self.to_pln)
-        await self.price_variations(ls, tok)
+        await self.price_variations(ls, self._token[0] if self._token else "")
         return ls
 
     async def price_variations(self, ls: list[Listing], tok: str) -> None:
@@ -259,8 +450,12 @@ class EbayBrowse(Adapter):
             if not gid:
                 continue
             try:
-                status, text = await self.client.call("GET", GROUP_URL.format(gid), {
-                    "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
+                if self._multi():
+                    status, text = await self._rotating(
+                        "GET", GROUP_URL.format(gid), {"X-EBAY-C-MARKETPLACE-ID": self.marketplace})
+                else:
+                    status, text = await self.client.call("GET", GROUP_URL.format(gid), {
+                        "Authorization": f"Bearer {tok}", "X-EBAY-C-MARKETPLACE-ID": self.marketplace})
             except AdapterError:
                 continue
             if status != 200:

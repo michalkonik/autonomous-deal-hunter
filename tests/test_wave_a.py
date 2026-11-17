@@ -11,7 +11,7 @@ import yaml
 
 from dh import books, config, notify
 from dh.config import Config, PolicyViolation
-from dh.llm import Client, PaidCapReached
+from dh.llm import Client, PaidCapReached, ProviderConflict
 from dh.store import Store
 
 REPO = Path(__file__).resolve().parents[1]
@@ -205,3 +205,65 @@ def test_paid_cap_counts_spend_once_across_rounds_and_a_month_boundary(tmp_path)
     usage["paid_usd"] = 0.0
     assert books.paid_month_usd(st, clock[0]) == 0.0 and c._paid_session == pytest.approx(0.0)
     assert asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA)) == {"a": 1}
+
+
+def _two_providers():
+    return Config({"models": {
+        "base_url": "http://local/v1",
+        "roles": {"worker": "local-worker", "senior": "local-senior", "advisor": "local-advisor"},
+        "providers": {
+            "grok": {"base_url": "https://api.x.ai/v1", "monthly_cap_usd": 1, "usd_per_mtok_in": 2,
+                     "usd_per_mtok_out": 6, "roles": {"senior": "grok-4.7"}},
+            "chatgpt": {"base_url": "https://api.openai.com/v1", "monthly_cap_usd": 0.01, "usd_per_mtok_in": 1,
+                        "usd_per_mtok_out": 4, "roles": {"advisor": "gpt-5"}},
+        }}})
+
+
+def test_each_provider_is_billed_and_capped_on_its_own():
+    hits = []
+
+    def handler(request: httpx.Request):
+        hits.append(str(request.url))
+        body = json.loads(request.content)
+        url = str(request.url)
+        if url.startswith("http://local/"):
+            assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        else:
+            assert "chat_template_kwargs" not in body
+        return _reply()
+
+    spent = {"grok": 0.0, "chatgpt": 0.0}
+    c = Client(_two_providers(), transport=httpx.MockTransport(handler),
+               paid_spend=lambda provider: spent[provider])
+    assert c.paid_roles["senior"] == "grok-4.7" and c.provider_of("worker") is None
+    assert asyncio.run(c.chat_json("senior", "s", "u", SCHEMA)) == {"a": 1}
+    assert asyncio.run(c.chat_json("worker", "s", "u", SCHEMA)) == {"a": 1}
+    assert hits == ["https://api.x.ai/v1/chat/completions", "http://local/v1/chat/completions"]
+    # ChatGPT's cap is $0.01 and this call would cost $0.003, so the second call is over the cap.
+    assert asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA)) == {"a": 1}
+    spent["chatgpt"] = 0.01
+    with pytest.raises(PaidCapReached):
+        asyncio.run(c.chat_json("advisor", "s", "u", SCHEMA))
+    assert asyncio.run(c.chat_json("senior", "s", "u", SCHEMA)) == {"a": 1}  # grok's cap is untouched
+
+
+def test_a_role_on_two_providers_is_refused():
+    cfg = Config({"models": {"base_url": "http://local/v1", "roles": {"advisor": "a"},
+                             "paid_api": {"enabled": True, "monthly_cap_usd": 1, "base_url": "https://paid.test/v1",
+                                          "roles": {"advisor": "big"}},
+                             "providers": {"grok": {"base_url": "https://api.x.ai/v1", "monthly_cap_usd": 1,
+                                                    "roles": {"advisor": "grok-4.7"}}}}})
+    with pytest.raises(ProviderConflict):
+        Client(cfg)
+
+
+def test_books_keep_a_separate_row_per_provider(tmp_path):
+    cfg = Config({"books": {"tariff_pln_kwh": 1.1, "base_w": 100},
+                  "models": {"providers": {"grok": {"pln_per_usd": 4}}}})
+    st = Store(tmp_path / "t.db")
+    rid = st.log_round(datetime(2026, 11, 12, tzinfo=timezone.utc))
+    books.record_round(st, rid, cfg, seconds=1, gpu_watts=[],
+                       llm={"paid_usd": 0.25, "paid_by_provider": {"grok": 0.25}}, fetches=0)
+    kinds = {r["kind"]: r["units"] for r in st.conn.execute("select kind, units from costs")}
+    assert kinds["paid:grok"] == pytest.approx(0.25) and kinds["paid_api"] == 0
+    assert books.paid_month_usd(st, datetime(2026, 11, 12, tzinfo=timezone.utc), "grok") == pytest.approx(0.25)

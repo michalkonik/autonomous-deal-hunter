@@ -3,7 +3,8 @@
 Design rules (see tests/test_match.py):
 - The KEY comes from the title only. A description can add defects (for-parts) but never creates a product.
 - When in doubt the key is None (certainty 0.0). A wrong key can create a fake deal; a missing key only costs recall,
-  and the LLM stage (method="llm") can still pick it up.
+  and the LLM stage (method="llm") can still pick it up. An explicit reject (notes "rules_rejected": server RAM,
+  a brand clash, a part-number that disagrees with the title) is not a doubt: the LLM must not override it.
 - Wanted ads ("kupię", "WTB"...) and box-only listings never get a key. Comparisons ("jak RTX 4090", "like", "vs")
   never match the chip they mention.
 - A whole gaming PC ("Komputer gamingowy", "Gaming PC", "Herní PC", "Gamer PC") maps to key `pc:bundle` (0.5) whose
@@ -104,6 +105,10 @@ _NEGATED_DEFECT = re.compile(
     r"neni\s+(?:poskozen|vadn|rozbit)\w*|nem\s+(?:serult|elromlott)\w*|"
     r"nem\s+hibas\w*|hibatlan\w*|"
     r"bez\s+(?:zavad|zavady|vad|vady|poskozeni|artefaktu)\w*|neposkozen\w*|"
+    # a finished repair is not a for-parts ad: "nach Reparatur", "po naprawie", "repaired"
+    r"nach(?:\s+der)?\s+reparatur|repariert|(?<![a-z])po\s+naprawie|(?<![a-z])naprawion\w*|"
+    r"(?<![a-z])repaired(?![a-z])|after\s+repair|(?<![a-z])javitott(?![a-z])|(?<![a-z])megjavit\w*|"
+    r"(?<![a-z])po\s+oprave|(?<![a-z])opraven\w*|"
     # cracks: "not cracked", "no cracks", "bez pęknięć", "nie pęknięta", "nicht gebrochen", "není prasklá", "nem törött"
     r"(?:not|isn't|isnt|never|no|zero|without)\s+(?:any\s+)?crack\w*|"
     r"(?:bez|brak|nie\s+ma)\s+(?:zadnych\s+)?pekni\w*|nie\s+(?:jest\s+)?pekniet\w*|"
@@ -116,8 +121,11 @@ _DEFECTS = {
                           r"(?<![a-z])cracked(?![a-z])|(?<![a-z])cracks?(?![a-z])|(?<![a-z])peknie\w*|"
                           r"gebrochen|(?<![a-z])praskl\w*|(?<![a-z])torott|(?<![a-z])repedt"),
     "faulty": re.compile(r"defekt|defective|faulty|kaputt|hibas|nefunkcn|nefunguje|vadna|wadliw|niesprawn|"
-                         r"do naprawy|broken|nem mukodik|nie dziala|not working|bastler|for repair|"
-                         r"spares or repair|elromlott|(?<![a-z])dead(?![a-z])"),
+                         r"do naprawy|(?<![a-z])naprawa(?![a-z])|broken|nem mukodik|nie dziala|not working|bastler|"
+                         r"for repair|spares or repair|elromlott|(?<![a-z])dead(?![a-z])|"
+                         r"(?<![a-z])reparatur(?![a-z])|(?<![a-z])repair(?![a-z])|"
+                         r"(?<![a-z])javitas(?![a-z])|(?<![a-z])oprava(?![a-z])|"
+                         r"(?<![a-z])wada(?![a-z])"),
     "no_display": re.compile(r"brak obrazu|bez obrazu|kein bild|kein signal|bildfehler|no display|no signal|"
                              r"no video|no post|nincs kep|nem ad kepet"),
     "artifacts": re.compile(r"artefakt|artifact"),
@@ -127,7 +135,9 @@ _DEFECTS = {
         r"bez\s+(?:rdzenia|chipu|gpu|pamieci|jadra|cipu)(?![a-z])|tylko\s+pcb|sama\s+plytka|"
         r"(?<![a-z])no\s+(?:die|core|gpu(?:\s+chip)?|vram)(?![a-z])|pcb\s+only|missing\s+(?:gpu\s+)?die|"
         r"(?<![a-z])without\s+(?:the\s+)?(?:gpu\s+)?(?:die|core|chip)(?![a-z])|"
-        r"ohne\s+(?:gpu-?\s?)?chip|nur\s+platine|chip\s+nelkul"),
+        r"ohne\s+(?:gpu-?\s?)?chip|nur\s+platine|chip\s+nelkul|"
+        r"(?<![a-z])chip\s+bga|(?<![a-z])bga\s+(?:chip|nvidia|amd|radeon)|(?<![a-z])gn20-|"
+        r"(?<![a-z])tylko\s+chip|(?<![a-z])sam(?:y|a)\s+chip|(?<![a-z])chip\s+only|(?<![a-z])nur\s+chip"),
 }
 
 _LIKE_NEW = re.compile(r"jak nowa|jak nowy|jak nowe|like[\s-]new|wie neu|neuwertig|stan idealny|idealny stan|"
@@ -141,7 +151,11 @@ _USED = re.compile(r"uzywan\w*|(?<![a-z])used(?![a-z])|gebraucht|pouzit\w*|haszn
 # 2026-11-07: a used card must NEVER be benchmarked against new offers, nor the other way round).
 _COND_LABEL = r"(?:condition|zustand|kondycja|stan|estado|etat|staat|condizione|kondice|kondicio)\s*[:=]\s*"
 _COND_FIELD_LIKENEW = re.compile(_COND_LABEL + r"(?:neuwertig|wie neu|like[\s-]?new|casi nuevo|como nuevo|top zustand)")
-_COND_FIELD_NEW = re.compile(_COND_LABEL + r"(?:brand[\s-]?new|new|neu|nieuw|nouveau|nuovo|nowy|nowa|nova|uj|sealed)(?![a-z])")
+# neuf/neuve (FR), nuevo/nueva (ES) are the new-condition words eBay writes. "neu" alone does not
+# match them, and those listings were landing in the used pool.
+_COND_FIELD_NEW = re.compile(
+    _COND_LABEL + r"(?:brand[\s-]?new|nieuw|nouveau|nuovo|nuevo|nueva|neuve|neuf|nowy|nowa|nova|neu|new|uj|sealed)"
+    r"(?![a-z])")
 _COND_FIELD_USED = re.compile(_COND_LABEL + r"(?:used|gebraucht|pre[\s-]?owned|second[\s-]?hand|occasion\w*|usato|"
                               r"uzywan\w*|hasznalt|gebruikt|pouzit\w*|ocazie|refurbished?\w*|renoviert|po renowacji)")
 
@@ -197,7 +211,8 @@ _NOT_LAPTOP_PHRASE = re.compile(r"(?:nie\s+)?(?:do|for|fur|pro|not for|nie dla)\
 _FOR_LAPTOP = re.compile(r"(?<!nie )(?<![a-z])(?:do|for|fur|pro)\s+(?:laptop\w*|notebook\w*)")
 
 _SWAP_VERB = re.compile(
-    r"(?<![a-z])(?:zamienie|wymienie|tausche|vymenim|cserelem|swap|for trade|trade for|wtt)(?![a-z])")
+    r"(?<![a-z])(?:zamienic|zamienie|wymienic|wymienie|tauschen|tausche|vymenit|vymenim|"
+    r"cserelni|cserelem|vaihdetaan|vaihdan|vaihdossa|swap|for trade|trade for|wtt)(?![a-z])")
 _SWAP_NOUN = re.compile(r"(?<![a-z])(?:zamiana|tausch|vymena|csere)(?![a-z])")
 _SWAP_PREP = {"na", "gegen", "za", "for", "fur"}
 _REPAIR = re.compile(r"past|pad|termopad|wentyl|fan|luft|lufter|ventil|warmeleit|thermal|chlodz|olej|oil")
@@ -308,6 +323,11 @@ _NONGPU_PRODUCT = re.compile(
     r"(?<![a-z0-9])k\d{1,2}(?![a-z0-9])")
 _GPU_CONTEXT = re.compile(r"pcie|sxm|hbm|(?<![a-z])(?:karta|karte|card|kartya)(?![a-z])|geforce|radeon|nvidia|tesla|quadro|(?<![a-z])amd(?![a-z])|(?<![a-z])gpu(?![a-z])|"
                           r"graphic|grafi[ck]|(?<![a-z])vga(?![a-z])|vram|(?<!l)gddr|videok|video\s?card")
+# "GeForce 6800 XT" is a 2004 NVIDIA card, not an RX 6800 XT. A bare model number is trusted only inside its own brand.
+_NVIDIA_BRAND = re.compile(r"(?<![a-z])(?:nvidia|geforce|gtx)(?![a-z])")
+_AMD_BRAND = re.compile(r"(?<![a-z])radeon(?![a-z])|(?<![a-z])rx(?![a-z])")
+# 256MB GDDR3 is not a modern card's VRAM. "256-bit" is a bus width and must not match.
+_OLD_VRAM = re.compile(r"(?<![a-z0-9])(?:64|128|256|512|1024)\s*mb(?![a-z])|gddr\s*[1-4](?!\d)")
 
 # comparison words directly before a chip (up to 2 words in between) or right after it
 _PRE_CMP = re.compile(
@@ -389,6 +409,21 @@ _COMPAT_TAIL = re.compile(r"(?<![a-z])(?:do|for|fur|pro|na)\s+(?:komputer\w*|pc|
                           r"szamitogep\w*|desktop\w*)(?![a-z0-9])")
 
 
+def _brand_clash(t: str, model_id: str) -> bool:
+    """True when the title's brand and the matched chip are different families.
+
+    A bare "6800 XT" may be an RX 6800 XT. "GeForce 6800 XT" may not: that is the 2004 NVIDIA card.
+    """
+    family = model_id.split("-")[0]
+    nvidia = _NVIDIA_BRAND.search(t) is not None or re.search(r"(?<![a-z])rtx(?![a-z])", t) is not None
+    amd = _AMD_BRAND.search(t) is not None
+    if family == "rx":
+        return nvidia and not amd
+    if family in ("rtx", "gtx"):
+        return amd and not nvidia
+    return False
+
+
 def _vram_candidates(t: str) -> list[int]:
     out = []
     for m in _GB.finditer(t):
@@ -431,10 +466,12 @@ def _gpu(t: str, bundle: list[str], laptop_ctx: bool = False) -> tuple[str, str,
     invalid = [v for v in cands if v not in ent["vram"]]
     if len(valid) > 1:
         return ("", "", 0.0)
+    if _brand_clash(t, ent["id"]):
+        return ("", "", 0.0)  # "GeForce 6800 XT" is not an RX 6800 XT
     if len(valid) == 1:
         vram, cert = next(iter(valid)), (0.95 if not invalid else 0.7)
-    elif invalid:
-        return ("", "", 0.0)  # a memory size no such card has: wrong chip or not a card
+    elif invalid or _OLD_VRAM.search(_COMPAT_TAIL.split(t, 1)[0]):
+        return ("", "", 0.0)  # a memory size no such card has, or 256MB/GDDR3: not this chip
     else:
         vram = ent["default_vram"]
         cert = 0.95 if len(ent["vram"]) == 1 else 0.7
@@ -448,12 +485,21 @@ def _gpu(t: str, bundle: list[str], laptop_ctx: bool = False) -> tuple[str, str,
 _DDR = re.compile(r"(?<![a-z])ddr[\s-]?([2345])(?![0-9])|(?<![a-z])pc([45])-\d{4,5}")
 _KIT1 = re.compile(r"(?<![a-z0-9.])(\d)\s*[x*]\s*(\d{1,3})\s*(?:gb|gib|go|g)?(?![a-z0-9])")
 _KIT2 = re.compile(r"(?<![a-z0-9.])(\d{1,3})\s*(?:gb|gib|go|g)\s*[x*]\s*(\d)(?![a-z0-9])")
-_TOTAL = re.compile(r"(?<![a-z0-9.,])(\d{1,3})\s*(?:gb|gib|go|g)(?![a-z0-9])")
+_TOTAL = re.compile(r"(?<![-a-z0-9.,])(\d{1,3})\s*(?:gb|gib|go|g)(?![a-z0-9])")
+# Corsair CMT64GX5M4... is 4 modules; G.Skill F5-...64GX1-... is 1 module. The title's "64GB" is the kit.
+_CORSAIR_KIT = re.compile(r"(?<![a-z])cm[a-z](\d{1,3})gx\d+m(\d)(?!\d)")
+_GSKILL_KIT = re.compile(r"(?<![a-z])f\d-\d+[a-z0-9]*?(\d{1,3})gx(\d)(?![a-z0-9])")
 _NOT_RAM_NEAR = re.compile(r"^\s*(?:ssd|hdd|nvme|vram|gddr|dysk)|(?:ssd|hdd|nvme|vram|gddr|dysk)\s*[:\-]?\s*$")
-_SERVER_RAM = re.compile(r"(?<![a-z])(?:ecc|reg|registered|rdimm|lrdimm|fb-?dimm|serwerow\w*|server)(?![a-z])")
-_SODIMM = re.compile(r"so[\s-]?dimm|(?:do|for|fur|pro|na)\s+(?:laptop\w*|notebook\w*)|"
+# "non-ecc" is a desktop module saying it is NOT registered. "2Rx4" and the HMCG/MTC/KSM families are server parts.
+_SERVER_RAM = re.compile(
+    r"(?<![a-z])(?:(?<!non-)(?<!non )ecc|registered|rdimm|lrdimm|fb-?dimm|serwerow\w*|server|"
+    r"2rx4|4rx4|hmcg\d|mtc\d|ksm\d|kth-pl|ucs-mr)(?![a-z])|(?<![a-z])reg(?![a-z])")
+_SODIMM = re.compile(r"so[\s-]?dimm|so[\s-]?ddr|(?<![a-z])(?:thinkpad|victus)(?![a-z])|"
+                     r"(?:do|for|fur|pro|na)\s+(?:laptop\w*|notebook\w*)|"
                      r"(?:laptop\w*|notebook\w*)\s+(?:ram|memory|pamiec|speicher)|"
                      r"(?:ram|pamiec|memory|speicher)\s+(?:laptop\w*|notebook\w*)")
+# Kingston's last hyphen group is the kit capacity in GB (KF560C36BBE-32 is 32GB, not the 64GB the title may claim).
+_KINGSTON_GB = re.compile(r"(?<![a-z])(?:kf|kvr|kth|ksm)[a-z0-9]*-(\d{1,3})(?![a-z0-9])")
 _KIT_WORDS = re.compile(r"(?<![a-z])(?:kit|zestaw|dual(?:\s*channel)?|set|para|pair|komplet|quad)(?![a-z])")
 
 
@@ -485,6 +531,13 @@ def _ram(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
     rest = t
     for s, e in sorted(spans, reverse=True):
         rest = rest[:s] + " " * (e - s) + rest[e:]
+    for rx in (_CORSAIR_KIT, _GSKILL_KIT):
+        for m in rx.finditer(t):
+            total_gb, count = int(m.group(1)), int(m.group(2))
+            if count in cfg["module_counts"] and total_gb % count == 0:
+                size = total_gb // count
+                if size in cfg["module_gb"]:
+                    kits.add((count, size))
     totals = set()
     for m in _TOTAL.finditer(rest):
         if _NOT_RAM_NEAR.search(rest[m.end(): m.end() + 8]) or _NOT_RAM_NEAR.search(rest[max(0, m.start() - 8): m.start()]):
@@ -505,6 +558,10 @@ def _ram(t: str, bundle: list[str]) -> tuple[str, str, float] | None:
             return ("", "", 0.0)  # no memory size, several sizes, or "kit" without a module layout
         total, count, size = next(iter(totals)), 1, next(iter(totals))
         cert = 0.7
+    sku_gb = {int(m.group(1)) for m in _KINGSTON_GB.finditer(t)
+              if int(m.group(1)) in cfg["module_gb"] or int(m.group(1)) == total}
+    if sku_gb and total not in sku_gb:
+        return ("", "", 0.0)  # the part number's capacity and the title's GB do not agree
     return taxonomy.canonical(cat, {"type": typ, "total_gb": total, "kit": f"{count}x{size}"}), cat, cert
 
 
@@ -628,6 +685,25 @@ def _flags(title_n: str, full_n: str, title_raw: str | None = None) -> tuple[boo
     return wanted, box, bool(defects), defects
 
 
+_PAPER_WORD = (
+    r"(?:paragon\w*|faktur\w*|invoice\w*|receipt\w*|rechnung\w*|"
+    r"gwaranc\w*|warranty|guarantee\w*|garantie\w*|gewaehr\w*|gewahr\w*|"
+    r"zaruk\w*|garancia\w*)")
+_PAPER = re.compile(r"(?<![a-z])" + _PAPER_WORD)
+# "bez paragonu i faktury" strips the whole chain. A comma does not: "bez paragonu, gwarancja" keeps the guarantee.
+_PAPER_NEG = re.compile(
+    r"(?<![a-z])(?:bez|ohne|no|without|brak|nincs|brez|kein|keine|keinen)\s+"
+    r"(?:(?:a|the|die|der|das|den)\s+)?" + _PAPER_WORD
+    + r"(?:\s+(?:i|and|und|oraz|or|oder|lub|ani)\s+" + _PAPER_WORD + r")*")
+
+
+def has_papers(title: str, description: str = "") -> bool:
+    """True when the listing states a receipt or a guarantee. A negated phrase (bez paragonu, no receipt,
+    ohne Garantie) does not count. Either document is enough. No mention means no papers."""
+    text = norm(f"{title or ''}\n{description or ''}")
+    return _PAPER.search(_PAPER_NEG.sub(" ", text)) is not None
+
+
 def _condition(title_n: str, for_parts: bool, full_n: str = "") -> str:
     if for_parts:
         return "for_parts"
@@ -740,7 +816,10 @@ def _rules_extract(title: str, description: str, lang: str) -> Extraction:
             result = _ram(t, other_bundle) or _ssd(t, other_bundle)
             if result and result[0] and _storage_accessory(t, result[1].startswith("ram")):
                 result = None
+    rejected = bool(result and not result[0])
     key, cat, cert = result if result and result[0] else (None, None, 0.0)
+    if rejected:
+        extra_notes.append("rules_rejected")
     items = gpu_bundle if (key and cat in taxonomy.GPU_CATEGORIES) else other_bundle
     return Extraction(
         key=key, category=cat, certainty=cert, condition=condition, defects=defects,

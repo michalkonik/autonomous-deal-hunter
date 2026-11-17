@@ -1,18 +1,19 @@
 fetch:
-  user_agent: "DealHunter/0.1 (personal price research; +https://github.com/michalkonik)"
+  user_agent: "DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)"
   min_interval_s: 4
   jitter_s: 2
   backoff_start_s: 60
   backoff_cap_s: 3600
   disable_after_blocks: 3
   robots_ttl_s: 86400
+  obey_robots: false   # owner 2026-11-12: robots.txt is not a reason to skip a public page. 403, 429 and challenge pages still stop the fetcher. No proxies, no captcha solving, no logged-in scraping.
   max_crawl_delay_s: 60
   timeout_s: 30
   proxies: false
   solve_captcha: false
   logged_in: false
 adapters:
-  allegro: {enabled: true, via: mailbox}
+  allegro: {enabled: true, via: api}   # official REST GET /offers/listing. Keys: bw-secret allegro#client_id / #client_secret. User-Agent is deal-hunter/1.0 (+https://github.com/michalkonik/family-finance-planner) unless adapters.allegro.user_agent overrides it. HTML is never fetched. Saved-search mail still arrives through mailbox.
   olx: {enabled: true, via: mailbox}   # OLX blocks polite polling: saved-search alert e-mails only
   mailbox:                             # IMAP alert mailbox; enable once `bw-secret dh-mail#imap` exists
     enabled: false
@@ -22,12 +23,30 @@ adapters:
       kleinanzeigen: [kleinanzeigen.de, classistatic.de]
       ebay: [ebayimg.com]
   vinted: {enabled: false}
-  ebay: {enabled: true, via: api}   # applies to all ebay_* markets (DE, PL + GB, FR, IT, ES, IE, AT, CH, BE); disabled at run time without keys (bw-secret ebay#client_id / #client_secret). Foreign markets return only items the seller ships to PL.
+  ebay: {enabled: true, via: api}   # all ebay_* markets. Keys: ebay#client_id / #client_secret, then ebay2, ebay3, … up to ebay8. A missing client_id ends the list. One key backs off on 429/403; extra keys switch on 429. Foreign markets return only items the seller ships to PL.
   pepper_pl: {enabled: true, via: rss}
   hotukdeals: {enabled: true, via: rss}
   retail: {enabled: true}
   allegro_lokalnie: {enabled: true}
   sprzedajemy: {enabled: true}
+  refurbed: {enabled: true, via: html}   # refurbed.pl search page 1 only. Price includes delivery in Poland. The struck "(Nowa)" price is ignored.
+  taniekomputery: {enabled: true, via: html}   # Polish refurbished shop. Category page, first screen. The struck price-old amount is ignored.
+  asgoodasnew: {enabled: true, via: html}   # German refurbished shop. Search page 1 (32 articles). Price is the grade amount without the voucher code. Ships to Poland (DHL, 10,90 EUR).
+  amso: {enabled: true, via: html}   # Kraków poleasing shop. Search page 1. strong.price is the offer. Unavailable rows are skipped.
+  luxtrade: {enabled: true, via: html}   # Polish refurbished phones. Search page 1. span.price is the grade offer. The content URL is that grade. Up to 24 months warranty. Delivery in Poland.
+  devicestore: {enabled: true, via: html}   # device.store, Bydgoszcz, ex-lease gear in EUR. Search page 1. strong.price is the gross offer. Delivery in Poland.
+  gebrauchtetechnik: {enabled: true, via: html}   # gebrauchte-technik.de. Search page 1. span.product-price is the offer, not the list price. Ships to Poland for 9,99 EUR.
+  swappie: {enabled: false, reason: "Polish iPhone category returned 403 on 2026-11-13; not worked around"}
+  subito: {enabled: false, reason: "robots.txt returned 403 (access denied) on 2026-11-12"}
+  blocket: {enabled: false, reason: "robots.txt prohibits automated crawling without written permission (checked 2026-11-12)"}
+  backmarket: {enabled: false, reason: "laptop category returned 403 on 2026-11-12; not worked around"}
+  afbshop: {enabled: false, reason: "shipping page lists DE, AT, BE, IT and ES, not Poland (checked 2026-11-13)"}
+  computeruniverse: {enabled: false, reason: "homepage returned 403 on 2026-11-13; not worked around"}
+  cex: {enabled: false, reason: "Poland search page had no product cards; catalog JSON returned 403 (2026-11-13)"}
+  itsco: {enabled: false, reason: "ships to Poland, but the card price is the bulk from-price and search returned 500 (2026-11-13)"}
+  clevertronic: {enabled: false, reason: "homepage returned 403 (a challenge page) on 2026-11-13"}
+  wisetek: {enabled: false, reason: "ships to Poland, but search and the catalog JSON returned 429 on 2026-11-13; not worked around"}
+  lapstore: {enabled: false, reason: "Poland delivery is only for commercial resellers, not a private address (checked 2026-11-13)"}
   kleinanzeigen: {enabled: true}
   hardverapro: {enabled: true}
   marktplaats: {enabled: true}

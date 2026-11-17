@@ -234,6 +234,22 @@ def test_condition(title, cond):
     assert ex(title).condition == cond
 
 
+@pytest.mark.parametrize("line,cond", [
+    ("condition: Neuf", "new"),
+    ("condition: Neuve", "new"),
+    ("condition: Nuevo", "new"),
+    ("condition: Nueva", "new"),
+    ("condition: Nuovo", "new"),
+    ("condition: Neu", "new"),
+    ("condition: como nuevo", "like_new"),
+    ("condition: Used", "used"),
+    ("condition: Gebraucht", "used"),
+])
+def test_structured_marketplace_condition(line, cond):
+    """eBay writes the condition in the listing's language. French and Spanish 'new' is not 'unknown'."""
+    assert ex("RTX 3060 12GB", line).condition == cond
+
+
 def test_extraction_type():
     assert isinstance(ex("RTX 4090"), Extraction)
 
@@ -274,6 +290,83 @@ def test_ram_keys(title, key, cert):
 def test_ram_not_confused_by_gpu_vram_words():
     assert ex("RTX 4070 12GB GDDR6X").key == "gpu:rtx-4070:12"
     assert ex("LPDDR5 16GB").key is None
+
+
+def test_sku_suffix_is_not_a_second_capacity():
+    """JM5600ALE-32G is the module size inside a 2x32 kit, not a conflicting 32GB total."""
+    r = ex("Pamięć Transcend, DDR5, 64 GB, 2x32 GB, 5600MHz, CL46 (JM5600ALE-32G)")
+    assert r.key == "ram:ddr5:64:2x32" and r.certainty == 0.95
+
+
+def test_corsair_part_number_sets_the_kit_layout():
+    r = ex("Pamięć RAM DDR5 Corsair 64 GB 32 CMT64GX5M4B6200C32 NOWA na gwarancji")
+    assert r.key == "ram:ddr5:64:4x16" and r.condition == "new"
+
+
+def test_bare_gpu_die_is_not_a_card():
+    r = ex("Chip BGA NVIDIA RTX 3060 GN20-E3-A1")
+    assert r.for_parts is True and "stripped_die" in r.defects
+    assert ex("RTX 3060 12GB").for_parts is False
+
+
+def test_wada_in_the_title_is_for_parts():
+    r = ex("Karta Graficzna MSI Radeon RX 7900 XTX Gaming Trio WADA! Plus drugi Cooler")
+    assert r.for_parts is True and r.condition == "for_parts"
+    assert ex("RTX 4090 24GB bez wad").for_parts is False
+
+
+def test_kingston_part_number_capacity_wins_over_a_contradicting_title():
+    """KF560C36BBE-32 is a 32GB module. A title that also says 64GB is not a 64GB stick."""
+    r = ex("Kingston FURY Beast 64GB DDR5 6000MHz KF560C36BBE-32")
+    assert r.key is None and "rules_rejected" in r.notes
+
+
+def test_non_ecc_desktop_dimm_is_not_server_ram():
+    r = ex("Kingston 5600MT/s Non-ECC CL46 DIMM 2Rx8 - 64 GB - DDR5 (KVR56U46BD8-64)")
+    assert r.key == "ram:ddr5:64:1x64"
+    assert r.for_parts is False
+
+
+@pytest.mark.parametrize("title", [
+    "Pamięć RAM Micron DDR5 64GB 6400MHz 2Rx4 RDIMM MTC40F2046S1RC64BD2",
+    "Pamięć RAM Hynix DDR5 64GB 6400MHz 2Rx4 HMCG94CHBRA276N",
+    "64GB DDR5-5600MHz RDIMM RAM KSM56R46BD4PMI-64HAI",
+    "32GB Memoria RAM IBM-Lenovo ThinkPad P17 Gen 2 (DDR4-25600 (PC4-3200))",
+    "32GB Memoria RAM HP-Compaq Victus 16-d0133nw (DDR4-25600 (PC4-3200))",
+    "PNY RAM SO-DDR4 32GB 3200MHZ PC4-25600 MN32GSD43200-SB",
+])
+def test_server_and_laptop_ram_are_not_desktop_keys(title):
+    r = ex(title)
+    assert r.key is None or r.key.startswith("ram-sodimm"), title
+    if r.key is None:
+        assert "rules_rejected" in r.notes
+
+
+def test_geforce_6800_xt_is_not_an_rx_6800_xt():
+    """2004 GeForce 6800 XT, 256MB GDDR3. The bare number 6800 XT must not become the modern AMD card."""
+    r = ex("GRAFIKKARTE XFX NVIDIA GEFORCE 6800 XT 256MB GDDR3 PV-T42E-UDD3 PCIe x16")
+    assert r.key is None and "rules_rejected" in r.notes
+    assert ex("Sapphire Radeon RX 6800 XT 16GB").key == "gpu:rx-6800-xt:16"
+
+
+@pytest.mark.parametrize("title", [
+    "ASUS GeForce RTX 3090 TUF OC GAMING Grafikkarte Graphics Card Reparatur Repair",
+    "RTX 3080 do naprawy",
+    "RTX 3080 repair",
+])
+def test_repair_word_is_for_parts(title):
+    r = ex(title)
+    assert r.for_parts is True and r.condition == "for_parts"
+
+
+@pytest.mark.parametrize("title,desc", [
+    ("RTX 3090 nach Reparatur", ""),
+    ("RTX 3090", "Karte wurde repariert und läuft"),
+    ("RTX 3090 po naprawie", ""),
+    ("RTX 3090 repaired", ""),
+])
+def test_a_finished_repair_is_not_for_parts(title, desc):
+    assert ex(title, desc).for_parts is False
 
 
 # ------------------------------------------------------------------ SSD
@@ -654,8 +747,9 @@ def test_desktop_cards_keep_key(title, key):
     assert ex(title).key == key
 
 
-SWAP = ["Zamienię", "Wymienię", "Zamienie na", "Tausche", "Vyměním", "Cserélem", "Swap", "For trade", "WTT",
-        "Zamiana na", "Tausch gegen", "Výměna za", "Trade for"]
+SWAP = ["Zamienię", "Wymienię", "Zamienie na", "Zamienić", "Wymienić", "Tausche", "Tauschen", "Vyměním",
+        "Cserélem", "Vaihdetaan", "Vaihdan", "Vaihdossa", "Swap", "For trade", "WTT", "Zamiana na",
+        "Tausch gegen", "Výměna za", "Trade for"]
 
 
 @pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RTX 3060 Ti 8GB", "RX 7900 XTX 24GB"])
@@ -706,9 +800,16 @@ def test_repair_nouns_not_swap(w, chip):
 @pytest.mark.parametrize("title", [
     "Zamiana na RTX 4090 24GB", "RTX 3080 10GB Tausch gegen RTX 4090", "Zamiana RTX 3070 za RTX 3080",
     "RTX 4090 24GB WTT", "RTX 3090 24GB for trade", "Trade for RTX 4090",
+    "PS5 NEU & UNGEÖFFNET gegen RTX 4070 Ti SUPER tauschen!",
 ])
 def test_swap_structures(title):
-    assert "swap_ad" in ex(title).notes
+    r = ex(title)
+    assert r.wanted_ad is True and "swap_ad" in r.notes and r.key is None, title
+
+
+def test_finnish_cash_difference_trade_is_a_swap():
+    r = ex("vaihdetaan gtx 1070 rtx 4060 välirahan kanssa")
+    assert r.wanted_ad is True and "swap_ad" in r.notes and r.key is None
 
 
 @pytest.mark.parametrize("chip", ["RTX 4090 24GB", "RTX 5090 24GB", "RTX 3080 10GB"])
@@ -906,3 +1007,18 @@ def test_real_cards_keep_a_certain_key(title, key):
     "Waterkoeling blok RTX 3080", "RTX 3080 Waterblok EK"])
 def test_water_blocks_in_every_language_are_not_cards(title):
     assert ex(title).key is None, title
+
+
+@pytest.mark.parametrize("title,desc,want", [
+    ("RTX 4090 faktura VAT", "", True),
+    ("RTX 4090", "gwarancja do 2027", True),
+    ("RTX 3080 10GB 2 lata gwarancji", "", True),
+    ("RTX 4090 bez paragonu", "", False),
+    ("RTX 4090 no receipt", "", False),
+    ("RTX 4090 ohne Garantie", "", False),
+    ("RTX 4090 bez paragonu i faktury", "", False),
+    ("RTX 4090 bez paragonu, gwarancja", "", True),
+    ("RTX 4090", "", False),
+])
+def test_has_papers_is_a_receipt_or_a_guarantee(title, desc, want):
+    assert match.has_papers(title, desc) is want

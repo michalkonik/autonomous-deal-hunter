@@ -75,7 +75,7 @@
   - advisor = senior.
   - `paid_api.enabled: false`.
 - **Git**
-  - Author `Michal Konik <michal.konik.job@gmail.com>`. No AI attribution in commits or PRs.
+  - Author `Michal Konik <offlinelocalagents@gmail.com>`. No AI attribution in commits or PRs.
   - Code repo `deal-hunter`: work on branch `feat/build`, open a PR, never push `main`.
   - Log repo `deal-hunter-log`: default branch `log`.
 

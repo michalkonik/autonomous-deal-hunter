@@ -99,7 +99,9 @@ PY
     [ -f "$R/config/local/models.yaml" ] && echo "local-models-overrides=present" || echo "local-models-overrides=absent"
     ;;
 secrets)
-    for ref in ebay#client_id ebay#client_secret dh-mail#imap dh-mail#smtp; do
+    for ref in ebay#client_id ebay#client_secret ebay#dev_id \
+               ebay2#client_id ebay2#client_secret ebay2#dev_id \
+               allegro#client_id allegro#client_secret dh-mail#imap dh-mail#smtp; do
         if ! command -v bw-secret >/dev/null; then echo "$ref=helper-absent"; continue; fi
         if ! v=$(bw-secret "$ref" 2>/dev/null); then echo "$ref=absent"; continue; fi
         case "$ref" in
@@ -144,6 +146,8 @@ def secret(ref):
     return bool(shutil.which("bw-secret")) and subprocess.run(["bw-secret", ref], capture_output=True).returncode == 0
 have_imap = secret("dh-mail#imap")
 have_ebay = secret("ebay#client_id") and secret("ebay#client_secret")
+have_ebay2 = secret("ebay2#client_id") and secret("ebay2#client_secret")
+have_allegro = secret("allegro#client_id") and secret("allegro#client_secret")
 live = dead = 0
 for name in sorted(ad):
     e = ad[name] or {}
@@ -156,19 +160,30 @@ for name in sorted(ad):
         why = why or "enabled: false in config/sources.yaml - set it true in config/local/sources.yaml once dh-mail#imap exists"
     if on and name == "mailbox" and not have_imap:
         on, why = False, "no credentials (bw-secret dh-mail#imap): the adapter is not even built, and dh status stays clean"
-    if on and via == "api" and not have_ebay:
+    if on and name == "allegro" and not have_allegro:
+        on, why = False, "no Allegro keys (bw-secret allegro#client_id / allegro#client_secret)"
+    elif on and via == "api" and name != "allegro" and not have_ebay:
         on, why = False, "no eBay keys (bw-secret ebay#client_id / ebay#client_secret)"
     live += on; dead += (not on)
     print(f"source={name} live={'yes' if on else 'no'} via={via}" + (f" reason={why}" if why else ""))
 print(f"live={live} not-live={dead}")
 if not have_imap:
-    print("access-gap dh-mail#imap: Allegro.pl and OLX.pl send only saved-search ALERT MAILS (both block polite "
-          "polling) - ask the owner for the mailbox now; without it those two markets are invisible")
+    print("access-gap dh-mail#imap: OLX.pl is mailbox-only (it blocks polite polling). Allegro, Kleinanzeigen "
+          "and eBay also send saved-search alert mail - ask the owner for the mailbox now")
+if not have_allegro:
+    print("access-gap allegro#client_id / allegro#client_secret: allegro.pl public search is off - ask for both. "
+          "The registered User-Agent is already the default; override adapters.allegro.user_agent before the first "
+          "call if theirs differs. /offers/listing may return not_verified until Allegro grants the app")
 if not have_ebay:
-    print("access-gap ebay#client_id / ebay#client_secret: eBay DE and PL are off (API only since 2026) - ask now")
+    print("access-gap ebay#client_id / ebay#client_secret: eBay DE and PL are off (API only) - ask how many "
+          "applications they have and store every set (ebay, then ebay2 … ebay8)")
+elif not have_ebay2:
+    print("access-gap ebay2#client_id / ebay2#client_secret: only one eBay application is stored - ask whether "
+          "more exist; a quota on one key switches to the next")
 if not Path("/usr/bin/google-chrome").exists():
     print("access-gap /usr/bin/google-chrome: tier-1 evidence screenshots are skipped")
-print("note: mailbox-sourced Allegro and OLX listings are never re-checked live and top out at tier 2 (docs/SOURCES.md)")
+print("note: mailbox-sourced listings are never re-checked live and top out at tier 2. Allegro REST offers "
+      "also have no per-offer re-check, so they cannot reach tier 1 (docs/SOURCES.md)")
 PY
     ;;
 verify)

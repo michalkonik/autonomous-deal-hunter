@@ -326,3 +326,45 @@ def test_conflict_reset_keeps_clone_only_cards_and_weekly_reports(tmp_path):
     assert f"deals/2026-10-29/deal-{did2}.md" in tree and f"deals/2026-10-29/deal-{did2}.json" in tree
     assert "weekly/2026-10-29.md" in tree
     assert "bought" in (tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md").read_text()  # origin's mark kept
+
+
+def test_reused_id_and_stale_open_do_not_clear_a_false_positive(tmp_path):
+    """A leftover card from before deal ids were reused, and the live card still saying open, are not edits."""
+    st = Store(tmp_path / "t.db")
+    did = add_deal(st, tmp_path)
+    skipped = {"status": "skipped", "price_pln": None, "date": "2026-10-29", "note": "repair service"}
+    publish.record_import(st.conn, did, skipped)
+    st.add_mark(did, "skipped", None, "repair service", "web", false_positive=True)
+    old = (f"---\ndeal_id: {did}\noutcome: {{status: open, price_pln: null, date: null, note: ''}}\n---\n")
+    live = (tmp_path / "var/cards/deals/2026-10-29" / f"deal-{did}.md").read_text()
+    n, bad = publish.import_texts(st, [
+        (f"/log/deals/2026-10-01/old-{did}.md", old),
+        (f"/log/deals/2026-10-29/deal-{did}.md", live),
+    ])
+    assert (n, bad) == (0, set())
+    rows = st.conn.execute("select status, source, false_positive from marks").fetchall()
+    assert len(rows) == 1 and rows[0]["status"] == "skipped" and rows[0]["source"] == "web"
+    assert rows[0]["false_positive"] == 1
+
+
+def test_web_mark_survives_sync_and_a_later_github_edit_still_imports(tmp_path):
+    bare, cfg, st = make_env(tmp_path)
+    did = add_deal(st, tmp_path)
+    asyncio.run(publish.sync(st, cfg, tmp_path))
+    skipped = {"status": "skipped", "price_pln": None, "date": "2026-10-29", "note": "false positive"}
+    publish.record_import(st.conn, did, skipped)
+    st.add_mark(did, "skipped", None, "false positive", "web", false_positive=True)
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["marks"] == 0
+    m = st.conn.execute("select status, source, false_positive from marks").fetchall()
+    assert len(m) == 1 and m[0]["source"] == "web" and m[0]["false_positive"] == 1 and m[0]["status"] == "skipped"
+    card = tmp_path / "clone/deals/2026-10-29" / f"deal-{did}.md"
+    assert "status: skipped" in card.read_text()
+    phone = clone2(tmp_path, bare)
+    md = phone / "deals/2026-10-29" / f"deal-{did}.md"
+    md.write_text(md.read_text().replace("status: skipped", "status: open").replace("false positive", ""))
+    git(phone, "commit", "-qam", "reopen"); git(phone, "push", "-q", "origin", "log")
+    r = asyncio.run(publish.sync(st, cfg, tmp_path))
+    assert r["marks"] == 1
+    latest = st.conn.execute("select status, source, false_positive from marks order by id desc").fetchone()
+    assert latest["status"] == "open" and latest["source"] == "github" and latest["false_positive"] == 0

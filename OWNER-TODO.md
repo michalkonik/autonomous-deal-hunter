@@ -51,14 +51,14 @@ then `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh stop`, `cd ~/Desktop
 
 ## 3. Publish `main` on GitHub (2 minutes)
 
-Only `feat/build` exists on `git@github.com:michalkonik/deal-hunter.git`. To create `main` from it
+Only `feat/build` exists on `git@github.com:michal-koniu/deal-hunter.git`. To create `main` from it
 (run this in any clone that has fetched `feat/build`):
 
 ```bash
 cd ~/Desktop/github_repos/deal-hunter
 git fetch origin
 git push origin origin/feat/build:refs/heads/main
-gh repo edit michalkonik/deal-hunter --default-branch main   # optional: make main the default branch
+gh repo edit michal-koniu/deal-hunter --default-branch main   # optional: make main the default branch
 ```
 
 Later, to bring `main` up to date with new work on `feat/build` (a fast-forward, no merge commit):
@@ -68,11 +68,11 @@ git fetch origin
 git push origin origin/feat/build:refs/heads/main            # refused if main has commits feat/build lacks
 ```
 
-Prefer a reviewed merge? Open a PR instead: `gh pr create --repo michalkonik/deal-hunter --base main --head feat/build`.
+Prefer a reviewed merge? Open a PR instead: `gh pr create --repo michal-koniu/deal-hunter --base main --head feat/build`.
 
 ## 4. The log repo: already configured, nothing to do
 
-`git@github.com:michalkonik/deal-hunter-log.git` exists and is empty. `config/publish.yaml` now points at it
+`git@github.com:michal-koniu/deal-hunter-log.git` exists and is empty. `config/publish.yaml` now points at it
 (`remote`, plus `repo_web_url` so the "Card" button in a push opens the card on GitHub). After the restart in
 item 1, the publisher clones it into `~/.local/share/deal-hunter/log`, creates the `log` branch itself and pushes
 only `log`, every 30 minutes. Check with `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh status` (`log repo: ... clone=True`). If you would rather keep the URL
@@ -80,15 +80,17 @@ out of the repository, delete the two lines from `config/publish.yaml` and put t
 `config/local/publish.yaml` instead (gitignored):
 
 ```yaml
-remote: git@github.com:michalkonik/deal-hunter-log.git
-repo_web_url: https://github.com/michalkonik/deal-hunter-log
+remote: git@github.com:michal-koniu/deal-hunter-log.git
+repo_web_url: https://github.com/michal-koniu/deal-hunter-log
 ```
 
 To mark a deal from your phone, edit the card's `outcome:` block in the GitHub app. The next sync imports it.
 
-## 5. The alert mailbox (gated: Allegro.pl, OLX.pl; also Kleinanzeigen and eBay alerts), about 1 hour
+## 5. The alert mailbox (gated: OLX.pl; also extra Allegro, Kleinanzeigen and eBay alerts), about 1 hour
 
-Allegro and OLX block polite automated requests, so the agent sees them only through e-mail alerts.
+OLX blocks polite automated requests, so the agent sees it only through e-mail alerts. Allegro.pl public
+search is the official REST API when the application is verified (section 6b). Saved-search mail still
+helps beside that API. The mailbox adapter never opens those websites.
 
 1. Create a **dedicated** mailbox with IMAP over SSL (port 993). Not your personal one: the agent reads every
    unseen mail in the folder. Your provider must add an `Authentication-Results` header (Gmail, Fastmail and
@@ -167,12 +169,27 @@ Allegro and OLX block polite automated requests, so the agent sees them only thr
 ## 6. eBay developer keys (gated: eBay DE and PL), about 30 minutes plus eBay's review
 
 1. Sign in at <https://developer.ebay.com>, create an application and a **Production** keyset.
-2. Store the keys in Bitwarden as item `ebay`, fields `client_id` (App ID) and `client_secret` (Cert ID).
-   Check with `bw-secret ebay#client_id`.
-3. Apply for the **Marketplace Insights API** (sold prices) in the developer portal. Until eBay grants it,
-   eBay supplies active asks only, and `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh status` shows `ebay_insights` as disabled (`not_granted`/`no_keys`).
+2. Store every application you have. First set: Bitwarden item `ebay`, fields `client_id` (App ID),
+   `client_secret` (Cert ID) and `dev_id` (stored, never sent). Further sets are `ebay2`, `ebay3`, … up to
+   `ebay8`, with the same fields. A missing `client_id` ends the list. A quota on one application switches
+   to the next. Check with `bw-secret ebay#client_id` (prints the value: do not paste it into chat).
+3. Apply for the **Marketplace Insights API** (sold prices) on **each** application. Until eBay grants it
+   on every stored key, `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh status` shows `ebay_insights`
+   as disabled (`not_granted` only when every key lacks the scope, otherwise `no_keys`).
    Sold prices are the fastest way to reach tier 1 before the clears-at ledger matures.
 4. `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh stop && .venv/bin/dh start`.
+
+## 6b. Allegro.pl REST keys (gated: public offer search)
+
+1. In the Allegro developer apps page, copy the Client ID and Client Secret for the application whose
+   User-Agent was validated. The shipped header is
+   `deal-hunter/1.0 (+https://github.com/michalkonik/family-finance-planner)`. If you registered a different
+   header, set `adapters.allegro.user_agent` to that exact string before the first call. A wrong header can
+   get the key blocked. The header is not a secret.
+2. Store item `allegro`, fields `client_id` and `client_secret`. Do not paste them into chat.
+3. `cd ~/Desktop/github_repos/deal-hunter && .venv/bin/dh stop && .venv/bin/dh start`.
+   Allegro has not been granting `/offers/listing` to new applications. Until they do, status shows
+   `not_verified` and the website is not fetched. Saved-search mail (section 5) still works beside that.
 
 ## 7. The accountant (one meeting)
 
