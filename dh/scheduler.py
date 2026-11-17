@@ -551,7 +551,7 @@ class _Round:
         return self.ctx.stop is not None and self.ctx.stop.is_set()
 
     async def _warm_rates(self) -> None:
-        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF"):
+        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF", "CAD"):
             try:
                 self.to_pln_rates[ccy] = await self.fx.rate(ccy, self.today)
                 await self.fx.rate(ccy, self.today - timedelta(days=1))  # pins a dated row valuation can read
@@ -972,8 +972,11 @@ class _Round:
                 return None
             return Decimal("0"), outbound, round(haversine_km(self.origin, (l.lat, l.lon)), 1)
         inb = self.shipping.get("inbound_pln") or {}
-        key = "PL" if origin == "PL" else ("EU" if origin in economics.EU else "non_EU")
-        return Decimal(str(inb.get(key, 0))), outbound, None
+        over = {}
+        node = self.ctx.cfg["valuation"].get("inbound_pln_override") if self.ctx.cfg.get("valuation") else None
+        if node is not None:
+            over = node.to_dict() if hasattr(node, "to_dict") else dict(node)
+        return shipping.inbound_pln(origin, inb, over), outbound, None
 
     async def _insights(self, key: str) -> None:
         """eBay Marketplace Insights sold comps for a key, once per key and at most `ebay_insights_keys` per round,
@@ -1262,8 +1265,12 @@ class _Round:
                 if shop is not None and a.tier.tier is not None and a.tier.tier < 5:
                     self._watch(a, shop)
                     return a
-        # a rising-market tier 4 is under the floor on purpose; the return check must not erase that signal
+        # a rising-market tier 4 is under the percentage floor on purpose; the 200 USD floor still applies
         trend = any(str(r).startswith("trend:") for r in (a.tier.reasons or ()))
+        small = valuegate.small_deal(getattr(a, "cons_usd", None), self.gate)
+        if small is not None and a.tier.tier is not None:
+            self.stats.drop(f"value_gate_{small.code}")
+            return None
         thin = None if trend else valuegate.thin_margin(
             getattr(a, "cons_usd", None), getattr(a, "capital_usd", None), self.gate)
         if thin is not None and a.tier.tier is not None and a.tier.tier < 5:

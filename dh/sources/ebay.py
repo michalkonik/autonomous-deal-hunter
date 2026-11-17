@@ -34,6 +34,7 @@ SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 GROUP_URL = "https://api.ebay.com/buy/browse/v1/item/get_items_by_item_group?item_group_id={}"
 SCOPE = "https://api.ebay.com/oauth/api_scope"
 MARKETS = {"EBAY_DE": ("ebay_de", "DE", "EUR"), "EBAY_PL": ("ebay_pl", "PL", "PLN"), "EBAY_US": ("ebay_us", "US", "USD"),
+           "EBAY_CA": ("ebay_ca", "CA", "CAD"),
            "EBAY_GB": ("ebay_gb", "GB", "GBP"), "EBAY_FR": ("ebay_fr", "FR", "EUR"),
            "EBAY_IT": ("ebay_it", "IT", "EUR"), "EBAY_ES": ("ebay_es", "ES", "EUR"),
            "EBAY_IE": ("ebay_ie", "IE", "EUR"), "EBAY_AT": ("ebay_at", "AT", "EUR"),
@@ -278,11 +279,17 @@ class EbayBrowse(Adapter):
     domain = "api.ebay.com"
 
     def __init__(self, marketplace: str = "EBAY_DE", secret_fn: Callable[[str], str | None] | None = None,
-                 client: ApiClient | None = None, limit: int = 50, weight: float | None = None):
+                 client: ApiClient | None = None, limit: int = 50, weight: float | None = None,
+                 location: str | None = None, source_name: str | None = None):
         if marketplace not in MARKETS:
             raise ValueError(marketplace)
         self.marketplace = marketplace
-        self.name, self.country, self.currency = MARKETS[marketplace]
+        name, country, currency = MARKETS[marketplace]
+        # Brazil has no Browse marketplace. `location` searches another site's catalog for items
+        # sitting in that country (ebay_br = EBAY_US + itemLocationCountry BR) that still ship to PL.
+        self.name = source_name or name
+        self.country = (location or country).upper()
+        self.currency = currency
         self.limit = limit
         self.weight = weight
         self._secret_fn = secret_fn

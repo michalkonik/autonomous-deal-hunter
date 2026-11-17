@@ -60,6 +60,8 @@ def _build(conf: dict | None = None) -> dict[str, Adapter]:
                                EbayBrowse("EBAY_GB"), EbayBrowse("EBAY_FR"), EbayBrowse("EBAY_IT"),
                                EbayBrowse("EBAY_ES"), EbayBrowse("EBAY_IE"), EbayBrowse("EBAY_AT"),
                                EbayBrowse("EBAY_CH"), EbayBrowse("EBAY_BE"),
+                               EbayBrowse("EBAY_US"), EbayBrowse("EBAY_CA"),
+                               EbayBrowse("EBAY_US", location="BR", source_name="ebay_br"),
                                RssAdapter("pepper_pl", "https://www.pepper.pl/rss/hot", "PL", "PLN"),
                                RssAdapter("hotukdeals", "https://www.hotukdeals.com/rss/hot", "GB", "GBP"),
                                Mailbox(),
@@ -70,7 +72,8 @@ def _build(conf: dict | None = None) -> dict[str, Adapter]:
 ADAPTER_NAMES = ["allegro", "allegro_lokalnie", "sprzedajemy", "refurbed", "taniekomputery", "asgoodasnew", "amso",
                  "luxtrade", "devicestore", "gebrauchtetechnik", "kleinanzeigen", "hardverapro", "marktplaats", "2ememain",
                  "bazos_cz", "bazos_sk", "bazos_at", "ebay_de", "ebay_pl", "tori", "ebay_gb", "ebay_fr", "ebay_it",
-                 "ebay_es", "ebay_ie", "ebay_at", "ebay_ch", "ebay_be", "pepper_pl", "hotukdeals", "mailbox", "retail"]
+                 "ebay_es", "ebay_ie", "ebay_at", "ebay_ch", "ebay_be", "ebay_us", "ebay_ca", "ebay_br",
+                 "pepper_pl", "hotukdeals", "mailbox", "retail"]
 
 
 def registry(cfg=None, root: Path | None = None) -> dict[str, Adapter]:

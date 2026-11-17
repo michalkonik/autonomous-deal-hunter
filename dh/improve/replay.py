@@ -188,6 +188,15 @@ class Judge:
             return Outcome(ex.key, True, "price_range", method=method, needs_llm=needs_llm, notes=notes)
         before = dict(r.stats.dropped)
         a = await r._appraise(listing, lid, ex, price_pln, verified_age_s=verified_age_s)
+        if a is not None:
+            gated = r._value_gate(a)  # same screen the live round runs before a deal is saved
+            if gated is None:
+                new = [k for k, v in r.stats.dropped.items() if v > before.get(k, 0)]
+                why = new[-1] if new else "value_gate"
+                return Outcome(ex.key, False, why, cons_usd=a.cons_usd, exp_usd=a.exp_usd,
+                               p_scam=round(float(a.risk.p_scam), 4), confidence=a.confidence,
+                               flags=list(a.risk.flags), method=method, needs_llm=needs_llm, notes=notes)
+            a = gated
         if a is None:
             new = [k for k, v in r.stats.dropped.items() if v > before.get(k, 0)]
             why = new[0] if new else "no_valuation"

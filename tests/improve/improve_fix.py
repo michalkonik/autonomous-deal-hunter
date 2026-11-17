@@ -44,8 +44,8 @@ def archive(store, *, now: datetime = NOW) -> dict[str, int]:
     store.conn.commit()
     ids = {}
     for name, title, price, desc in (
-            ("deal", "RTX 3090 Gigabyte Gaming OC 24GB używana", "2000", "Stan bardzo dobry."),
-            ("fp", "RTX 3090 MSI Ventus 24GB używana", "2050", "Szybka sprzedaż."),
+            ("deal", "RTX 3090 Gigabyte Gaming OC 24GB używana", "1400", "Stan bardzo dobry."),
+            ("fp", "RTX 3090 MSI Ventus 24GB używana", "1450", "Szybka sprzedaż."),
             ("fair", "RTX 3090 Zotac Trinity 24GB używana", "3150", "")):
         l = listing(name, title, price, desc=desc, seen=now - timedelta(days=2))
         lid = store.upsert_listing(l)
