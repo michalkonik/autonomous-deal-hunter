@@ -1,7 +1,18 @@
 """Easy access to Poland: Polish offers and listings that ship here rank ahead of the rest."""
 from types import SimpleNamespace
 
-from dh.shipping import domestic_classified, easy_poland, ship_pl
+from dh.shipping import domestic_classified, easy_poland, inbound_pln, ship_pl
+
+
+def test_overseas_inbound_is_not_the_european_envelope():
+    table = {"PL": "20", "EU": "60", "non_EU": "200"}
+    over = {"US": "500", "CA": "500", "BR": "550"}
+    assert inbound_pln("PL", table, over) == 20
+    assert inbound_pln("DE", table, over) == 60
+    assert inbound_pln("CH", table, over) == 200
+    assert inbound_pln("US", table, over) == 500
+    assert inbound_pln("CA", table, over) == 500
+    assert inbound_pln("BR", table, over) == 550
 
 
 def test_easy_poland_is_a_polish_offer_or_a_shipment_to_poland():
