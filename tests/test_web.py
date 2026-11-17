@@ -447,6 +447,33 @@ def test_default_allowed_hosts_include_local_interfaces(monkeypatch):
     assert "192.168.0.39" in h and "localhost" in h and "127.0.0.1" in h
 
 
+def test_extra_allowed_hosts_are_added_and_client_ip_is_not_checked(tmp_path, monkeypatch):
+    """A Tailscale name is accepted in addition to the current LAN address. A foreign Host stays refused.
+    No source address is consulted, so the same name works from any client IP."""
+    from dh.web import app as webapp
+    monkeypatch.setattr(webapp, "_local_ipv4s", lambda: {"203.0.113.7"})
+    monkeypatch.setattr(webapp, "_HOSTS_CACHE", None)
+    data = load_cfg_data()
+    data["publish"] = {"cards_dir": "var/cards/deals"}
+    data["web"] = {"extra_allowed_hosts": ["rig.tailnet.ts.net:8711"]}
+    cfg = config.Config(data)
+    db = tmp_path / "t.db"
+    st = Store(db)
+    app = create_app(db, cfg, tmp_path, fx_factory=lambda s_: FakeFx(), customs_factory=lambda s_: FakeCustoms())
+    c = TestClient(app, raise_server_exceptions=False)
+    d, _, _ = make_deal(st)
+    tail = {"Origin": "https://rig.tailnet.ts.net:8711",
+            "Host": "rig.tailnet.ts.net:8711"}
+    lan = {"Origin": "http://203.0.113.7:8711", "Host": "203.0.113.7:8711"}
+    evil = {"Origin": "http://evil.example:8711", "Host": "evil.example:8711"}
+    assert c.post(f"/deal/{d.id}/mark", data={"status": "bought"}, headers=tail,
+                  follow_redirects=False).status_code == 303
+    assert c.post(f"/deal/{d.id}/mark", data={"status": "skipped", "reason": "x"}, headers=lan,
+                  follow_redirects=False).status_code == 303
+    assert c.post(f"/deal/{d.id}/mark", data={"status": "bought"}, headers=evil).status_code == 403
+    assert st.conn.execute("select count(*) from marks").fetchone()[0] == 2
+
+
 def test_date_time_columns_and_filters(tmp_path):
     st, c, _ = build(tmp_path)
     d1, _, _ = make_deal(st, sid="1", seller="1", key="KEY-ONE")

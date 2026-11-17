@@ -3,5 +3,6 @@ host: 0.0.0.0
 port: 8711
 # allowed_hosts: Host names accepted on POST. Unset (default): this machine's own addresses - localhost, the
 # hostname and every address currently on a local interface (re-discovered per request, so a DHCP change is fine).
-# Set it (in config/local/web.yaml) only to add names that are NOT local addresses, e.g. allowed_hosts:
-# [rig.local, 100.64.0.5]; an explicit list REPLACES the automatic discovery.
+# An explicit allowed_hosts list REPLACES that discovery.
+# extra_allowed_hosts: names added on top of the list, for names that are not local interfaces
+# (Tailscale MagicDNS, mDNS). The browser's source IP is not checked.
