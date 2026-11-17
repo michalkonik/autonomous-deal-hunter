@@ -187,9 +187,9 @@ def test_labels_come_only_from_verified_outcomes(store):
     from dh.models import Deal
     archive(store)
     ids = {}
-    # at 2520 PLN the champion calls both a tier-2 deal; the challenger's extra keyword drops both to tier 4
+    # at 1500 PLN the champion nets about 208 USD (a deal); the extra keyword cuts it under the 200 USD floor
     for name, status, note in (("bought", "bought", "great"), ("scam", "skipped", "scam: fake listing")):
-        l = listing(name, "RTX 3090 Gigabyte Gaming OC 24GB używana", "2520", seen=NOW - timedelta(hours=2))
+        l = listing(name, "RTX 3090 Gigabyte Gaming OC 24GB używana", "1500", seen=NOW - timedelta(hours=2))
         ids[name] = store.upsert_listing(l)
         did = store.save_deal(Deal(id=None, listing_ref=ids[name], key=KEY_3090, tier=2, star=False, effort="easy",
                                    confidence="medium", cons_net_pln=Decimal(200), exp_net_pln=Decimal(300),
@@ -208,8 +208,8 @@ def test_labels_come_only_from_verified_outcomes(store):
 
 
 def test_unsold_for_a_week_is_not_a_deal(store):
-    # at 2520 PLN the champion calls it a tier-2 deal; the extra scam keyword's risk haircut makes it tier 4
-    l = listing("slow", "RTX 3090 Gigabyte Gaming OC 24GB używana", "2520", seen=NOW - timedelta(days=9))
+    # at 1500 PLN the champion clears 200 USD; the extra scam keyword's haircut does not
+    l = listing("slow", "RTX 3090 Gigabyte Gaming OC 24GB używana", "1500", seen=NOW - timedelta(days=9))
     lid = store.upsert_listing(l)
     store.record_observation(lid, l.price, NOW - timedelta(days=9))
     store.record_observation(lid, l.price, NOW)

@@ -551,7 +551,7 @@ class _Round:
         return self.ctx.stop is not None and self.ctx.stop.is_set()
 
     async def _warm_rates(self) -> None:
-        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF"):
+        for ccy in ("EUR", "CZK", "HUF", "GBP", "USD", "CHF", "CAD"):
             try:
                 self.to_pln_rates[ccy] = await self.fx.rate(ccy, self.today)
                 await self.fx.rate(ccy, self.today - timedelta(days=1))  # pins a dated row valuation can read
