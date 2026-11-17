@@ -225,7 +225,9 @@ def test_value_gate_skips_pc_bundles(tmp_path):
 
 
 def test_thin_margin_on_a_pc_is_a_watch_and_a_real_one_stays(tmp_path):
-    rnd, _st = make_round(tmp_path)
+    # make_ctx turns the dollar floor off for the pipeline fixtures. This test is about that floor.
+    ctx = ts.make_ctx(tmp_path, ts.FakeAdapter([]), None, min_net_usd=200)
+    rnd = scheduler._Round(ctx)
     small = _appraisal(key="pc:bundle")
     small.cons_usd, small.capital_usd = Decimal("40"), Decimal("2000")
     assert rnd._value_gate(small) is None and rnd.stats.dropped.get("value_gate_small_deal") == 1
