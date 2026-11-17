@@ -255,7 +255,8 @@ Energy per round = (mean GPU power + `base_w`) x hours x tariff. Without `rocm-s
 | Key | Default | Meaning |
 |---|---|---|
 | `host`, `port` | `0.0.0.0`, `8711` | Listen address |
-| `allowed_hosts` | this machine's names and LAN IPs | Host names accepted on POST (the mark buttons). Add mDNS or Tailscale names in `config/local/web.yaml` |
+| `allowed_hosts` | this machine's names and LAN IPs | Host names accepted on POST (the mark buttons). An explicit list replaces the automatic one |
+| `extra_allowed_hosts` | empty | Names added on top of that list (Tailscale MagicDNS, mDNS). The client IP is not checked |
 
 The page has no login: anyone on the LAN can read it and post marks. Do not expose port 8711 beyond a trusted
 network.

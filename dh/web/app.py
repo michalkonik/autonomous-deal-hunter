@@ -160,8 +160,9 @@ def _local_ipv4s() -> set[str]:
 def default_allowed_hosts() -> list[str]:
     """Current local addresses: localhost, the rig hostname and its addresses, and every address currently
     configured on a local interface (so a DHCP change after startup does not lock the owner out of POSTs).
-    mDNS (`rig.local`) and Tailscale (`rig.tailnet.ts.net`, 100.x addresses) names are NOT guessed:
-    add them to `web.allowed_hosts` in config/local/web.yaml (an explicit list disables this discovery)."""
+    mDNS (`rig.local`) and Tailscale (`rig.tailnet.ts.net`, 100.x addresses) names are NOT guessed.
+    Add those with `web.extra_allowed_hosts` in config/local/web.yaml (they are added to this list).
+    `web.allowed_hosts` still replaces this list entirely."""
     hosts = {"localhost", "127.0.0.1", "::1"}
     try:
         name = socket.gethostname()
@@ -228,10 +229,17 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
     hunter_status = hunter_status or _default_hunter_status
     page_stop = page_stop or _self_term
     web_cfg = cfg.get("web")
-    # web.allowed_hosts: an explicit Host list (port ignored) accepted on POST, e.g. mDNS "rig.local" or a
-    # Tailscale name. Unset (default): the current local addresses, re-discovered per request (_auto_hosts).
+    # web.allowed_hosts: an explicit Host list (port ignored) accepted on POST. Unset: the current local
+    # addresses, re-discovered per request (_auto_hosts). An explicit list replaces that discovery.
+    # web.extra_allowed_hosts: names added on top of whichever list is in use (Tailscale, mDNS). The
+    # client's IP is never checked, so a saved Tailscale name works from any network.
     override = web_cfg.get("allowed_hosts") if web_cfg is not None else None
     allowed_hosts = {_host_only(str(h)) for h in override} if override else None
+    extra_raw = web_cfg.get("extra_allowed_hosts") if web_cfg is not None else None
+    extra_hosts = {_host_only(str(h)) for h in extra_raw} if extra_raw else set()
+
+    def hosts_for_post() -> set[str]:
+        return (set(allowed_hosts) if allowed_hosts is not None else set(_auto_hosts())) | extra_hosts
     try:
         cd = Path(str(cfg.publish.cards_dir))
     except AttributeError:
@@ -351,7 +359,7 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
 
     # ---------------------------------------------------------------- mark
     async def mark_post(request: Request):
-        _same_origin(request, allowed_hosts or _auto_hosts())
+        _same_origin(request, hosts_for_post())
         deal_id = _deal_id(request)
         form = await request.form()
         st = open_store()
@@ -550,7 +558,7 @@ def create_app(store_path, cfg, root, *, fx_factory=None, customs_factory=None,
     async def page_stop_post(request: Request):
         """The "stop the page" button: stops ONLY the standalone page server (never the hunter). The reply is
         the last thing this process sends; it terminates itself right after (see _self_term)."""
-        _same_origin(request, allowed_hosts or _auto_hosts())
+        _same_origin(request, hosts_for_post())
         page_stop()
         return render(request, "stopped.html")
 
