@@ -195,7 +195,7 @@ def _targets(target: Any, names: list[str]) -> list[str]:
     return [n for n in want if n in names]
 
 
-def build_arms(items: list[dict], adapters: dict, feed_sources: list[str]) -> list[Arm]:
+def build_arms(items: list[dict], adapters: dict, feed_sources: list[str], root=None) -> list[Arm]:
     """Query items x their target sources, plus one feed arm per feed source (dedup by arm id; sentinel wins)."""
     feeds = [n for n in adapters if n in set(feed_sources) and not is_mail_source(adapters[n])]
     searchable = [n for n in adapters if n not in set(feed_sources) and not is_mail_source(adapters[n])]
@@ -204,7 +204,7 @@ def build_arms(items: list[dict], adapters: dict, feed_sources: list[str]) -> li
         if it.get("kind") != "query":
             continue
         text = " ".join(str(it["value"]).lower().split())
-        if rules_extract(text, "", "pl").key == PC_KEY:
+        if rules_extract(text, "", "pl", root=root).key == PC_KEY:
             continue  # whole-PC queries ("gaming pc", "komputer gamingowy") are false positives
         for src in _targets(it.get("target"), searchable):
             aid = ledger.arm_id(src, text)
@@ -657,7 +657,7 @@ class _Round:
 
     def _plan(self) -> list[Arm]:
         items = self._items()
-        arms = build_arms(items, self.ctx.adapters, list(self.sc["feed_sources"]))
+        arms = build_arms(items, self.ctx.adapters, list(self.sc["feed_sources"]), root=self.root)
         usable = []
         for a in arms:
             ad = self.ctx.adapters[a.source]
