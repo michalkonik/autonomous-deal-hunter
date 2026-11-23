@@ -12,8 +12,11 @@ what each adapter already proves, verified 2026-11-07 against live sources:
 - luxtrade.pl: a Polish shop for refurbished phones; the offer is bought with delivery in Poland.
 - device.store: a Polish shop in Bydgoszcz; the storefront delivers to Poland (checked 2026-11-13).
 - gebrauchte-technik.de: the shipping page lists Poland at 9,99 EUR (checked 2026-11-13).
-- eBay (any market, incl. insights): the search itself is filtered by `deliveryCountry: PL`
-  (dh/sources/ebay.py SHIP_TO), so every eBay listing we see ships to Poland.
+- eBay outside the US: the search itself is filtered by `deliveryCountry: PL`
+  (dh/sources/ebay.py SHIP_TO), so those listings ship to Poland.
+- eBay items located in the US: the same filter is not trusted. `ships` is true only after
+  `shipToLocations` (or one item lookup) includes Poland, Europe, or worldwide. Otherwise
+  the listing does not ship here.
 - kleinanzeigen / marktplaats / 2ememain / tori: adapters parse a `ships` flag, but that only proves
   domestic shipping, not Poland. The scheduler prices them as a pickup from home, not as a cheap
   EU parcel. A pickup-only ad on any source is a clear 0.
@@ -40,6 +43,10 @@ def ship_pl(listing) -> int | None:
     if source in _SHIPS_TO_PL:
         return 1
     if source.startswith("ebay"):
+        # A US location used to inherit the "every eBay row ships to Poland" assumption. Domestic US
+        # shipping options are not a shipment to Poland; only an explicit confirmation is.
+        if str(getattr(listing, "country", "") or "").upper() == "US":
+            return 1 if getattr(listing, "ships", None) is True else 0
         return 1
     if source in _CLASSIFIED_DOMESTIC_SHIP:
         return None

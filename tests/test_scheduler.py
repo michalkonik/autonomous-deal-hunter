@@ -1,5 +1,6 @@
 """Round pipeline (scheduler.run_round) with a fake adapter, a fake LLM and fixed NBP rates: no network, no model."""
 import asyncio
+import dataclasses
 import json
 import random
 from collections import Counter
@@ -438,31 +439,62 @@ async def test_ebay_insights_ingested_before_valuation_and_capped(tmp_path):
     assert stats.candidates == 2
 
 
-async def test_partout_values_pc_bundle(tmp_path, monkeypatch):
-    from dh.valuation import ExitEstimate
-    seen = {}
+async def test_pc_bundle_is_dropped_before_partout(tmp_path, monkeypatch):
+    called = {"n": 0}
 
-    async def fake_value(l, ex, store, day, client=None, **kw):
-        seen["key"], seen["client"] = ex.key, client
-        return ExitEstimate(channel="allegro", key="pc:bundle", condition=None, p25_pln=Decimal("7000"),
-                            median_pln=Decimal("7500"), p75_pln=Decimal("8000"), n_effective=8.0, n_sold=8,
-                            newest_days=1.0, days_to_sell=None, trend_30d=None, ceiling_pln=None, comps=[],
-                            n_sold_effective=8.0,
-                            notes=["partout", "parts:3", "part:gpu:rtx-3060:12", "part:cpu:ryzen-5-5600",
-                                   "part:ram:ddr4:16:2x8"])
+    async def fake_value(*a, **kw):
+        called["n"] += 1
+        return None
+
     monkeypatch.setattr(scheduler.partout, "value", fake_value)
     llm = FakeLLM(LLM_3060)
     ctx = make_ctx(tmp_path, FakeAdapter([listing("7", "Komputer gamingowy Ryzen 5 5600 RTX 3060 16GB", "3500")]), llm)
     stats = await scheduler.run_round(ctx)
-    assert seen["key"] == "pc:bundle" and seen["client"] is not None
-    assert llm.calls == []  # the product extractor is not asked about whole PCs
-    assert stats.partout == 1
-    d = ctx.store.deals()[0]
-    assert d.key == "pc:bundle" and d.tier == 3  # 3 parts -> heavy; certainty 0.5 -> low
-    # allegro_lokalnie ships inside PL: the direct-to-PL bonus eases heavy -> moderate (owner 2026-11-07)
-    assert d.effort == "moderate" and d.ship_pl == 1
-    assert sorted(json.loads(d.evidence_json)["components"]) == ["cpu:ryzen-5-5600", "gpu:rtx-3060:12",
-                                                                 "ram:ddr4:16:2x8"]
+    assert called["n"] == 0 and llm.calls == []
+    assert stats.partout == 0 and stats.dropped.get("pc_bundle") == 1
+    assert ctx.store.deals() == []
+
+
+def test_pc_bundle_queries_are_not_armed():
+    items = [
+        {"id": "q.pc", "kind": "query", "target": "all", "value": "gaming pc"},
+        {"id": "q.k", "kind": "query", "target": "all", "value": "komputer gamingowy"},
+        {"id": "q.gpu", "kind": "query", "target": "all", "value": "rtx 3060"},
+    ]
+    arms = scheduler.build_arms(items, {"allegro_lokalnie": FakeAdapter([])}, [])
+    assert [a.query.text for a in arms] == ["rtx 3060"]
+
+
+async def test_us_listing_needs_a_poland_shipment(tmp_path):
+    class USAdapter(FakeAdapter):
+        name, country = "ebay_us", "US"
+
+        def __init__(self, listings, ok):
+            super().__init__(listings)
+            self.ok, self.checks = ok, 0
+
+        async def confirm_ships_to_poland(self, listing):
+            self.checks += 1
+            return self.ok
+
+    gpu = listing("9", "Gigabyte RTX 3060 Gaming OC u\u017cywana", "700")
+    gpu = dataclasses.replace(gpu, country="US", source="ebay_us", currency="USD", ships=None,
+                              description="US location: ship-to-Poland not confirmed")
+
+    blocked = USAdapter([gpu], ok=False)
+    ctx = make_ctx(tmp_path, blocked, FakeLLM(LLM_3060))
+    seed_comps(ctx.store)
+    stats = await scheduler.run_round(ctx)
+    assert blocked.checks == 1 and stats.dropped.get("us_not_to_poland") == 1 and ctx.store.deals() == []
+
+    allowed = USAdapter([gpu], ok=True)
+    ctx2 = make_ctx(tmp_path / "ok", allowed, FakeLLM(LLM_3060))
+    seed_comps(ctx2.store)
+    stats2 = await scheduler.run_round(ctx2)
+    assert allowed.checks == 1 and stats2.dropped.get("us_not_to_poland") is None
+    row = ctx2.store.conn.execute("select ships, description from listings").fetchone()
+    assert row[0] == 1 and "ships to Poland" in row[1]
+    # Duty on a US import is a separate gate. This test only proves the ship check let it through.
 
 
 async def test_photo_reuse_feeds_risk_for_candidates(tmp_path):

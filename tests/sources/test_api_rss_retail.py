@@ -135,6 +135,60 @@ def test_ebay_variation_group_check_failure_keeps_warning(store):
     assert "price may be for the cheapest option" in v.description  # the extractor/LLM still sees the warning
 
 
+def test_us_item_ships_to_poland_only_when_regions_say_so():
+    assert ebay.poland_in_ship_to({}) is None
+    assert ebay.poland_in_ship_to({"shipToLocations": {"regionIncluded": [
+        {"regionName": "Poland", "regionType": "COUNTRY"}]}}) is True
+    assert ebay.poland_in_ship_to({"shipToLocations": {"regionIncluded": [
+        {"regionName": "Worldwide", "regionType": "WORLDWIDE"}],
+        "regionExcluded": [{"regionName": "PL", "regionType": "COUNTRY"}]}}) is False
+    assert ebay.poland_in_ship_to({"shipToLocations": {"regionIncluded": [
+        {"regionName": "United States", "regionType": "COUNTRY"}]}}) is False
+
+    us = {
+        "itemId": "v1|206686241832|0", "title": "RTX 3060 Ti", "itemWebUrl": "https://www.ebay.com/itm/206686241832",
+        "price": {"value": "699.00", "currency": "USD"}, "buyingOptions": ["FIXED_PRICE"],
+        "itemLocation": {"country": "US", "postalCode": "750**"},
+        "shippingOptions": [{"shippingCost": {"value": "20.00", "currency": "USD"}}],
+        "seller": {"username": "us_seller", "feedbackScore": 10},
+    }
+    domestic = json.dumps({"itemSummaries": [{**us, "shipToLocations": {"regionIncluded": [
+        {"regionName": "United States", "regionType": "COUNTRY"}]}}]})
+    abroad = json.dumps({"itemSummaries": [{**us, "shipToLocations": {"regionIncluded": [
+        {"regionName": "Worldwide", "regionType": "WORLDWIDE"}]}}]})
+    ad = ebay.EbayBrowse("EBAY_US", secret_fn=KEYS.get)
+    no = ebay.parse_search(domestic, ad)[0]
+    yes = ebay.parse_search(abroad, ad)[0]
+    assert no.country == "US" and no.ships is False and "does not ship to Poland" in no.description
+    assert yes.ships is True and "ships to Poland" in yes.description
+
+
+def test_confirm_ships_to_poland_reads_getitem_once(store):
+    seen = []
+
+    async def req(method, url, headers, data, timeout):
+        seen.append(url)
+        if "oauth2/token" in url:
+            return 200, json.dumps({"access_token": "tok", "expires_in": 7200})
+        assert "v1%7C206686241832%7C0" in url
+        assert headers["X-EBAY-C-MARKETPLACE-ID"] == "EBAY_US"
+        return 200, json.dumps({"shipToLocations": {"regionIncluded": [
+            {"regionName": "Europe", "regionType": "COUNTRY_REGION"}]}})
+
+    async def nosleep(_): pass
+    ad = ebay.EbayBrowse("EBAY_US", secret_fn=KEYS.get, client=ebay.ApiClient(req, min_interval_s=0, sleep=nosleep))
+    item = ebay.parse_search(json.dumps({"itemSummaries": [{
+        "itemId": "v1|206686241832|0", "title": "RTX 3060 Ti",
+        "itemWebUrl": "https://www.ebay.com/itm/206686241832",
+        "price": {"value": "699.00", "currency": "USD"}, "buyingOptions": ["FIXED_PRICE"],
+        "itemLocation": {"country": "US"}, "seller": {"username": "us_seller"},
+    }]}), ad)[0]
+    assert item.ships is None
+    assert run(ad.confirm_ships_to_poland(item)) is True
+    assert run(ad.confirm_ships_to_poland(item)) is True
+    assert sum(1 for u in seen if "oauth2" not in u) == 1  # cached; no second getItem
+
+
 def test_ebay_search_sends_token_marketplace_and_filter(store):
     rec = Recorder()
     ad = ebay.EbayBrowse("EBAY_PL", secret_fn=KEYS.get, client=_client(rec))
