@@ -21,7 +21,7 @@ import time
 from datetime import datetime
 from decimal import Decimal
 from typing import Awaitable, Callable
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
 import httpx
 
@@ -31,6 +31,7 @@ from .base import Adapter, AdapterError, Query, filter_query, now_utc, price_of,
 UA = "DealHunter/0.1 (personal price research; +https://github.com/michal-koniu)"
 TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
 SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+ITEM_URL = "https://api.ebay.com/buy/browse/v1/item/{}"
 GROUP_URL = "https://api.ebay.com/buy/browse/v1/item/get_items_by_item_group?item_group_id={}"
 SCOPE = "https://api.ebay.com/oauth/api_scope"
 MARKETS = {"EBAY_DE": ("ebay_de", "DE", "EUR"), "EBAY_PL": ("ebay_pl", "PL", "PLN"), "EBAY_US": ("ebay_us", "US", "USD"),
@@ -41,6 +42,35 @@ MARKETS = {"EBAY_DE": ("ebay_de", "DE", "EUR"), "EBAY_PL": ("ebay_pl", "PL", "PL
 # Foreign markets only return items the seller ships to Poland (verified filter: an unsupported filter value
 # produces a warning while deliveryCountry is accepted; total counts show it genuinely filters).
 SHIP_TO = "PL"
+# US item location still needs shipToLocations. Europe / worldwide includes Poland unless Poland is excluded.
+_POLAND_REGIONS = frozenset({"PL", "POLAND", "WORLDWIDE", "EUROPE", "EUROPEAN_UNION", "EU"})
+_POLAND_BLOCK = frozenset({"PL", "POLAND", "WORLDWIDE"})
+
+
+def _region_names(regions) -> set[str]:
+    out: set[str] = set()
+    for region in regions or []:
+        if not isinstance(region, dict):
+            continue
+        name = str(region.get("regionName") or region.get("regionId") or "").upper().replace(" ", "_")
+        typ = str(region.get("regionType") or "").upper()
+        if name:
+            out.add(name)
+        if typ == "WORLDWIDE" or name in {"WORLDWIDE", "WORLD_WIDE"}:
+            out.add("WORLDWIDE")
+    return out
+
+
+def poland_in_ship_to(item: dict) -> bool | None:
+    """True/False when `shipToLocations` is present. None when this payload does not say."""
+    if "shipToLocations" not in item:
+        return None
+    loc = item.get("shipToLocations") or {}
+    included = _region_names(loc.get("regionIncluded"))
+    excluded = _region_names(loc.get("regionExcluded"))
+    if excluded & _POLAND_BLOCK:
+        return False
+    return bool(included & _POLAND_REGIONS)
 FOR_PARTS_IDS = {"7000"}  # "For parts or not working"
 ALLOWED_API_HOSTS = frozenset({"api.ebay.com"})
 Request = Callable[..., Awaitable[tuple[int, str]]]
@@ -292,6 +322,8 @@ class EbayBrowse(Adapter):
         self._token: tuple[str, float] | None = None
         #: source_id -> item group id for variation listings found by the last parse_search
         self.variations: dict[str, str] = {}
+        #: source_id -> confirmed ship-to-Poland, so a later round does not call getItem again
+        self._pl_ship: dict[str, bool] = {}
 
     # ---------------------------------------------------------------- keys / health
     def _secret(self) -> Callable[[str], str | None]:
@@ -440,6 +472,36 @@ class EbayBrowse(Adapter):
         await self.price_variations(ls, self._token[0] if self._token else "")
         return ls
 
+    async def confirm_ships_to_poland(self, listing: Listing) -> bool:
+        """One getItem for a US listing. True only when shipToLocations includes Poland. Cached per item id.
+
+        A non-200, a transport error, or a payload with no Poland/Europe/worldwide region is False. The search
+        filter is not re-checked here; this is the listing-level confirmation the filter does not provide.
+        """
+        sid = str(listing.source_id)
+        if sid in self._pl_ship:
+            return self._pl_ship[sid]
+        url = ITEM_URL.format(quote(sid, safe=""))
+        headers = {"X-EBAY-C-MARKETPLACE-ID": self.marketplace}
+        try:
+            if self._multi():
+                status, text = await self._rotating("GET", url, headers)
+            else:
+                tok = await self._auth()
+                status, text = await self.client.call(
+                    "GET", url, {"Authorization": f"Bearer {tok}", **headers})
+        except AdapterError:
+            self._pl_ship[sid] = False
+            return False
+        ok = False
+        if status == 200:
+            try:
+                ok = poland_in_ship_to(json.loads(text)) is True
+            except ValueError:
+                ok = False
+        self._pl_ship[sid] = ok
+        return ok
+
     async def price_variations(self, ls: list[Listing], tok: str) -> None:
         """Variation listings show the price of their CHEAPEST option while the title advertises the strongest
         one (observed: an 'RTX 5090' PC listed at 2399 whose 5090 option costs 6699; 999 buys the RTX 3050).
@@ -542,6 +604,21 @@ def parse_search(text: str, ad: EbayBrowse) -> list[Listing]:
         if str(it.get("conditionId")) in FOR_PARTS_IDS:
             parts.append("for parts or not working")
         loc = it.get("itemLocation") or {}
+        country = loc.get("country") or ad.country
+        if str(country).upper() == "US":
+            # Domestic US shippingOptions are not evidence of a shipment to Poland.
+            ship_to = poland_in_ship_to(it)
+            if ship_to is True:
+                parts.append("ships to Poland")
+                ships_flag: bool | None = True
+            elif ship_to is False:
+                parts.append("does not ship to Poland")
+                ships_flag = False
+            else:
+                parts.append("US location: ship-to-Poland not confirmed")
+                ships_flag = None
+        else:
+            ships_flag = True if it.get("shippingOptions") else None
         try:
             score = float(sel["feedbackPercentage"]) if sel.get("feedbackPercentage") is not None else None
         except (TypeError, ValueError):
@@ -555,9 +632,9 @@ def parse_search(text: str, ad: EbayBrowse) -> list[Listing]:
         img = (it.get("image") or {}).get("imageUrl")
         out.append(ad.make(
             source_id=str(it["itemId"]), url=it["itemWebUrl"], title=re.sub(r"\s+", " ", it.get("title") or "").strip(),
-            description="; ".join(parts), price=pr[0], currency=pr[1], country=(loc.get("country") or ad.country),
+            description="; ".join(parts), price=pr[0], currency=pr[1], country=country,
             city=loc.get("city") or loc.get("postalCode"),
             seller_hash=seller_hash(ad.name, sel.get("username")), seller_ratings=sel.get("feedbackScore"),
-            seller_score=score, ships=True if it.get("shippingOptions") else None,
+            seller_score=score, ships=ships_flag,
             is_business=(acct == "BUSINESS") if acct else None, photos=[img] if img else [], posted_at=created))
     return out

@@ -18,6 +18,10 @@ def test_easy_poland_is_a_polish_offer_or_a_shipment_to_poland():
 def test_ship_pl_still_marks_pickup_as_not_shipped():
     assert ship_pl(SimpleNamespace(source="olx", pickup_only=True)) == 0
     assert ship_pl(SimpleNamespace(source="ebay_de", pickup_only=False)) == 1
+    assert ship_pl(SimpleNamespace(source="ebay_us", pickup_only=False, country="US", ships=True)) == 1
+    assert ship_pl(SimpleNamespace(source="ebay_us", pickup_only=False, country="US", ships=False)) == 0
+    assert ship_pl(SimpleNamespace(source="ebay_us", pickup_only=False, country="US", ships=None)) == 0
+    assert ship_pl(SimpleNamespace(source="ebay_de", pickup_only=False, country="DE", ships=False)) == 1
     assert ship_pl(SimpleNamespace(source="refurbed", pickup_only=False, country="PL")) == 1
     assert ship_pl(SimpleNamespace(source="taniekomputery", pickup_only=False, country="PL")) == 1
     assert ship_pl(SimpleNamespace(source="asgoodasnew", pickup_only=False, country="DE")) == 1

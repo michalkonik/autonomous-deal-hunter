@@ -204,6 +204,8 @@ def build_arms(items: list[dict], adapters: dict, feed_sources: list[str]) -> li
         if it.get("kind") != "query":
             continue
         text = " ".join(str(it["value"]).lower().split())
+        if rules_extract(text, "", "pl").key == PC_KEY:
+            continue  # whole-PC queries ("gaming pc", "komputer gamingowy") are false positives
         for src in _targets(it.get("target"), searchable):
             aid = ledger.arm_id(src, text)
             q = Query(text=text, category=it.get("category"),
@@ -870,6 +872,33 @@ class _Round:
                 self.stats.alive_cleared += 1
 
     # ------------------------------------------------------------ evaluate one listing
+    async def _us_ships_to_poland(self, l: Listing, ad) -> bool:
+        """US-located goods count only when the payload, or one item lookup, says they ship to Poland.
+
+        The search filter `deliveryCountry:PL` is not enough: a US seller's domestic shipping options used to
+        pass as "ships". No checker, or a failed lookup, is a no — never an assumption.
+        """
+        desc = l.description or ""
+        if l.ships is False or "does not ship to Poland" in desc:
+            return False
+        if l.ships is True and "ships to Poland" in desc:
+            return True
+        fn = getattr(ad, "confirm_ships_to_poland", None)
+        if fn is None:
+            return False
+        try:
+            ok = bool(await fn(l))
+        except Exception as e:  # noqa: BLE001 - an unconfirmed US item is not a deal
+            self.stats.errors.append(f"us-ship {l.source}:{l.source_id}: {type(e).__name__}: {e}"[:200])
+            return False
+        l.ships = bool(ok)
+        if ok and "ships to Poland" not in desc:
+            l.description = (desc + "; ships to Poland").lstrip("; ")
+        elif not ok and "does not ship to Poland" not in desc:
+            l.description = (desc + "; does not ship to Poland").lstrip("; ")
+        self.store.upsert_listing(l)
+        return ok
+
     async def _guarded(self, l: Listing, lid: int, arm: Arm, ad) -> None:
         async with self.task_sem:
             try:
@@ -892,10 +921,19 @@ class _Round:
             self.store.save_extraction(lid, rules)
             self._mark_eval(lid, l, note="rules_rejected")
             return self.stats.drop("rules_rejected")
+        if rules.key == PC_KEY:
+            # Whole PCs are almost always false positives. Do not part them out or spend an LLM call.
+            self.store.save_extraction(lid, rules)
+            self._mark_eval(lid, l, note="pc_bundle")
+            return self.stats.drop("pc_bundle")
         if rules.key is None and (not _HW.search(l.title or "") or _SYSTEM_WORDS.search(l.title or "")):
             self.store.save_extraction(lid, rules)
             self._mark_eval(lid, l, note="no_key")
             return self.stats.drop("no_key")
+        if str(l.country or "").upper() == "US" and not await self._us_ships_to_poland(l, ad):
+            self.store.save_extraction(lid, rules)
+            self._mark_eval(lid, l, note="us_not_to_poland")
+            return self.stats.drop("us_not_to_poland")
         price_pln = await self._price_pln(l)
         if rules.key and rules.key != PC_KEY and not self._in_range(rules.key, price_pln):
             self.store.save_extraction(lid, rules)

@@ -688,24 +688,6 @@
   sentinel: false
   min_pln: 60
   value: nvme 4tb
-- id: query.komputer_gamingowy
-  kind: query
-  target: allegro_lokalnie,sprzedajemy
-  provenance: seed
-  helpful: 0
-  harmful: 0
-  sentinel: false
-  min_pln: 1000
-  value: komputer gamingowy
-- id: query.gaming_pc
-  kind: query
-  target: kleinanzeigen,marktplaats,hardverapro
-  provenance: seed
-  helpful: 0
-  harmful: 0
-  sentinel: false
-  min_pln: 1000
-  value: gaming pc
 - id: query.rtx_5080_ti
   kind: query
   target: all
