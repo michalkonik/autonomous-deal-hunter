@@ -20,7 +20,8 @@ from dh.store import Store
 
 REPO = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc).replace(microsecond=0)
-RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90", "CHF": "4.55"}
+RATES = {"USD": "3.70", "EUR": "4.25", "CZK": "0.17", "HUF": "0.011", "GBP": "4.90", "CHF": "4.55",
+         "CAD": "2.65"}
 KEY = "gpu:rtx-3060:12"
 
 
@@ -129,10 +130,13 @@ def seed_comps(st, n=10, price="1400"):
         st.add_comp(KEY, "used", "olx", Decimal(price) + i, NOW - timedelta(days=1 + i), "owner_sale", f"t:{i}")
 
 
-def make_ctx(tmp_path, adapter, llm, *, items=None, dry=True, **over):
+def make_ctx(tmp_path, adapter, llm, *, items=None, dry=True, min_net_usd=0, **over):
     tmp_path.mkdir(parents=True, exist_ok=True)
     cfg = config.load(REPO)
     data = cfg.to_dict()
+    # These fixtures price a 700 PLN card against ~1400 PLN sales. That net is under the owner's
+    # 200 USD floor, so the default here turns the floor off and one test turns it back on.
+    data["valuation"]["gate"]["min_net_usd"] = min_net_usd
     data["scheduler"] = {**data.get("scheduler", {}), "budget": 10, "max_searches_per_source": 10,
                          "feed_sources": [], **over}
     cfg = config.Config(data, REPO)
@@ -198,6 +202,13 @@ async def test_round_pipeline_with_fakes(tmp_path):
     assert row["pulls"] == 1 and row["reward"] > 0
     r = st.conn.execute("select * from rounds").fetchone()
     assert r["deals_found"] == 1 and json.loads(r["notes"])["deals_by_tier"] == {"2": 1}
+
+
+async def test_a_deal_under_200_usd_is_not_saved(tmp_path):
+    ctx = make_ctx(tmp_path, FakeAdapter([listing()]), FakeLLM(LLM_3060), min_net_usd=200)
+    seed_comps(ctx.store)
+    stats = await scheduler.run_round(ctx)
+    assert ctx.store.deals() == [] and stats.dropped.get("value_gate_small_deal") == 1
 
 
 async def test_second_round_does_not_reprocess_or_duplicate(tmp_path):

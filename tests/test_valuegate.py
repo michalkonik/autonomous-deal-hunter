@@ -89,15 +89,21 @@ def md_of(asks=(), retail=None, n_sold=0, sold_recent=True):
                                 n_sold=n_sold, sold_recent=sold_recent)
 
 
+def test_under_200_usd_is_dropped():
+    md = md_of(asks=["36000", "37000"], n_sold=3)
+    v = valuegate.verdict(Decimal("30000"), md, P, cons_usd=Decimal("199"), capital_usd=Decimal("1500"))
+    assert v.action == "drop" and v.code == "small_deal"
+
+
 def test_thin_margin_demotes_a_keep():
     md = md_of(asks=["36000", "37000"], n_sold=3)  # 30000 is far enough under the low ask that price is not the issue
-    v = valuegate.verdict(Decimal("30000"), md, P, cons_usd=Decimal("80"), capital_usd=Decimal("1500"))
+    v = valuegate.verdict(Decimal("30000"), md, P, cons_usd=Decimal("220"), capital_usd=Decimal("5000"))
     assert v.action == "watch" and v.code == "thin_margin" and "thin margin" in v.note
 
 
 def test_return_at_the_bar_still_keeps():
     md = md_of(asks=["36000", "37000"], n_sold=3)
-    v = valuegate.verdict(Decimal("30000"), md, P, cons_usd=Decimal("150"), capital_usd=Decimal("1500"))
+    v = valuegate.verdict(Decimal("30000"), md, P, cons_usd=Decimal("200"), capital_usd=Decimal("1500"))
     assert v.action == "keep"
 
 
@@ -219,9 +225,14 @@ def test_value_gate_skips_pc_bundles(tmp_path):
 
 
 def test_thin_margin_on_a_pc_is_a_watch_and_a_real_one_stays(tmp_path):
-    rnd, _st = make_round(tmp_path)
+    # make_ctx turns the dollar floor off for the pipeline fixtures. This test is about that floor.
+    ctx = ts.make_ctx(tmp_path, ts.FakeAdapter([]), None, min_net_usd=200)
+    rnd = scheduler._Round(ctx)
+    small = _appraisal(key="pc:bundle")
+    small.cons_usd, small.capital_usd = Decimal("40"), Decimal("2000")
+    assert rnd._value_gate(small) is None and rnd.stats.dropped.get("value_gate_small_deal") == 1
     thin = _appraisal(key="pc:bundle")
-    thin.cons_usd, thin.capital_usd = Decimal("40"), Decimal("2000")
+    thin.cons_usd, thin.capital_usd = Decimal("220"), Decimal("5000")
     assert rnd._value_gate(thin).tier.tier == 5 and any("thin margin" in r for r in thin.why)
     fat = _appraisal(key="pc:bundle")
     fat.cons_usd, fat.capital_usd = Decimal("400"), Decimal("2000")
